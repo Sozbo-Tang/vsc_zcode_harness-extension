@@ -1,0 +1,22 @@
+[project]
+name = "zcode-py"
+version = "0.1.0"
+description = "Zcode-Py agent core: hand-rolled Python agent harness driven by the VSCode sidebar extension over stdio JSONL"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic",
+    "openai",
+    "httpx",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

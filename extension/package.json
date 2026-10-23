@@ -1,0 +1,58 @@
+{
+  "name": "zcode-py",
+  "displayName": "Zcode-Py",
+  "description": "Python agent harness in a VSCode sidebar (TS thin shell + Python core over stdio JSONL)",
+  "version": "0.1.0",
+  "publisher": "zcode-py",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -p . --watch"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "zcode-py",
+          "title": "Zcode-Py",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "zcode-py": [
+        {
+          "type": "webview",
+          "id": "zcode.sidebar",
+          "name": "Zcode-Py"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "zcode.newSession",
+        "title": "Zcode-Py: New Session"
+      },
+      {
+        "command": "zcode.openSidebar",
+        "title": "Zcode-Py: Open Sidebar"
+      },
+      {
+        "command": "zcode.apiSettings",
+        "title": "Zcode-Py: API Settings"
+      }
+    ]
+  }
+}
