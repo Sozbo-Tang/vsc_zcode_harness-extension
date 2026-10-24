@@ -21,7 +21,8 @@ import type { CoreEvent, CoreSend, HostRpcMethod, UserMessageContext } from '../
 
 export interface HostRpc {
   request<T = unknown>(method: HostRpcMethod, params?: unknown, timeoutMs?: number): Promise<T>;
-  sendCore(message: CoreSend): void;
+  /** sessionKey 缺省 = 活跃会话；携带时定向发往该宿主会话进程（并行多开） */
+  sendCore(message: CoreSend, sessionKey?: string): void;
   onEvent(handler: (e: CoreEvent) => void): () => void;
   onHostError(handler: (e: { sessionKey?: string; errorKind: string; message: string }) => void): () => void;
   onProcessState(handler: (e: { sessionKey: string; state: string; detail?: string }) => void): () => void;
@@ -31,7 +32,7 @@ export interface HostRpc {
 
 const rpc: HostRpc = {
   request: (method, params, timeoutMs) => hostRequest(method, params, timeoutMs),
-  sendCore: (message) => hostSendCore(message),
+  sendCore: (message, sessionKey) => hostSendCore(message, sessionKey),
   onEvent: (handler) => onHostEvent(handler),
   onHostError: (handler) => onHostError(handler),
   onProcessState: (handler) => onProcessState(handler),

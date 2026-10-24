@@ -13,7 +13,7 @@
  * 清空输入框、不抢焦点；running 期间 Enter 静默（发送仍按运行态门控，
  * 对权限请求的回应渠道是卡上按钮）。
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import Markdown from 'react-markdown';
 import { useStore, isSubagentTool, currentLevel, formatParam, type ChatItem } from '../store/store';
 import type { EditorSelectionResult, PermissionMode } from '../protocol';
@@ -32,6 +32,9 @@ import { WelcomePage } from '../components/WelcomePage';
 function fmtDur(ms: number): string {
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
+
+/** 附件路径 → 文件名（chip 只显名，路径放 title） */
+const baseName = (p: string): string => p.split(/[\\/]/).pop() || p;
 
 function ThinkingBlock({ item }: { item: Extract<ChatItem, { kind: 'thinking' }> }): React.JSX.Element {
   const dur = (item.endedAt ?? Date.now()) - item.startedAt;
@@ -55,7 +58,14 @@ function ItemView({ item }: { item: ChatItem }): React.JSX.Element {
           {(item.context?.fileRefs?.length ?? 0) > 0 && (
             <div className="attach">
               {item.context?.fileRefs?.map((f) => (
-                <span key={f} className="chip">📎 {f}</span>
+                <span key={f} className="chip" title={f}>📎 {baseName(f)}</span>
+              ))}
+            </div>
+          )}
+          {(item.context?.images?.length ?? 0) > 0 && (
+            <div className="attach">
+              {item.context?.images?.map((f) => (
+                <span key={f} className="chip" title={f}>🖼 {baseName(f)}</span>
               ))}
             </div>
           )}
@@ -140,6 +150,19 @@ export function ChatView(): React.JSX.Element {
   const atFetchRef = useRef<number | undefined>(undefined);
   const logRef = useRef<HTMLDivElement | null>(null);
   const stickRef = useRef(true);
+  // M4/R27：输入历史回溯指针（null = 不在回溯态；否则指向 history 下标，
+  // 键入（非历史选择）即复位 —— 见 onDraftChange）
+  const histNavRef = useRef<number | null>(null);
+
+  // 本会话输入历史：转录内 user 条目按序取文本（resume 重放同样覆盖）；
+  // 「另发过的」消息全部经 store.sendUserMessage 落入 items，无需单独记账
+  const history = useMemo(
+    () =>
+      items
+        .filter((it): it is Extract<ChatItem, { kind: 'user' }> => it.kind === 'user' && it.text.trim() !== '')
+        .map((it) => it.text),
+    [items],
+  );
 
   // 流式自动吸底（用户上滚则不打扰）
   useEffect(() => {
@@ -170,10 +193,12 @@ export function ChatView(): React.JSX.Element {
       cancelRunning();
       return;
     }
+    histNavRef.current = null; // 发送即离开历史回溯态（下次 ↑ 从最新一条起）
     sendUserMessage(draft);
   };
 
   const onDraftChange = (text: string): void => {
+    histNavRef.current = null; // 键入即离开历史回溯态（历史选择走 setInputDraft 不经此）
     setInputDraft(text);
     const m = /@([A-Za-z0-9_./-]*)$/.exec(text);
     if (m === null) {
@@ -227,8 +252,41 @@ export function ChatView(): React.JSX.Element {
         return;
       }
     }
+    // M4/R27：输入历史回溯 —— 空草稿按 ↑ 进入（逐条向更早），↓ 前进；
+    // 到尾回空串退出回溯。回溯态下 ↑ 可连续翻（草稿已被历史值填充）。
+    if (e.key === 'ArrowUp' && !e.shiftKey) {
+      if (history.length === 0) return; // 无历史：保持默认光标行为
+      const cur = histNavRef.current;
+      if (cur === null) {
+        if (draft !== '') return; // 仅空输入时进入回溯（shift+↑ 仍可挪光标）
+        histNavRef.current = history.length - 1;
+      } else if (cur > 0) {
+        histNavRef.current = cur - 1;
+      } else {
+        e.preventDefault(); // 已到最早一条：停在原值
+        return;
+      }
+      e.preventDefault();
+      setInputDraft(history[histNavRef.current]);
+      return;
+    }
+    if (e.key === 'ArrowDown' && !e.shiftKey) {
+      const cur = histNavRef.current;
+      if (cur === null) return; // 非回溯态：保持默认光标行为
+      e.preventDefault();
+      const next = cur + 1;
+      if (next >= history.length) {
+        histNavRef.current = null;
+        setInputDraft('');
+      } else {
+        histNavRef.current = next;
+        setInputDraft(history[next]);
+      }
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
+      histNavRef.current = null;
       if (!running) sendUserMessage(draft);
     }
   };
@@ -251,6 +309,17 @@ export function ChatView(): React.JSX.Element {
           fileRefs: [sel.file],
           selection: `# ${sel.file} L${sel.startLine}-${sel.endLine}\n${sel.text}`,
         });
+      })
+      .catch(() => undefined);
+  };
+
+  // M5（R9）：图片附件 —— 宿主文件对话框挑图 → chip；发送时进 context.images，
+  // 主模型无视觉时由核心经视觉中继转述（中继卡回显，原图退场省 token）
+  const attachImage = (): void => {
+    void rpc
+      .request<{ file: string } | null>('editor.pickImage')
+      .then((r) => {
+        if (r !== null) attachContext({ images: [r.file] });
       })
       .catch(() => undefined);
   };
@@ -334,6 +403,7 @@ export function ChatView(): React.JSX.Element {
 
       {(atMenu !== null && atMenu.items.length > 0) ||
       (pendingContext.fileRefs?.length ?? 0) > 0 ||
+      (pendingContext.images?.length ?? 0) > 0 ||
       pendingContext.selection !== undefined ||
       pendingContext.terminalSel !== undefined ||
       pendingContext.problems !== undefined ? (
@@ -356,9 +426,18 @@ export function ChatView(): React.JSX.Element {
           )}
           {(pendingContext.fileRefs?.length ?? 0) > 0 &&
             pendingContext.fileRefs?.map((f) => (
-              <span key={f} className="chip">
-                📎 {f}
+              <span key={f} className="chip" title={f}>
+                📎 {baseName(f)}
                 <button className="chip-x" onClick={() => removeContextChip('fileRef', f)} title="移除引用">
+                  ×
+                </button>
+              </span>
+            ))}
+          {(pendingContext.images?.length ?? 0) > 0 &&
+            pendingContext.images?.map((f) => (
+              <span key={f} className="chip" title={f}>
+                🖼 {baseName(f)}
+                <button className="chip-x" onClick={() => removeContextChip('image', f)} title="移除图片">
                   ×
                 </button>
               </span>
@@ -416,7 +495,7 @@ export function ChatView(): React.JSX.Element {
         >
           📎 文件
         </button>
-        <button className="btn sec" disabled title="图片输入 — M5 Vision 中继">
+        <button className="btn sec" onClick={attachImage} title="附加图片（主模型无视觉时自动经视觉中继转述，PLAN R9）">
           🖼 图片
         </button>
         <button

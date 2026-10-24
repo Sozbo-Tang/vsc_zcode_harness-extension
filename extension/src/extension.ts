@@ -4,6 +4,10 @@
  *   uv 子进程）→ ZcodeWebviewViewProvider（侧边栏桥）三方接线；
  * - 命令：新会话 / 停止生成 / 打开设置 / 打开侧边栏 / API 设置占位；
  * - 状态栏项占位（PLAN §6.7：🚢档位│模型│运行状态│上下文 —— M1 只显状态）；
+ * - M4：workspaceState 持久化活跃会话（重启恢复 key；会话创建/切换写入）、
+ *   session.activate RPC（并行多开的活跃会话切换）；
+ * - M5：图片附件入口（zcode.attachImage 命令 + editor.pickImage RPC，
+ *   复用 host_prompt 通道挂 chip）、workspace.saveExport RPC（导出落盘）；
  * - deactivate 返回 Promise：优雅回收全部子进程（EOF→SIGTERM→SIGKILL）。
  */
 
@@ -25,7 +29,12 @@ import {
   RPC_EDITOR_GET_SELECTION,
   RPC_EDITOR_LIST_FILES,
   RPC_EDITOR_PICK_FILE,
+  RPC_EDITOR_PICK_IMAGE,
+  RPC_SESSION_ACTIVATE,
+  RPC_WORKSPACE_SAVE_EXPORT,
+  SessionActivateParams,
   UserMessageContext,
+  WorkspaceSaveExportParams,
 } from "./protocol";
 import {
   collectDiagnostics,
@@ -34,6 +43,7 @@ import {
   listWorkspaceFiles,
   openDiffReview,
   pickFile,
+  pickImage,
   readTerminalSelection,
   registerEditorBridge,
   selectionToContext,
@@ -49,6 +59,9 @@ interface Runtime {
 }
 
 let runtime: Runtime | undefined;
+
+/** workspaceState 键：上次活跃会话 key（M4 重启恢复；PLAN §3.2 工作区状态） */
+const ACTIVE_SESSION_KEY_STATE = "zcode.activeSessionKey";
 
 function agentDirFrom(extensionUri: vscode.Uri): string {
   // 扩展装在 <repo>/extension/，agent 在 <repo>/agent/ —— 由扩展位置推导，
@@ -107,9 +120,26 @@ export function activate(context: vscode.ExtensionContext): void {
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBar.name = "Zcode-Py";
   statusBar.command = "zcode.openSidebar";
-  const rt: Runtime = { channel, keys, manager, provider, statusBar, activeSessionKey: undefined };
+  // M4：恢复上次活跃会话 key（窗口重载/重启后续聊定位）。注意进程不随
+  // 扩展重启复活——恢复的 key 供 webview getState 展示与路由目标；进程
+  // 不在时 sendToActiveSession 会广播 session_not_found，续聊由 webview
+  // 发 control resume 前先确保会话进程存在（新建会话或 session.activate）。
+  const restoredKey = context.workspaceState.get<string>(ACTIVE_SESSION_KEY_STATE);
+  const rt: Runtime = {
+    channel,
+    keys,
+    manager,
+    provider,
+    statusBar,
+    activeSessionKey: restoredKey !== undefined && restoredKey.length > 0 ? restoredKey : undefined,
+  };
   runtime = rt;
   updateStatusBar(rt);
+
+  /** 活跃会话持久化（会话创建 / session.activate 切换时调用） */
+  const persistActiveSession = (key: string): void => {
+    void context.workspaceState.update(ACTIVE_SESSION_KEY_STATE, key);
+  };
 
   // —— Python 核心 → webview ——
   manager.onCoreMessage((e) => {
@@ -200,6 +230,59 @@ export function activate(context: vscode.ExtensionContext): void {
     return file !== null ? { file } : null;
   });
 
+  // M5：图片附件挑选（R9 视觉中继入口；结果进 user_message.context.images）
+  provider.registerRpcHandler(RPC_EDITOR_PICK_IMAGE, async () => {
+    const file = await pickImage();
+    return file !== null ? { file } : null;
+  });
+
+  // M4：会话导出 Markdown 落盘（R12）：core result.markdown → 保存对话框 →
+  // workspace.fs 写文件；用户取消返回 null（不报错）
+  provider.registerRpcHandler(RPC_WORKSPACE_SAVE_EXPORT, async (params) => {
+    const p = params as Partial<WorkspaceSaveExportParams> | undefined;
+    if (
+      p === undefined ||
+      typeof p.defaultName !== "string" ||
+      typeof p.markdown !== "string"
+    ) {
+      throw new Error("workspace.saveExport: 参数需为 {defaultName, markdown}（均 string）");
+    }
+    const fileName = p.defaultName.endsWith(".md") ? p.defaultName : `${p.defaultName}.md`;
+    // 建议目录：首个工作区根；无工作区窗口兜底 home（与子进程 cwd 策略一致）
+    const defaultUri = vscode.Uri.joinPath(
+      vscode.Uri.file(PythonProcessManager.defaultCwd()),
+      fileName,
+    );
+    const target = await vscode.window.showSaveDialog({
+      title: "Zcode-Py: 导出会话为 Markdown",
+      saveLabel: "导出",
+      defaultUri,
+      filters: { Markdown: ["md"] },
+    });
+    if (target === undefined) {
+      return null; // 用户取消
+    }
+    await vscode.workspace.fs.writeFile(target, Buffer.from(p.markdown, "utf8"));
+    return { path: target.fsPath };
+  });
+
+  // M4：活跃会话切换（R16 并行多开）：更新宿主路由目标 + 状态栏并持久化；
+  // 目标会话须已存在于 processManager（不存在 = 应答错误，webview 提示新建）
+  provider.registerRpcHandler(RPC_SESSION_ACTIVATE, (params) => {
+    const key = (params as Partial<SessionActivateParams> | undefined)?.sessionKey;
+    if (typeof key !== "string" || key.length === 0) {
+      throw new Error("session.activate: 参数需为 {sessionKey: string}");
+    }
+    if (manager.get(key) === undefined) {
+      throw new Error(`session.activate: 会话 ${key} 不存在或已停止`);
+    }
+    rt.activeSessionKey = key;
+    persistActiveSession(key);
+    updateStatusBar(rt);
+    channel.appendLine(`[host] 活跃会话切换: ${key}`);
+    return { activeSessionKey: key };
+  });
+
   // —— 视图与命令 ——
   context.subscriptions.push(
     channel,
@@ -214,9 +297,21 @@ export function activate(context: vscode.ExtensionContext): void {
       const proc = await manager.createSession();
       if (proc !== undefined) {
         rt.activeSessionKey = proc.sessionKey;
+        persistActiveSession(proc.sessionKey);
         updateStatusBar(rt);
         channel.appendLine(`[host] 会话已创建: ${proc.sessionKey}（等待 session_started）`);
       }
+      await vscode.commands.executeCommand("zcode.sidebar.focus");
+    }),
+    // M5：图片附件入口（R9）：挑图 → host_prompt{text:"", context.images} →
+    // 聚焦侧边栏。约定（protocol.ts WebviewHostPromptMessage）：text 空串 =
+    // webview 只挂图片 chip、不改用户草稿；发送仍由用户确认（不代发）。
+    vscode.commands.registerCommand("zcode.attachImage", async () => {
+      const file = await pickImage();
+      if (file === null) {
+        return; // 用户取消，不打扰
+      }
+      rt.provider.postHostPrompt("", { images: [file] });
       await vscode.commands.executeCommand("zcode.sidebar.focus");
     }),
     vscode.commands.registerCommand("zcode.stopGeneration", () => {

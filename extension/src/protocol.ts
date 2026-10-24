@@ -10,6 +10,11 @@
  * telegraph_state.levels[]{id,label,param,ok} 且 paramTranslation 为 dict、
  * compaction.layer 为 string 且 report 为 dict、ping_result.message、
  * result{ok,command,detail}。
+ * M4/M5 增量（对照 protocol.py 封版 R9/R7/R21/R16/R28/R12/R11）：
+ * MessageContext.images、control 命令 fork/pin/export/set_root/env_refresh
+ * 及其参数（atMessageId/pinned/rootIndex/rootPath）、sessions_list 的 M4
+ * 字段集（title/pinned/lastActivity/messageCount/rootPath 等）、
+ * result.markdown（export 全文）。
  *
  * 解析策略：只严格校验信封（合法 JSON + string type），载荷字段宽容、
  * 未知类型也放行转发（见 parseCoreMessage）——Python 侧 decode 对
@@ -39,6 +44,12 @@ export interface UserMessageContext {
   fileRefs?: string[];
   terminalSel?: string;
   problems?: string;
+  /**
+   * 图片附件路径（M5 视觉中继入口，R9；逐字对齐 protocol.py
+   * MessageContext.images）：扩展宿主侧本地绝对路径；主模型不支持视觉时
+   * 由用户指定的多模态模型转述成文字，转述后原图从上下文移除省 token。
+   */
+  images?: string[];
 }
 
 /** user_message{text, context{...}} */
@@ -76,6 +87,9 @@ export interface DiffReviewMessage {
  * control{new_session | resume<id> | cancel | compact | telegraph<level> |
  * switch_model{providerId, modelId}} —— Python 侧（protocol.py）以 `command`
  * 判别 + 可选参数承载，枚举 CONTROL_COMMANDS 额外含 "ping"（测试连接）。
+ * M4 追加 fork / pin / export / set_root（R16/R28/R12/R11），M5 追加
+ * env_refresh（R7/R21）——各命令只取自己所需的参数，其余字段忽略
+ * （向后兼容靠这一约定，与 Python 侧 Control 一致）。
  */
 export type ControlCommand =
   | "new_session"
@@ -84,11 +98,18 @@ export type ControlCommand =
   | "compact"
   | "telegraph"
   | "switch_model"
-  | "ping";
+  | "ping"
+  // M4：分叉 / 收藏固定 / 导出 Markdown / multi-root 切根
+  | "fork"
+  | "pin"
+  | "export"
+  | "set_root"
+  // M5：环境面板「刷新」——重新探测并广播 env_info
+  | "env_refresh";
 export interface ControlMessage {
   type: "control";
   command: ControlCommand;
-  /** command = "resume" */
+  /** command = "resume"；fork / pin / export 亦可指定目标会话（缺省 = 当前会话） */
   sessionId?: string;
   /** command = "telegraph"：档位 id（telegraph_state.levels[].id） */
   level?: string;
@@ -96,6 +117,14 @@ export interface ControlMessage {
   providerId?: string;
   /** command = "switch_model" */
   modelId?: string;
+  /** command = "fork"：分叉点（转录内入站 user_message 的 messageId） */
+  atMessageId?: string;
+  /** command = "pin"：目标态；缺省 = 取反切换 */
+  pinned?: boolean;
+  /** command = "set_root"：init.workspaceRoots 下标 */
+  rootIndex?: number;
+  /** command = "set_root"：按路径切根（与 rootIndex 二选一，须命中 workspaceRoots） */
+  rootPath?: string;
 }
 
 /** rollback{checkpointId} */
@@ -277,12 +306,30 @@ export interface RollbackResultMessage {
 }
 
 /**
- * sessions_list —— Python 侧 sessions 为数据驱动 list 直通，
- * 此处给建议字段（全部可选 + 索引签名）。
+ * sessions_list —— Python 侧 sessions 为数据驱动 list 直通。M4 起字段集
+ * （protocol.py SessionsList / main.py _session_summaries）：sessionId /
+ * title / pinned / lastActivity / messageCount / rootPath（另有 providerId /
+ * modelId / parentSessionId）；None 值剔除保持载荷紧凑，故全部可选 +
+ * 索引签名宽容。
  */
 export interface SessionSummary {
   sessionId?: string;
   title?: string;
+  /** R28 收藏固定标志（Python 侧恒发 bool；置顶渲染由 UI 决定） */
+  pinned?: boolean;
+  /** 最近活动时间（ISO 字符串，Python 侧 meta.updatedAt 映射） */
+  lastActivity?: string;
+  /** 转录消息条数 */
+  messageCount?: number;
+  /** 会话当前根目录（multi-root set_root 切换后的根，init.workspaceRoots 之一） */
+  rootPath?: string;
+  /** 会话所用 Provider（恢复时校验仍已配置） */
+  providerId?: string;
+  /** 会话所用模型 */
+  modelId?: string;
+  /** fork 来源会话 id（「分叉自…」，无则缺省） */
+  parentSessionId?: string;
+  /** 兼容旧 webview 镜像的别名（M4 前建议字段；Python 侧定名 lastActivity） */
   updatedAt?: string;
   [key: string]: unknown;
 }
@@ -334,13 +381,18 @@ export interface ErrorMessage {
   message: string;
 }
 
-/** result{ok, command?, detail?} —— control 命令的通用回执（Python 侧语义） */
+/** result{ok, command?, detail?, markdown?} —— control 命令的通用回执（Python 侧语义） */
 export interface ResultMessage {
   type: "result";
   ok: boolean;
   /** 回执对应的 control.command */
   command?: string;
   detail?: string;
+  /**
+   * command = "export"：导出的 Markdown 全文（R12；核侧不替用户选路径，
+   * 落盘由 UI 经宿主 RPC workspace.saveExport 完成）；其余命令恒缺省。
+   */
+  markdown?: string;
 }
 
 /** M0 冒烟遗留的 echo 帧（agent/zcode_py/__main__.py），保留以兼容过渡期 */
@@ -552,6 +604,45 @@ export interface EditorPickFileResult {
   file: string;
 }
 
+/* ──────────── M4/M5 宿主 RPC（图片挑选 / 导出落盘 / 会话激活） ──────────── */
+
+export const RPC_EDITOR_PICK_IMAGE = "editor.pickImage";
+/**
+ * 系统打开对话框挑选一张图片（过滤器 png/jpg/jpeg/webp/gif，单选）。
+ * result = {file}（扩展宿主侧本地绝对路径，可进 user_message.context.images）；
+ * 用户取消时 result 为 null。实现 vscode.window.showOpenDialog。
+ */
+export interface EditorPickImageResult {
+  file: string;
+}
+
+export const RPC_WORKSPACE_SAVE_EXPORT = "workspace.saveExport";
+/** 会话导出 Markdown 落盘（R12）：core result.markdown → 保存对话框 → 写文件 */
+export interface WorkspaceSaveExportParams {
+  /** 建议文件名（缺 .md 后缀时宿主自动补；作保存对话框 defaultUri 文件名） */
+  defaultName: string;
+  /** 导出的 Markdown 全文（来自 result.markdown） */
+  markdown: string;
+}
+/** 保存成功 result；用户取消时 result 为 null */
+export interface WorkspaceSaveExportResult {
+  /** 落盘路径（扩展宿主侧本地绝对路径） */
+  path: string;
+}
+
+export const RPC_SESSION_ACTIVATE = "session.activate";
+/**
+ * 活跃会话切换（R16 并行多开）：更新宿主 activeSessionKey（此后不带
+ * sessionKey 的 core 消息路由到该会话）+ 状态栏，并写入 workspaceState
+ * 持久化（重启恢复）。目标会话须已存在于 processManager，否则应答错误。
+ */
+export interface SessionActivateParams {
+  sessionKey: string;
+}
+export interface SessionActivateResult {
+  activeSessionKey: string;
+}
+
 export type WebviewToHostMessage = WebviewReadyMessage | WebviewCoreSendMessage | WebviewRpcRequest;
 
 export interface WebviewCoreForwardMessage {
@@ -585,12 +676,16 @@ export interface WebviewRpcResponseMessage {
 
 /**
  * 宿主主动投给 webview 的「待发提示」（编辑器右键四动作 / 终端选中诊断 /
- * Problems 一键发送，PLAN §6.7）：webview 收到后填充输入框草稿并挂上下文
- * chip，用户确认后发送（不代发——用户保持对输入的最终控制权）。
+ * Problems 一键发送 / 图片附件命令，PLAN §6.7）：webview 收到后填充输入框
+ * 草稿并挂上下文 chip，用户确认后发送（不代发——用户保持对输入的最终控制权）。
+ *
+ * 约定：text 传空串 "" 时 webview 只挂 context chip、不改草稿（M5
+ * zcode.attachImage 的图片附件入口即 {text:"", context:{images:[file]}}——
+ * 只追加图片 chip，不动用户正在输入的草稿）。
  */
 export interface WebviewHostPromptMessage {
   kind: "host_prompt";
-  /** 预填文本（与既有草稿拼接：草稿在前，新文本换行接续） */
+  /** 预填文本（与既有草稿拼接：草稿在前，新文本换行接续；"" = 只挂 chip） */
   text: string;
   /** 随行上下文（合并进 pendingContext） */
   context?: UserMessageContext;

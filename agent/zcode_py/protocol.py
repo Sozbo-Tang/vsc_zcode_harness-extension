@@ -37,6 +37,8 @@ CONTROL_COMMANDS = (
     "pin",
     "export",
     "set_root",
+    # M4：全文搜索（query 承载关键词；结果经 Result.detail JSON 返回）
+    "search_sessions",
     # M5（R7/R21）：环境面板「刷新」——重新探测并广播 env_info
     "env_refresh",
 )
@@ -123,10 +125,11 @@ class Control:
     providerId: str | None = None
     modelId: str | None = None
     # M4 扩展参数：各命令只取自己所需，其余字段忽略（向后兼容靠这一约定）
-    atMessageId: str | None = None  # fork：分叉点（转录内入站 user_message 的 messageId）
+    atMessageId: str | None = None  # fork：分叉点（入站 user_message 的 messageId；"__last_user_message__" 哨兵 = 最后一条）
     pinned: bool | None = None  # pin：目标态；缺省 = 取反切换
     rootIndex: int | None = None  # set_root：init.workspaceRoots 下标
     rootPath: str | None = None  # set_root：按路径切根（与 rootIndex 二选一）
+    query: str | None = None  # search_sessions：搜索关键词
 
 
 @dataclass

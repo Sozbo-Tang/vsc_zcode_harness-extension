@@ -913,6 +913,70 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* M4 会话视图：日期分组头 / 条目操作区 / 提示行 */
+
+.session-block {
+  display: flex;
+  flex-direction: column;
+}
+
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  padding: 8px 2px 3px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.group-head:hover {
+  color: var(--vscode-foreground);
+}
+
+.group-head .chev {
+  display: inline-block;
+  transition: transform 0.15s ease;
+}
+
+.group-head.open .chev {
+  transform: rotate(90deg);
+}
+
+.session-meta {
+  white-space: nowrap;
+}
+
+.iconbtn {
+  border: none;
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+  cursor: pointer;
+  padding: 0 5px;
+  border-radius: 3px;
+  font-size: 13px;
+  line-height: 1.4;
+  flex: none;
+}
+
+.iconbtn:hover {
+  background: var(--vscode-toolbar-hoverBackground);
+  color: var(--vscode-foreground);
+}
+
+.session-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 4px 4px 22px;
+}
+
+.session-notice {
+  padding: 0 6px 5px 22px;
+  overflow-wrap: anywhere;
+}
+
 /* ---------- 环境/设置 ---------- */
 
 .envinfo {
@@ -920,6 +984,41 @@ body {
   flex-direction: column;
   gap: 6px;
   font-size: 12px;
+}
+
+/* M5 环境面板：硬件键值行 / 语言卡 / 缺失黄牌指引 */
+
+.env-val {
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.langcard .lang-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 4px;
+}
+
+.lang-hint {
+  margin-top: 2px;
+}
+
+.lang-hint summary {
+  cursor: pointer;
+  user-select: none;
+  font-size: 11px;
+  color: var(--vscode-editorWarning-foreground, var(--vscode-charts-yellow));
+}
+
+.lang-hint summary::-webkit-details-marker {
+  display: none;
+}
+
+.lang-hint-body {
+  padding: 3px 6px;
+  border-left: 2px solid var(--vscode-editorWarning-foreground);
+  overflow-wrap: anywhere;
 }
 
 .setting-group {

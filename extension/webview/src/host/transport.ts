@@ -164,10 +164,17 @@ export function hostRequest<T = unknown>(
   });
 }
 
-/** 转发一条壳 → 核消息给 Python（宿主 onSendToCore；sessionKey 缺省=活跃会话） */
-export function hostSendCore(message: CoreSend): void {
+/**
+ * 转发一条壳 → 核消息给 Python（宿主 onSendToCore）。
+ * sessionKey 缺省 = 活跃会话；携带时定向发往该宿主会话进程
+ * （并行多开 R16：宿主 webviewHost 'core' 信封已支持 sessionKey，
+ * 目标非活跃会话时宿主按 key 路由，不存在则回 host_error）。
+ */
+export function hostSendCore(message: CoreSend, sessionKey?: string): void {
   installListener();
-  getVsCodeApi().postMessage({ kind: 'core', message });
+  const envelope: { kind: 'core'; message: CoreSend; sessionKey?: string } = { kind: 'core', message };
+  if (sessionKey !== undefined) envelope.sessionKey = sessionKey;
+  getVsCodeApi().postMessage(envelope);
 }
 
 export function onHostEvent(handler: EventHandler): () => void {

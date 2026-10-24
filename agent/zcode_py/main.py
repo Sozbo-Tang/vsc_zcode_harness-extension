@@ -297,22 +297,23 @@ class ZcodeService:
 
     def _run_env_probe(self) -> None:
         """探测 → 广播 env_info（含环境面板所需全部事实）→ 环境事实注入
-        system prompt。探测失败广播 error 但不影响会话。"""
+        system prompt。探测失败广播 error 但不影响会话。锁在广播前释放：
+        紧随首个 env_info 到来的 env_refresh 不应撞上「emit 与 release 之间
+        的窗口」而被误报 busy。"""
         try:
             env = probe_environment(self._workspace_roots)
-            self._emit(
-                EnvInfo(hardware=env["hardware"], workspaceLangs=env["workspaceLangs"])
-            )
-            self._env_facts = environment_facts(env)
-            loop = self._loop
-            if loop is not None:
-                loop.system_prompt = self._system_prompt_with_env()
         except Exception as exc:  # noqa: BLE001 —— 探测失败只降级，不拖垮会话
+            self._env_probe_lock.release()
             self._emit(
                 Error(kind="env", message=f"environment probe failed: {type(exc).__name__}: {exc}")
             )
-        finally:
-            self._env_probe_lock.release()
+            return
+        self._env_probe_lock.release()
+        self._emit(EnvInfo(hardware=env["hardware"], workspaceLangs=env["workspaceLangs"]))
+        self._env_facts = environment_facts(env)
+        loop = self._loop
+        if loop is not None:
+            loop.system_prompt = self._system_prompt_with_env()
 
     def _ensure_config(self) -> None:
         if self._config is not None:
@@ -598,6 +599,8 @@ class ZcodeService:
             "pin": self._control_pin,
             "export": self._control_export,
             "set_root": self._control_set_root,
+            "search_sessions": self._control_search_sessions,
+            "env_refresh": self._control_env_refresh,
         }.get(msg.command)
         if handler is None:
             self._emit(Error(kind="protocol", message=f"unknown control command: {msg.command!r}"))
@@ -771,11 +774,14 @@ class ZcodeService:
         if not source_id:
             self._emit(Error(kind="protocol", message="fork requires sessionId"))
             return
-        if not msg.atMessageId:
-            self._emit(Error(kind="protocol", message="fork requires atMessageId"))
+        at_message_id = self._resolve_fork_point(source_id, msg.atMessageId)
+        if not at_message_id:
+            self._emit(
+                Error(kind="not_found", message=f"fork point {msg.atMessageId!r} not found in session {source_id}")
+            )
             return
         try:
-            new_meta = self._store.fork(source_id, msg.atMessageId)
+            new_meta = self._store.fork(source_id, at_message_id)
         except SessionError as exc:
             self._emit(Error(kind="not_found", message=str(exc)))
             return
@@ -783,6 +789,25 @@ class ZcodeService:
         self._emitter.emit(SessionStarted(sessionId=new_id), record=False)
         self._emitter.emit(SessionsList(sessions=self._session_summaries()), record=False)
         self._emit(Result(ok=True, command="fork", detail=new_id))
+
+    FORK_AT_LAST_USER_MESSAGE = "__last_user_message__"
+
+    def _resolve_fork_point(self, source_id: str, at_message_id: str | None) -> str | None:
+        """分叉点解析：显式 messageId 直接用；哨兵/缺省 = 源转录最后一条入站
+        user_message 的 messageId（webview 无转录内 id 时按此约定发送哨兵）。"""
+        if at_message_id and at_message_id != self.FORK_AT_LAST_USER_MESSAGE:
+            return at_message_id
+        try:
+            frames = self._store.read_frames(source_id)
+        except SessionError:
+            return None
+        for envelope in reversed(frames):
+            event = envelope.get("event") or {}
+            if envelope.get("dir") == "in" and event.get("type") == "user_message":
+                mid = event.get("messageId")
+                if isinstance(mid, str) and mid:
+                    return mid
+        return None
 
     def _control_pin(self, msg: Control) -> None:
         """R28：pinned 标志切换（pinned 缺省 = 取反）；置顶渲染由 UI 决定。"""
@@ -862,6 +887,26 @@ class ZcodeService:
             except SessionError:
                 pass
         self._emit(Result(ok=True, command="set_root", detail=root))
+
+    def _control_search_sessions(self, msg: Control) -> None:
+        """M4 全文搜索：标题 + 转录文本匹配，结果经 Result.detail（JSON 数组）返回。"""
+        query = (msg.query or "").strip()
+        if not query:
+            self._emit(Error(kind="protocol", message="search_sessions requires query"))
+            return
+        matches = self._store.search_sessions(query)
+        self._emit(
+            Result(ok=True, command="search_sessions", detail=json.dumps(matches, ensure_ascii=False))
+        )
+
+    def _control_env_refresh(self, msg: Control) -> None:
+        """M5 环境面板「刷新」：重新探测并广播 env_info（探测线程内完成广播）。"""
+        if not self._spawn_env_probe():
+            self._emit(
+                Error(kind="busy", message="环境探测正在进行中，请稍候（env_info 到达即完成）")
+            )
+            return
+        self._emit(Result(ok=True, command="env_refresh", detail="probing"))
 
     def _restore_session_root(self, meta: dict) -> None:
         """resume 时回到 meta.rootPath 记录的根（仍在当前 workspaceRoots 内才生效）。"""

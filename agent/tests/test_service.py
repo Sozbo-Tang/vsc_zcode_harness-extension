@@ -553,3 +553,75 @@ def test_new_session_resets_root_and_resume_restores(tmp_home):
     result = harness.frames_of_type("result")[-1]
     assert result["command"] == "resume" and result["ok"] is True
     assert harness.service._loop.tool_session.ctx.cwd == ws_b  # 恢复记录的根
+
+
+# ---------------------------------------------------------------------------
+# M4/M5 收尾接线：fork 哨兵 / 全文搜索 / 环境刷新（Wave2 跨层缺口闭环）
+# ---------------------------------------------------------------------------
+
+
+def _chat_once(harness, text):
+    harness.send({"type": "user_message", "text": text})
+    assert harness.wait_frames("message_complete")
+
+
+def test_fork_sentinel_resolves_last_user_message(tmp_home):
+    provider = FakeProvider(turns=[[TextDelta("第一答")]])
+    harness = Harness(provider)
+    harness.send({"type": "init", "workspaceRoots": ["/w"]})
+    _chat_once(harness, "unique-fork-point")
+
+    harness.send({"type": "control", "command": "fork",
+                  "atMessageId": "__last_user_message__"})
+    assert harness.wait_frames("result")
+    result = [r for r in harness.frames_of_type("result") if r.get("command") == "fork"][-1]
+    assert result["ok"] is True
+    new_id = result["detail"]
+    assert new_id and new_id != harness.emitter.session_id
+
+
+def test_fork_bad_point_reports_not_found(tmp_home):
+    harness = Harness(FakeProvider())
+    harness.send({"type": "init", "workspaceRoots": ["/w"]})
+    _chat_once(harness, "hello")
+
+    harness.send({"type": "control", "command": "fork", "atMessageId": "um_nope"})
+    assert harness.wait_frames("error")
+    err = harness.frames_of_type("error")[-1]
+    assert err["kind"] == "not_found"
+
+
+def test_control_search_sessions_returns_matches(tmp_home):
+    harness = Harness(FakeProvider(turns=[[TextDelta("答")]]))
+    harness.send({"type": "init", "workspaceRoots": ["/w"]})
+    _chat_once(harness, "zebra-topic-question")
+
+    harness.send({"type": "control", "command": "search_sessions", "query": "zebra-topic"})
+    assert harness.wait_frames("result")
+    result = [r for r in harness.frames_of_type("result") if r.get("command") == "search_sessions"][-1]
+    assert result["ok"] is True
+    assert json.loads(result["detail"])
+
+    harness.send({"type": "control", "command": "search_sessions"})
+    errs = harness.frames_of_type("error")
+    assert errs and errs[-1]["kind"] == "protocol"
+
+
+def test_control_env_refresh(monkeypatch, tmp_home):
+    import zcode_py.main as main_mod
+
+    canned = {
+        "hardware": {"cpuModel": "T", "cpuCores": 1, "ramTotal": "1GB",
+                     "os": "macOS", "arch": "arm64"},
+        "workspaceLangs": [],
+    }
+    monkeypatch.setattr(main_mod, "probe_environment", lambda roots: canned)
+    harness = Harness(FakeProvider())
+    harness.send({"type": "init", "workspaceRoots": ["/w"]})
+    assert harness.wait_frames("env_info")
+    assert harness.frames_of_type("env_info")[-1]["hardware"]["cpuModel"] == "T"
+
+    harness.send({"type": "control", "command": "env_refresh"})
+    assert harness.wait_frames("result")
+    result = [r for r in harness.frames_of_type("result") if r.get("command") == "env_refresh"][-1]
+    assert result["ok"] is True and result["detail"] == "probing"

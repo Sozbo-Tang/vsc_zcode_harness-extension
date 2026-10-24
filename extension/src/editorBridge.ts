@@ -4,7 +4,8 @@
  *
  * 已落地：diff 审阅页（editor.openDiff）、编辑跟随（editor.followToolCall）、
  * 选区获取（editor.getSelection）、@补全文件列表（editor.listFiles）、
- * 文件挑选（editor.pickFile）、终端选中读取、Problems 收集。
+ * 文件挑选（editor.pickFile）、图片挑选（editor.pickImage，M5）、
+ * 终端选中读取、Problems 收集。
  */
 
 import * as vscode from "vscode";
@@ -225,6 +226,22 @@ export async function pickFile(): Promise<string | null> {
     matchOnDescription: false,
   });
   return picked !== undefined ? picked.label : null;
+}
+
+/* ── M5：图片附件挑选（R9 视觉中继入口，RPC editor.pickImage / 命令 zcode.attachImage） ── */
+
+/** 🖼图片：系统打开对话框挑选单张图片（png/jpg/jpeg/webp/gif）；取消返回 null */
+export async function pickImage(): Promise<string | null> {
+  const uris = await vscode.window.showOpenDialog({
+    title: "Zcode-Py: 选择要附加的图片",
+    canSelectMany: false,
+    canSelectFiles: true,
+    canSelectFolders: false,
+    filters: { Images: ["png", "jpg", "jpeg", "webp", "gif"] },
+  });
+  const uri = uris?.[0];
+  // fsPath = 扩展宿主侧真实路径（远程开发下即远程侧路径），直接进 context.images
+  return uri !== undefined ? uri.fsPath : null;
 }
 
 /* ── M3：终端选中（官方 copySelection+剪贴板通道读取，尽力恢复剪贴板） ── */

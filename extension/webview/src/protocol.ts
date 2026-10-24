@@ -12,6 +12,10 @@
  *    echo / getState（extension/src/extension.ts L120-128），Provider CRUD
  *    的方法名是 webview 侧提案，宿主实现后如有出入以宿主为准
  *  - control command 'set_permission_mode'：宿主 ControlCommand 枚举暂缺
+ *  - M4/M5：editor.pickImage / workspace.saveExport / session.activate RPC
+ *    为 webview 侧按方法名先行调用（宿主侧并行实现中，参数提案见下方接口）
+ *  - control 新命令 fork/pin/export/set_root/env_refresh 已在 Python 侧
+ *    CONTROL_COMMANDS 定稿；宿主镜像枚举暂缺（宽容转发不影响）
  */
 
 /* ---------- 基础类型（镜像 extension/src/protocol.ts） ---------- */
@@ -30,25 +34,79 @@ export interface TelegraphLevel {
 /** 权限模式（ZCode CollaborationMode 子集；宿主 ControlCommand 暂缺 set_permission_mode） */
 export type PermissionMode = 'build' | 'plan' | 'yolo';
 
+/**
+ * env_info.hardware（数据驱动 dict 直通，见 envprobe/hardware.py probe_hardware）。
+ * 前 5 个字段是宿主镜像的早期建议形状；M5 定稿字段为 platform/cpuModel/
+ * cpuCores/ramTotal/ramTotalBytes/gpuModel/gpuVram —— 两套并存，UI 各自降级。
+ */
 export interface HardwareInfo {
+  /* 早期建议字段（宿主 protocol.ts HardwareInfo） */
   cpu?: string;
   gpu?: string;
   ram?: string;
   os?: string;
   arch?: string;
+  /* M5 定稿字段（agent envprobe/hardware.py） */
+  /** sys.platform：darwin / linux / win32 */
+  platform?: string;
+  cpuModel?: string;
+  cpuCores?: number;
+  /** 人读 RAM 总量（如 "64 GB"）；ramTotalBytes 为原始字节数 */
+  ramTotal?: string;
+  ramTotalBytes?: number;
+  gpuModel?: string;
+  gpuVram?: string;
 }
 
+/**
+ * env_info.workspaceLangs[] 条目（envprobe/langs.py probe_workspace_langs）。
+ * ok/detail 是早期建议形状（宿主镜像）；M5 定稿为 markers/missing/version/
+ * packageManagers/extras/installHint —— missing=true 即黄牌（R21）。
+ */
 export interface WorkspaceLang {
   language?: string;
   ok?: boolean;
   detail?: string;
+  /* M5 定稿字段 */
+  /** 展示名（如 "Node.js/TypeScript"，LANGUAGE_LABELS） */
+  label?: string;
+  /** 命中的特征文件名（pyproject.toml / package.json…） */
+  markers?: string[];
+  /** 特征文件绝对路径（≤20 条/语言） */
+  markerPaths?: string[];
+  /** true = 语言出现但主工具链缺失 → 黄牌 + installHint（R21） */
+  missing?: boolean;
+  /** 主工具链版本（如 "Python 3.12.4"）；缺失时 null */
+  version?: string | null;
+  /** 包管理器 → 版本（pip3 / npm / cargo…） */
+  packageManagers?: Record<string, string>;
+  /** 补充工具 → 版本/存在性（conda / gradle / nvm…） */
+  extras?: Record<string, string>;
+  /** 缺失时的安装指引（英文一句话，envprobe/_TOOLCHAINS） */
+  installHint?: string | null;
 }
 
-/** 镜像宿主 SessionSummary：{sessionId, title?, updatedAt?（ISO 字符串）} */
+/**
+ * sessions_list 摘要（protocol.py SessionsList 数据驱动直通；meta.json 字段集）。
+ * M4 定稿：sessionId / title / pinned / lastActivity / messageCount / rootPath
+ * （另有 providerId / modelId / parentSessionId）；updatedAt 为早期镜像字段。
+ */
 export interface SessionSummary {
   sessionId: string;
   title?: string;
+  pinned?: boolean;
+  /** 最近活跃（ISO，sessions/_now_iso：本地时间拼 Z 后缀——分组容忍小时级偏差） */
+  lastActivity?: string;
+  /** 兼容字段（早期宿主镜像用 updatedAt） */
   updatedAt?: string;
+  /** 入站 user_message 条数（轮次计数） */
+  messageCount?: number;
+  /** multi-root 当前根（R11） */
+  rootPath?: string;
+  providerId?: string;
+  modelId?: string;
+  /** 分叉来源会话（R16 ↳ 标记） */
+  parentSessionId?: string;
 }
 
 export interface PerfTurn {
@@ -120,7 +178,11 @@ export type CoreEvent =
     }
   | { type: 'image_artifact'; path: string }
   | { type: 'error'; kind: string; message: string }
-  | { type: 'result' }
+  /**
+   * control 命令通用回执（protocol.py Result）。export 命令经 markdown 携带
+   * 导出全文（R12：核心只产文本，落盘由 UI 调 workspace.saveExport）。
+   */
+  | { type: 'result'; ok: boolean; command?: string; detail?: string; markdown?: string }
   | { type: 'echo'; line: string };
 
 /* ---------- 壳 → 核（镜像 HostToCoreMessage 的 webview 发送子集） ---------- */
@@ -160,12 +222,28 @@ export type CoreSend =
         | 'compact'
         | 'telegraph'
         | 'switch_model'
-        | 'set_permission_mode'; // 宿主 ControlCommand 枚举暂缺，提案项
+        | 'set_permission_mode' // 宿主 ControlCommand 枚举暂缺，提案项
+        | 'ping' // 测试连接（CONTROL_COMMANDS；宿主镜像枚举暂缺）
+        // M4（protocol.py CONTROL_COMMANDS：R16/R28/R12/R11）
+        | 'fork'
+        | 'pin'
+        | 'export'
+        | 'set_root'
+        // M5（R7/R21）：环境面板「刷新」→ 核心重新探测并广播 env_info
+        | 'env_refresh';
       sessionId?: string;
       level?: string;
       providerId?: string;
       modelId?: string;
       mode?: PermissionMode;
+      /** fork：分叉点（转录内入站 user_message 的 messageId） */
+      atMessageId?: string;
+      /** pin：目标态；缺省 = 取反切换 */
+      pinned?: boolean;
+      /** set_root：init.workspaceRoots 下标（与 rootPath 二选一） */
+      rootIndex?: number;
+      /** set_root：按路径切根 */
+      rootPath?: string;
     };
 
 /* ---------- webview ↔ 宿主 RPC ---------- */
@@ -224,7 +302,55 @@ export type EditorRpcMethod =
   | 'editor.followToolCall'
   | 'editor.getSelection'
   | 'editor.listFiles'
-  | 'editor.pickFile';
+  | 'editor.pickFile'
+  /** M5（R9）：图片附件挑选（文件对话框过滤图片后缀；用户取消 null） */
+  | 'editor.pickImage';
+
+/** M5：editor.pickImage → {file}；用户取消时 null（形状对齐 editor.pickFile） */
+export interface EditorPickImageResult {
+  file: string;
+}
+
+/**
+ * M4 分叉点哨兵（约定字段，非协议帧值）：UI 侧没有转录内 messageId 时，
+ * fork 以此值发送——核心侧若不支持该哨兵将回 not_found 错误（main.py
+ * _control_fork 要求 atMessageId 命中转录）。当前会话优先用 checkpoint
+ * 事件的 atMessageId（与入站 user_message messageId 同源，见 store
+ * applyEvent 'checkpoint'），哨兵仅为「非当前会话分叉」的降级路径。
+ */
+export const FORK_AT_LAST_USER_MESSAGE = '__last_user_message__';
+
+/** M4：切换宿主侧活跃会话（并行多开 R16；宿主侧并行实现，参数为提案） */
+export type SessionRpcMethod = 'session.activate';
+
+export interface SessionActivateParams {
+  /** Python 核心会话 id（sessions_list.sessionId，非宿主 sessionKey） */
+  sessionId: string;
+  /** 已知宿主 sessionKey 时可携带（webview 通常不知道，缺省由宿主解析） */
+  sessionKey?: string;
+}
+
+export interface SessionActivateResult {
+  /** 激活后的宿主 sessionKey（宿主实现可回传用于后续定向 sendCore） */
+  activeSessionKey?: string;
+}
+
+/** M4（R12）：会话导出 Markdown 落盘（宿主保存对话框 + 写文件） */
+export type WorkspaceRpcMethod = 'workspace.saveExport';
+
+export interface WorkspaceSaveExportParams {
+  /** control export 回执 result.markdown 全文 */
+  markdown: string;
+  /** 建议（缺省）文件名：zcode-<sessionId>.md */
+  fileName?: string;
+  sessionId?: string;
+}
+
+export interface WorkspaceSaveExportResult {
+  /** 实际保存路径（用户取消时缺省） */
+  path?: string;
+  saved?: boolean;
+}
 
 export interface GetStateResult {
   activeSessionKey?: string;
@@ -240,7 +366,12 @@ export type ProviderRpcMethod =
   | 'provider.ping'
   | 'provider.list_models';
 
-export type HostRpcMethod = RegisteredRpcMethod | ProviderRpcMethod | EditorRpcMethod;
+export type HostRpcMethod =
+  | RegisteredRpcMethod
+  | ProviderRpcMethod
+  | EditorRpcMethod
+  | SessionRpcMethod
+  | WorkspaceRpcMethod;
 
 export type ProviderProtocol =
   | 'anthropic'

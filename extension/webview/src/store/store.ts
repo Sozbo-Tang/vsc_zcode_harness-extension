@@ -24,6 +24,7 @@ import type {
   UserMessageContext,
   WorkspaceLang,
 } from '../protocol';
+import { FORK_AT_LAST_USER_MESSAGE } from '../protocol';
 
 /* ---------- 聊天条目投影（由事件归约产生） ---------- */
 
@@ -96,6 +97,21 @@ interface ProviderUiState {
   modelsError?: string;
 }
 
+/** 会话条目级瞬态 UI（M4：R16/R28/R12 动作的 busy 与回执提示），key = sessionId */
+export interface SessionUiState {
+  busy?: 'resume' | 'fork' | 'pin' | 'export';
+  notice?: string;
+  noticeKind?: 'info' | 'error';
+}
+
+/** 最近一次异步 control（fork/pin/export/resume）的对账锚：result 回执不带
+ * sessionId，用 (command, sessionId) 配对一次（单用户侧栏的 single-flight 假定） */
+interface PendingControl {
+  command: string;
+  sessionId: string;
+  at: number;
+}
+
 /* ---------- 轻量 UI 态持久化（vscode getState/setState） ---------- */
 
 interface PersistedUi {
@@ -152,6 +168,16 @@ export interface WebviewStore {
   /** Python 核心会话 id（session_started.sessionId，与宿主 sessionKey 是两个命名空间） */
   coreSessionId?: string;
   processState?: { sessionKey: string; state: string; detail?: string };
+  /** 会话条目瞬态 UI（busy/回执提示），key = sessionId */
+  sessionsUi: Record<string, SessionUiState>;
+  /**
+   * 最近一次 checkpoint 的 atMessageId —— 与入站 user_message 的 messageId
+   * 同源（main.py _on_user_message 生成同一 id），是 UI 侧唯一可得的分叉点
+   * 真实标识；无 git 仓库（无 checkpoint 帧）时为 undefined。
+   */
+  lastAtMessageId?: string;
+  /** 异步 control 对账锚（见 PendingControl） */
+  pendingControl?: PendingControl;
 
   /* ---- 切片：activeSession（当前会话投影） ---- */
   chat: { items: ChatItem[]; running: boolean };
@@ -168,6 +194,8 @@ export interface WebviewStore {
 
   /* ---- 切片：env ---- */
   env: { hardware: HardwareInfo; workspaceLangs: WorkspaceLang[] } | null;
+  /** env_refresh 已发出、等待 env_info 回流（按钮禁用态；15s 兜底解锁） */
+  envRefreshing: boolean;
 
   /* ---- 切片：tasks ---- */
   tasks: BackgroundTask[];
@@ -175,10 +203,13 @@ export interface WebviewStore {
   /* ---- 输入态 ---- */
   inputDraft: string;
   setInputDraft(text: string): void;
-  /** M3：待发上下文（📎文件 / ⊞选中 / 终端选中 / Problems 的 chip 集合） */
+  /** M3/M5：待发上下文（📎文件 / 🖼图片 / ⊞选中 / 终端选中 / Problems 的 chip 集合） */
   pendingContext: UserMessageContext;
   attachContext(patch: Partial<UserMessageContext>): void;
-  removeContextChip(kind: 'fileRef' | 'selection' | 'terminalSel' | 'problems', file?: string): void;
+  removeContextChip(
+    kind: 'fileRef' | 'selection' | 'terminalSel' | 'problems' | 'image',
+    file?: string,
+  ): void;
   applyHostPrompt(text: string, context?: UserMessageContext): void;
 
   /* ---- 动作 ---- */
@@ -190,6 +221,19 @@ export interface WebviewStore {
   sendUserMessage(text: string, context?: UserMessageContext): void;
   newSession(): void;
   cancelRunning(): void;
+
+  /* ---- M4 会话动作（R16/R28/R12；均发 control，回执经 result 归约） ---- */
+  /** 恢复/切换活跃会话：control resume（重放转录，session_started 切投影）
+   *  + session.activate RPC（宿主切换活跃进程，并行多开）+ 切聊天视图 */
+  activateSession(sessionId: string): void;
+  /** 从分叉点复制前缀成新会话（R16；atMessageId 见 FORK_AT_LAST_USER_MESSAGE 注释） */
+  forkSession(sessionId: string): void;
+  /** 收藏/取消收藏（R28；乐观翻转 —— core pin 只回 result 不回 sessions_list） */
+  togglePinSession(sessionId: string): void;
+  /** 导出 Markdown（R12）：control export → result.markdown → workspace.saveExport 落盘 */
+  exportSession(sessionId: string): void;
+  /** 环境面板刷新（M5/R21）：control env_refresh → 核心重新探测广播 env_info */
+  refreshEnv(): void;
   /** 决策按钮 → §5 permission_response；rule 为「写规则」附带文本（可选） */
   respondPermission(id: string, decision: 'allow' | 'deny' | 'always', rule?: string): void;
   reviewDiff(id: string, accepted: boolean): void;
@@ -252,6 +296,90 @@ function classifyRpcError(err: unknown): boolean {
   return !(err instanceof RpcTimeoutError);
 }
 
+type StoreSet = (partial: Partial<WebviewStore> | ((s: WebviewStore) => Partial<WebviewStore>)) => void;
+type StoreGet = () => WebviewStore;
+
+/** 单条会话 UI 态打补丁 */
+function patchSessionUi(set: StoreSet, sessionId: string, patch: Partial<SessionUiState>): void {
+  set((s) => ({
+    sessionsUi: { ...s.sessionsUi, [sessionId]: { ...s.sessionsUi[sessionId], ...patch } },
+  }));
+}
+
+/**
+ * result 回执归约（M4）：按 pendingControl 对账（result 帧不带 sessionId，
+ * command 匹配才消费），处理 export 落盘 / fork / pin / resume 的 busy 与提示。
+ * export 的 markdown 经宿主 workspace.saveExport RPC 落盘（R12：核心只产文本）。
+ */
+function reduceResult(
+  e: Extract<CoreEvent, { type: 'result' }>,
+  get: StoreGet,
+  set: StoreSet,
+): void {
+  const pend = get().pendingControl;
+  if (pend === undefined || e.command !== pend.command) return;
+  const sessionId = pend.sessionId;
+  set({ pendingControl: undefined });
+  if (e.command === 'export') {
+    if (e.ok && e.markdown != null && e.markdown !== '') {
+      patchSessionUi(set, sessionId, { busy: undefined, notice: '已生成导出，选择保存位置…', noticeKind: 'info' });
+      void hostRequest<{ path?: string; saved?: boolean }>('workspace.saveExport', {
+        markdown: e.markdown,
+        sessionId,
+        fileName: `zcode-${sessionId}.md`,
+      })
+        .then((r) => {
+          set({ hostConnected: true });
+          patchSessionUi(set, sessionId, {
+            busy: undefined,
+            notice: r?.path ? `已导出：${r.path}` : '已导出',
+            noticeKind: 'info',
+          });
+        })
+        .catch((err) => {
+          set({ hostConnected: classifyRpcError(err) });
+          patchSessionUi(set, sessionId, {
+            busy: undefined,
+            notice: `导出失败：${err instanceof Error ? err.message : String(err)}`,
+            noticeKind: 'error',
+          });
+        });
+    } else {
+      patchSessionUi(set, sessionId, {
+        busy: undefined,
+        notice: e.detail ?? '导出失败',
+        noticeKind: 'error',
+      });
+    }
+    return;
+  }
+  if (e.command === 'fork') {
+    patchSessionUi(set, sessionId, {
+      busy: undefined,
+      notice: e.ok ? `已分叉 → ${e.detail ?? '新会话'}` : e.detail ?? '分叉失败',
+      noticeKind: e.ok ? 'info' : 'error',
+    });
+    return;
+  }
+  if (e.command === 'pin') {
+    // 乐观翻转已在 togglePinSession 先行；失败（!ok）回滚
+    if (!e.ok) {
+      set((s) => ({
+        sessions: s.sessions.map((x) => (x.sessionId === sessionId ? { ...x, pinned: !x.pinned } : x)),
+      }));
+    }
+    patchSessionUi(set, sessionId, {
+      busy: undefined,
+      notice: e.ok ? (e.detail === 'pinned' ? '已收藏' : '已取消收藏') : e.detail ?? '收藏切换失败',
+      noticeKind: e.ok ? 'info' : 'error',
+    });
+    return;
+  }
+  if (e.command === 'resume') {
+    patchSessionUi(set, sessionId, { busy: undefined });
+  }
+}
+
 export const useStore = create<WebviewStore>()((set, get) => ({
   view: 'chat',
   hostConnected: false,
@@ -264,6 +392,9 @@ export const useStore = create<WebviewStore>()((set, get) => ({
   activeSessionKey: undefined,
   coreSessionId: undefined,
   processState: undefined,
+  sessionsUi: {},
+  lastAtMessageId: undefined,
+  pendingControl: undefined,
   chat: { items: [], running: false },
   todos: [],
   perf: { phase: 'idle' },
@@ -274,6 +405,7 @@ export const useStore = create<WebviewStore>()((set, get) => ({
   providers: [],
   providerUi: {},
   env: null,
+  envRefreshing: false,
   tasks: [],
   inputDraft: '',
 
@@ -292,6 +424,10 @@ export const useStore = create<WebviewStore>()((set, get) => ({
         const merged = [...(cur.fileRefs ?? []), ...patch.fileRefs];
         next.fileRefs = [...new Set(merged)];
       }
+      if (patch.images !== undefined) {
+        const mergedImgs = [...(cur.images ?? []), ...patch.images];
+        next.images = [...new Set(mergedImgs)];
+      }
       if (patch.selection !== undefined) next.selection = patch.selection;
       if (patch.terminalSel !== undefined) next.terminalSel = patch.terminalSel;
       if (patch.problems !== undefined) next.problems = patch.problems;
@@ -305,6 +441,8 @@ export const useStore = create<WebviewStore>()((set, get) => ({
       const next: UserMessageContext = { ...cur };
       if (kind === 'fileRef') {
         next.fileRefs = (cur.fileRefs ?? []).filter((f) => f !== file);
+      } else if (kind === 'image') {
+        next.images = (cur.images ?? []).filter((f) => f !== file);
       } else if (kind === 'selection') {
         delete next.selection;
       } else if (kind === 'terminalSel') {
@@ -550,7 +688,8 @@ export const useStore = create<WebviewStore>()((set, get) => ({
         break;
       }
       case 'env_info': {
-        set({ env: { hardware: e.hardware, workspaceLangs: e.workspaceLangs } });
+        // M5：刷新回流（env_refresh 发起）即解锁刷新按钮
+        set({ env: { hardware: e.hardware, workspaceLangs: e.workspaceLangs }, envRefreshing: false });
         break;
       }
       case 'sessions_list': {
@@ -584,15 +723,24 @@ export const useStore = create<WebviewStore>()((set, get) => ({
         }));
         break;
       }
-      case 'checkpoint':
+      case 'checkpoint': {
+        // atMessageId 与入站 user_message 的 messageId 同源（main.py 生成同一
+        // id 后先落转录再广播 checkpoint）——这是 UI 侧唯一可得的分叉点真实
+        // 标识，forkSession 据此发 control fork
+        set({ lastAtMessageId: e.atMessageId });
+        break;
+      }
+      case 'result': {
+        reduceResult(e, get, set);
+        break;
+      }
       case 'rollback_result':
       case 'compaction':
       case 'git_result':
       case 'image_artifact':
-      case 'result':
       case 'echo':
-        // M1 webview 尚不消费：检查点回滚 UI=R30/M2、压缩报告=M8、git=M4、
-        // 图片 artifact 展示=M5/M6、echo=M0 遗留帧。事件到达即忽略（不报错）。
+        // 尚不消费：压缩报告=M8、git=M4 宿主侧、图片 artifact 展示=M6、
+        // echo=M0 遗留帧。事件到达即忽略（不报错）。
         break;
     }
   },
@@ -637,6 +785,82 @@ export const useStore = create<WebviewStore>()((set, get) => ({
 
   cancelRunning: () => {
     hostSendCore({ type: 'control', command: 'cancel' });
+  },
+
+  activateSession: (sessionId) => {
+    // 已是当前投影会话：仅切视图（避免重复 resume 造成转录重放翻倍）
+    if (get().coreSessionId !== sessionId) {
+      set((s) => ({
+        sessionsUi: { ...s.sessionsUi, [sessionId]: { ...s.sessionsUi[sessionId], busy: 'resume' } },
+        pendingControl: { command: 'resume', sessionId, at: Date.now() },
+      }));
+      // 顺序：先 resume（发往当前活跃进程，核心绑定该会话并重放转录 ——
+      // session_started 到达时 store 切投影），再 session.activate（宿主把
+      // 活跃 sessionKey 指到绑定该会话的进程；并行多开 R16。方法名调用，
+      // 宿主侧并行实现，未注册时静默降级 —— 路由仍走默认活跃会话）
+      hostSendCore({ type: 'control', command: 'resume', sessionId });
+      void hostRequest('session.activate', { sessionId })
+        .then(() => set({ hostConnected: true }))
+        .catch((err) => set({ hostConnected: classifyRpcError(err) }));
+      armSessionBusyTimeout(sessionId, 'resume');
+    }
+    set({ view: 'chat' });
+    persistUi(get);
+  },
+
+  forkSession: (sessionId) => {
+    const s = get();
+    // 分叉点（R16）：UI 侧没有转录内 messageId —— 当前会话回退到最近一次
+    // checkpoint 的 atMessageId（与入站 user_message messageId 同源，即
+    // 「最后一条用户消息」）；非当前会话用哨兵 FORK_AT_LAST_USER_MESSAGE
+    // （约定字段：核心侧未支持时回 not_found 错误，协议字段待补）
+    const atMessageId =
+      sessionId === s.coreSessionId && s.lastAtMessageId != null
+        ? s.lastAtMessageId
+        : FORK_AT_LAST_USER_MESSAGE;
+    set((st) => ({
+      sessionsUi: { ...st.sessionsUi, [sessionId]: { ...st.sessionsUi[sessionId], busy: 'fork', notice: undefined } },
+      pendingControl: { command: 'fork', sessionId, at: Date.now() },
+    }));
+    hostSendCore({ type: 'control', command: 'fork', sessionId, atMessageId });
+    armSessionBusyTimeout(sessionId, 'fork');
+  },
+
+  togglePinSession: (sessionId) => {
+    const cur = get().sessions.find((x) => x.sessionId === sessionId)?.pinned ?? false;
+    // 乐观翻转：core pin 只回 result 不回 sessions_list（置顶渲染是 UI 策略，
+    // sessions.list_sessions 注释）——本地先行，result !ok 时归约器回滚
+    set((s) => ({
+      sessions: s.sessions.map((x) => (x.sessionId === sessionId ? { ...x, pinned: !cur } : x)),
+      sessionsUi: { ...s.sessionsUi, [sessionId]: { ...s.sessionsUi[sessionId], busy: 'pin' } },
+      pendingControl: { command: 'pin', sessionId, at: Date.now() },
+    }));
+    hostSendCore({ type: 'control', command: 'pin', sessionId, pinned: !cur });
+    armSessionBusyTimeout(sessionId, 'pin');
+  },
+
+  exportSession: (sessionId) => {
+    // R12：control export → result{command:'export', markdown} → 宿主
+    // workspace.saveExport 落盘（归约在 reduceResult；核心不替用户选路径）
+    set((s) => ({
+      sessionsUi: { ...s.sessionsUi, [sessionId]: { ...s.sessionsUi[sessionId], busy: 'export', notice: undefined } },
+      pendingControl: { command: 'export', sessionId, at: Date.now() },
+    }));
+    hostSendCore({ type: 'control', command: 'export', sessionId });
+    armSessionBusyTimeout(sessionId, 'export');
+  },
+
+  refreshEnv: () => {
+    if (get().envRefreshing) return;
+    // M5/R21：核心重新探测并广播 env_info（归约清除 envRefreshing）；
+    // 核心未实现该命令时回 error 帧，兜底超时解锁按钮
+    set({ envRefreshing: true });
+    hostSendCore({ type: 'control', command: 'env_refresh' });
+    window.setTimeout(() => {
+      if (useStore.getState().envRefreshing) {
+        useStore.setState({ envRefreshing: false });
+      }
+    }, 15_000);
   },
 
   respondPermission: (id, decision, rule) => {
@@ -793,3 +1017,18 @@ export const useStore = create<WebviewStore>()((set, get) => ({
     }));
   },
 }));
+
+/**
+ * busy 兜底解锁：control 回执（result）丢失或核心未实现该命令（回 error
+ * 帧、无 result）时，避免会话条目/刷新按钮卡在 busy 态（15s 单飞超时）。
+ */
+function armSessionBusyTimeout(sessionId: string, kind: SessionUiState['busy']): void {
+  window.setTimeout(() => {
+    const cur = useStore.getState().sessionsUi[sessionId];
+    if (cur?.busy === kind) {
+      useStore.setState((s) => ({
+        sessionsUi: { ...s.sessionsUi, [sessionId]: { ...cur, busy: undefined } },
+      }));
+    }
+  }, 15_000);
+}

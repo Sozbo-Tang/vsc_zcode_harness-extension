@@ -97,6 +97,12 @@
         "command": "zcode.sendProblems",
         "title": "诊断 Problems 面板",
         "category": "Zcode-Py"
+      },
+      {
+        "command": "zcode.attachImage",
+        "title": "附加图片给会话",
+        "category": "Zcode-Py",
+        "icon": "$(file-media)"
       }
     ],
     "menus": {
