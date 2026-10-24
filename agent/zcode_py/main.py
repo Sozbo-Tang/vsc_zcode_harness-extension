@@ -55,6 +55,7 @@ from .config import (
     api_key_for,
     get_model_entry,
     get_provider_entry,
+    home_dir,
     load_config,
 )
 from .cronjobs import CronManager
@@ -249,6 +250,12 @@ class ZcodeService:
         # M8（R31）：notebook 三件套 + search_history（L4 冷存检索）
         self._router = ResponseRouter()
         self._registry = default_registry()
+        # R3 工具开关 + 默认权限（tools.json：disabled / alwaysAllow），注册表
+        # 构建后立即应用（重启后开关与白名单保持）
+        self._tool_state = self._load_tool_state()
+        for _name in self._tool_state.get("disabled") or []:
+            if isinstance(_name, str):
+                self._registry.set_enabled(_name, False)
         register_memory_tool(self._registry)
         self._browser_registered = register_browser_tools(self._registry)
         self._registry.register(RUN_CHILD_SPEC)
@@ -599,6 +606,8 @@ class ZcodeService:
         )
         # 子代理与主会话共享同一个权限引擎（会话内 always 记忆互通，M7/R25）
         self._permissions_engine = engine
+        # tools.json 的 alwaysAllow 白名单热并入（R3 默认权限配置）
+        self._apply_allow_rules()
         session_cls = ToolSession if self._browser_registered else _BrowserHintSession
         session = session_cls(
             registry=self._registry,
@@ -843,6 +852,9 @@ class ZcodeService:
             "workflow_run": self._control_workflow_run,
             "workflows_list": self._control_workflows_list,
             "inline_complete": self._control_inline_complete,
+            "tools_list": self._control_tools_list,
+            "tool_toggle": self._control_tool_toggle,
+            "tool_permission": self._control_tool_permission,
         }.get(msg.command)
         if handler is None:
             self._emit(Error(kind="protocol", message=f"unknown control command: {msg.command!r}"))
@@ -1410,6 +1422,98 @@ class ZcodeService:
             command, name=name, timeout=timeout, cwd=self._workspace_cwd
         )
         self._emit(Result(ok=True, command="background_start", detail=record["taskId"]))
+
+    # ------------------------------------------------------------------ R3：工具开关 + 默认权限
+
+    def _tool_state_path(self) -> Path:
+        return home_dir() / "config" / "tools.json"
+
+    def _load_tool_state(self) -> dict:
+        try:
+            data = json.loads(self._tool_state_path().read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
+        return {"disabled": [], "alwaysAllow": []}
+
+    def _save_tool_state(self) -> None:
+        path = self._tool_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(self._tool_state, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def _tool_allow_rules(self) -> list[str]:
+        return [
+            str(r)
+            for r in (self._tool_state.get("alwaysAllow") or [])
+            if isinstance(r, str) and ":" in r
+        ]
+
+    def _apply_allow_rules(self) -> None:
+        """热更权限引擎白名单 = settings.permissionAllow + tools.json.alwaysAllow
+        （service 级共享引擎就地改写 inner.allow_rules，无需重建 loop）。"""
+        engine = self._permissions_engine
+        if engine is None:
+            return
+        engine.inner.allow_rules = [
+            str(r) for r in (self._settings.get("permissionAllow") or []) if isinstance(r, str)
+        ] + self._tool_allow_rules()
+
+    def _control_tools_list(self, msg: Control) -> None:
+        """R3 工具面板数据源：全部注册工具（含禁用态）+ 默认权限态。"""
+        always = {r.split(":", 1)[0] for r in self._tool_allow_rules()}
+        items = [
+            {
+                "name": spec.name,
+                "description": spec.description,
+                "tier": spec.tier,
+                "enabled": self._registry.get(spec.name) is not None,
+                "alwaysAllowed": spec.name in always,
+            }
+            for spec in self._registry.specs()
+        ]
+        self._emit(
+            Result(ok=True, command="tools_list", detail=json.dumps(items, ensure_ascii=False))
+        )
+
+    def _control_tool_toggle(self, msg: Control) -> None:
+        """R3 工具开关：禁用工具不进 schema（模型不可见不可调）；持久化。"""
+        name = (msg.name or "").strip()
+        if not name:
+            self._emit(Error(kind="protocol", message="tool_toggle requires a non-empty 'name'"))
+            return
+        if not self._registry.set_enabled(name, bool(msg.enabled)):
+            self._emit(Error(kind="not_found", message=f"unknown tool {name!r}"))
+            return
+        self._tool_state["disabled"] = self._registry.disabled_names()
+        self._save_tool_state()
+        self._emit(
+            Result(ok=True, command="tool_toggle", detail=f"{name}: {'on' if msg.enabled else 'off'}")
+        )
+
+    def _control_tool_permission(self, msg: Control) -> None:
+        """R3 默认权限：always = 该工具免询问白名单规则 ``name: *``；ask = 移除
+        该工具全部规则。**always 不绕过 DANGER 黑名单**（PLAN §9.3：引擎判定
+        顺序黑名单在最前，bash 危险命令在 always 下仍强制弹卡）。"""
+        name = (msg.name or "").strip()
+        mode = msg.mode
+        if not name:
+            self._emit(Error(kind="protocol", message="tool_permission requires a non-empty 'name'"))
+            return
+        if mode not in ("ask", "always"):
+            self._emit(
+                Error(kind="protocol", message="tool_permission mode must be 'ask' | 'always'")
+            )
+            return
+        rules = [r for r in self._tool_allow_rules() if r.split(":", 1)[0] != name]
+        if mode == "always":
+            rules.append(f"{name}: *")
+        self._tool_state["alwaysAllow"] = rules
+        self._save_tool_state()
+        self._apply_allow_rules()
+        self._emit(Result(ok=True, command="tool_permission", detail=f"{name}: {mode}"))
 
     def _control_tasks_list(self, msg: Control) -> None:
         """任务面板数据源：Result.detail JSON（state: running|finished|failed|

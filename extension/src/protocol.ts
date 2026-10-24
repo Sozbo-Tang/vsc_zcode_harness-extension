@@ -137,7 +137,12 @@ export type ControlCommand =
   // 工作流（workflows_list → result.detail JSON；workflow_run 异步运行，
   // 运行态沿任务帧/工具卡，最终报告走 result.detail JSON）
   | "workflow_run"
-  | "workflows_list";
+  | "workflows_list"
+  // R3：工具开关 + 默认权限（tools_list → result.detail JSON；toggle/
+  // permission 即时生效并持久化在核心侧 tools.json）
+  | "tools_list"
+  | "tool_toggle"
+  | "tool_permission";
 export interface ControlMessage {
   type: "control";
   command: ControlCommand;

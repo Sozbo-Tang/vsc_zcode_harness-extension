@@ -28,7 +28,7 @@
   },
   "contributes": {
     "viewsContainers": {
-      "activitybar": [
+      "auxiliarybar": [
         {
           "id": "zcode-py",
           "title": "Zcode-Py",

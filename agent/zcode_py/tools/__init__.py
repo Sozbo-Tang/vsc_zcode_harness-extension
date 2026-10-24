@@ -98,22 +98,46 @@ def error_outcome(detail: str, *, kind: str = "invalid_args") -> ToolOutcome:
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolSpec] = {}
+        # R3 工具开关：disabled 只对 schema 暴露与 get 生效（已注册 spec 保留，
+        # 重新启用即恢复）；持久化在 ~/.zcode-py/config/tools.json（service 层）
+        self._disabled: set[str] = set()
 
     def register(self, spec: ToolSpec) -> None:
         self._tools[spec.name] = spec
 
     def unregister(self, name: str) -> bool:
         """摘除一个工具（M8：MCP server 移除时回收 mcp__* 工具）。"""
+        self._disabled.discard(name)
         return self._tools.pop(name, None) is not None
 
     def get(self, name: str) -> ToolSpec | None:
+        if name in self._disabled:
+            return None
         return self._tools.get(name)
+
+    def set_enabled(self, name: str, enabled: bool) -> bool:
+        """工具开关（R3）：返回该名字是否存在于注册表（不存在 = 配置错）。"""
+        if name not in self._tools:
+            return False
+        if enabled:
+            self._disabled.discard(name)
+        else:
+            self._disabled.add(name)
+        return True
+
+    def disabled_names(self) -> list[str]:
+        return sorted(self._disabled)
 
     def names(self) -> list[str]:
         return sorted(self._tools)
 
+    def specs(self) -> list[ToolSpec]:
+        """全部 spec（含已禁用——工具面板要列出开关态）。"""
+        return [self._tools[k] for k in sorted(self._tools)]
+
     def schemas(self) -> list[dict]:
-        """OpenAI function 风格工具定义（LLMRequest.tools 的内部统一格式）。"""
+        """OpenAI function 风格工具定义（LLMRequest.tools 的内部统一格式）。
+        禁用工具不进 schema——模型看不到即不可调用。"""
         return [
             {
                 "type": "function",
@@ -123,7 +147,9 @@ class ToolRegistry:
                     "parameters": spec.parameters,
                 },
             }
-            for spec in (self._tools[k] for k in sorted(self._tools))
+            for k in sorted(self._tools)
+            if k not in self._disabled
+            for spec in (self._tools[k],)
         ]
 
 

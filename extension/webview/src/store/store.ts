@@ -23,6 +23,7 @@ import type {
   ProviderConfig,
   SessionSummary,
   SkillInfo,
+  ToolInfo,
   TelegraphLevel,
   TodoItem,
   UserMessageContext,
@@ -245,6 +246,19 @@ export interface WebviewStore {
   /** 发 control skills_list（核心扫描 SKILL.md → result.detail JSON 回执） */
   refreshSkills(): void;
 
+  /* ---- 切片：tools（R3 工具开关 + 默认权限） ---- */
+  /** tools_list 回执投影（ToolsView 工具页签数据源） */
+  toolsList: ToolInfo[];
+  /** tools_list 已发出、等待回执（刷新按钮禁用；15s 兜底） */
+  toolsRefreshing: boolean;
+  /** 是否已请求过一次（工具页签首开自动拉取的幂等标记） */
+  toolsRequested: boolean;
+  /** tool_toggle / tool_permission 进行中（单飞；成功后自动回拉 tools_list） */
+  toolActionPending: boolean;
+  refreshTools(): void;
+  toggleTool(name: string, enabled: boolean): void;
+  setToolPermission(name: string, mode: 'ask' | 'always'): void;
+
   /* ---- 切片：mcp（M8，R3/M8） ---- */
   /** mcp_list / mcp_refresh 回执投影（ToolsView MCP 页签数据源） */
   mcpServers: McpServerInfo[];
@@ -428,6 +442,36 @@ function patchSessionUi(set: StoreSet, sessionId: string, patch: Partial<Session
  * {skills: [...]} 包裹；条目须有 string name，description/path 宽容
  * （path 兼容 source 命名）；解析失败回空数组（UI 显示空态）。
  */
+/** R3 工具面板回执解析（宽容：数组或 {tools:[...]}；enabled/alwaysAllowed 缺省 false） */
+function parseToolsDetail(detail?: string): ToolInfo[] {
+  if (typeof detail !== 'string' || detail === '') return [];
+  let data: unknown;
+  try {
+    data = JSON.parse(detail);
+  } catch {
+    return [];
+  }
+  const arr = Array.isArray(data)
+    ? data
+    : data !== null && typeof data === 'object' && Array.isArray((data as { tools?: unknown }).tools)
+      ? ((data as { tools: unknown[] }).tools)
+      : [];
+  const out: ToolInfo[] = [];
+  for (const x of arr) {
+    if (x === null || typeof x !== 'object') continue;
+    const o = x as Record<string, unknown>;
+    if (typeof o.name !== 'string' || o.name === '') continue;
+    out.push({
+      name: o.name,
+      description: typeof o.description === 'string' ? o.description : undefined,
+      tier: typeof o.tier === 'string' ? o.tier : undefined,
+      enabled: o.enabled !== false,
+      alwaysAllowed: o.alwaysAllowed === true,
+    });
+  }
+  return out;
+}
+
 function parseSkillsDetail(detail?: string): SkillInfo[] {
   if (typeof detail !== 'string' || detail === '') return [];
   let data: unknown;
@@ -813,6 +857,19 @@ function reduceResult(
     set((s) => ({ skillsRefreshing: false, skills: e.ok ? parseSkillsDetail(e.detail) : s.skills }));
     return;
   }
+  if (e.command === 'tools_list') {
+    // R3：回执即解锁；toggle/permission 成功后的自动回拉也走这里刷新
+    set((s) => ({ toolsRefreshing: false, toolsList: e.ok ? parseToolsDetail(e.detail) : s.toolsList }));
+    return;
+  }
+  if (e.command === 'tool_toggle' || e.command === 'tool_permission') {
+    // 即时回执：解锁并自动回拉 tools_list（核心侧已持久化并热更引擎）
+    set({ toolActionPending: false });
+    if (e.ok) {
+      useStore.getState().refreshTools();
+    }
+    return;
+  }
   if (e.command === 'mcp_list' || e.command === 'mcp_refresh') {
     // M8：回执即解锁刷新按钮；ok 时以 detail JSON 覆盖 mcpServers（失败保留旧表 + 提示）
     set((s) => ({
@@ -926,6 +983,10 @@ export const useStore = create<WebviewStore>()((set, get) => ({
   envRefreshing: false,
   skills: [],
   skillsRefreshing: false,
+  toolsList: [],
+  toolsRefreshing: false,
+  toolsRequested: false,
+  toolActionPending: false,
   skillsRequested: false,
   mcpServers: [],
   mcpRefreshing: false,
@@ -1314,7 +1375,7 @@ export const useStore = create<WebviewStore>()((set, get) => ({
                 name: e.taskId,
                 status: 'running' as const,
                 startedAt: Date.now(),
-                tail: clampTail(e.text),
+                tail: clampTail(e.tail ?? ''),
               },
             ],
           };
@@ -1388,6 +1449,11 @@ export const useStore = create<WebviewStore>()((set, get) => ({
         // command error 帧）时立即解锁刷新按钮——不等 15s 兜底
         if (get().skillsRefreshing && e.message.includes('skills_list')) {
           set({ skillsRefreshing: false });
+        }
+        // R3：tools_* 同款——错误帧立即解锁工具面板 busy
+        if (e.message.includes('tools_list') || e.message.includes('tool_toggle')
+            || e.message.includes('tool_permission')) {
+          set({ toolsRefreshing: false, toolActionPending: false });
         }
         // M8：mcp_* 同款——错误帧立即解锁 busy 并把提示带进 MCP 页签
         if (e.message.includes('mcp_')) {
@@ -1589,6 +1655,56 @@ export const useStore = create<WebviewStore>()((set, get) => ({
     }, 15_000);
   },
 
+  refreshTools: () => {
+    if (get().toolsRefreshing) return;
+    // R3：control tools_list → result.detail JSON（reduceResult 对账消费）
+    set({
+      toolsRefreshing: true,
+      toolsRequested: true,
+      pendingControl: { command: 'tools_list', sessionId: get().coreSessionId ?? '', at: Date.now() },
+    });
+    hostSendCore({ type: 'control', command: 'tools_list' });
+    window.setTimeout(() => {
+      if (useStore.getState().toolsRefreshing) {
+        useStore.setState({ toolsRefreshing: false });
+      }
+    }, 15_000);
+  },
+
+  toggleTool: (name, enabled) => {
+    if (get().toolActionPending) return;
+    set({ toolActionPending: true });
+    hostSendCore({
+      type: 'control',
+      command: 'tool_toggle',
+      name,
+      enabled,
+      query: JSON.stringify({ name, enabled }),
+    });
+    window.setTimeout(() => {
+      if (useStore.getState().toolActionPending) {
+        useStore.setState({ toolActionPending: false });
+      }
+    }, 15_000);
+  },
+
+  setToolPermission: (name, mode) => {
+    if (get().toolActionPending) return;
+    set({ toolActionPending: true });
+    hostSendCore({
+      type: 'control',
+      command: 'tool_permission',
+      name,
+      mode,
+      query: JSON.stringify({ name, mode }),
+    });
+    window.setTimeout(() => {
+      if (useStore.getState().toolActionPending) {
+        useStore.setState({ toolActionPending: false });
+      }
+    }, 15_000);
+  },
+
   refreshMcp: (command = 'mcp_list') => {
     if (get().mcpRefreshing) return;
     // M8：control mcp_list（首开/添加后回拉）或 mcp_refresh（「↻ 刷新」重连
@@ -1742,7 +1858,7 @@ export const useStore = create<WebviewStore>()((set, get) => ({
     hostSendCore({
       type: 'control',
       command: 'cron_remove',
-      cronId: entry?.id ?? name,
+      cronId: String(entry?.id ?? name),
       name,
       query: JSON.stringify({ cronId: entry?.id, name }),
     });
@@ -1764,7 +1880,7 @@ export const useStore = create<WebviewStore>()((set, get) => ({
     hostSendCore({
       type: 'control',
       command: 'cron_toggle',
-      cronId: get().crons.find((c) => c.name === name)?.id ?? name,
+      cronId: String(get().crons.find((c) => c.name === name)?.id ?? name),
       name,
       enabled,
       query: JSON.stringify({ name, enabled }),

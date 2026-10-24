@@ -281,13 +281,20 @@ export type CoreSend =
         | 'cron_remove'
         | 'cron_toggle'
         | 'workflow_run'
-        | 'workflows_list';
+        | 'workflows_list'
+        // R3：工具开关 + 默认权限（tools.json 持久化在核心侧）
+        | 'tools_list'
+        | 'tool_toggle'
+        | 'tool_permission';
       sessionId?: string;
       level?: string;
       providerId?: string;
       modelId?: string;
-      /** permission_mode：目标模式（build | plan | yolo） */
-      mode?: PermissionMode;
+      /**
+       * permission_mode：目标模式（build | plan | yolo）；
+       * tool_permission：默认权限（ask = 每次询问 | always = 始终允许白名单）
+       */
+      mode?: PermissionMode | 'ask' | 'always';
       /** fork：分叉点（转录内入站 user_message 的 messageId） */
       atMessageId?: string;
       /** pin：目标态；缺省 = 取反切换 */
@@ -458,6 +465,18 @@ export interface SkillInfo {
   description?: string;
   /** SKILL.md 来源路径（列表 title 属性展示） */
   path?: string;
+  [key: string]: unknown;
+}
+
+/** R3 工具面板条目（tools_list 回执投影） */
+export interface ToolInfo {
+  name: string;
+  description?: string;
+  /** readonly | write */
+  tier?: string;
+  enabled: boolean;
+  /** true = 已有 `name: *` 免询问白名单规则（不绕过危险命令黑名单） */
+  alwaysAllowed: boolean;
   [key: string]: unknown;
 }
 

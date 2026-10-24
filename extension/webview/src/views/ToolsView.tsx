@@ -1,6 +1,7 @@
 /**
- * ToolsView 工具·Skills·MCP 视图（M1 空壳 → M7 Skills 页签 → M8 MCP 页签）。
- *  - 工具开关 M2（占位文案不变）；
+ * ToolsView 工具·Skills·MCP 视图。
+ *  - 工具（R3，已实装）：tools_list 回执 → 开关 + 默认权限（每次询问/
+ *    始终允许），tool_toggle / tool_permission 即时生效并自动回拉；
  *  - Skills（M7/R3）：control skills_list 回执（store.skills，reduceResult
  *    对账）→ 列表（名称 + 描述 + 来源路径）；首开自动拉取一次，「刷新」
  *    重发；核心未就绪/无技能时显示空态 + SKILL.md 放置指引。
@@ -17,6 +18,82 @@ import { useStore } from '../store/store';
 import type { McpServerInfo } from '../protocol';
 
 const TABS = ['工具', 'Skills', 'MCP'] as const;
+
+/* ---------- R3：工具开关 + 默认权限 ---------- */
+
+function ToolsTab(): React.JSX.Element {
+  const tools = useStore((s) => s.toolsList);
+  const refreshing = useStore((s) => s.toolsRefreshing);
+  const requested = useStore((s) => s.toolsRequested);
+  const pending = useStore((s) => s.toolActionPending);
+  const refreshTools = useStore((s) => s.refreshTools);
+  const toggleTool = useStore((s) => s.toggleTool);
+  const setToolPermission = useStore((s) => s.setToolPermission);
+
+  // 首开自动拉取一次（幂等标记）；之后靠「刷新」手动重发
+  useEffect(() => {
+    if (!requested) refreshTools();
+  }, [requested, refreshTools]);
+
+  return (
+    <div className="toolspanel">
+      <div className="skillhead">
+        <span>
+          工具 <span className="muted small">（{tools.length}）</span>
+        </span>
+        <button
+          className="btn sec"
+          onClick={refreshTools}
+          disabled={refreshing}
+          title="重新拉取工具注册表（control tools_list）"
+        >
+          {refreshing ? '刷新中…' : '↻ 刷新'}
+        </button>
+      </div>
+      {tools.length === 0 ? (
+        <div className="muted empty-note">
+          {refreshing ? '正在获取工具列表…' : '暂无工具数据（核心未就绪？点「刷新」重试）。'}
+        </div>
+      ) : (
+        <ul className="toollist">
+          {tools.map((t) => (
+            <li key={t.name} className="toolrow" title={t.description ?? t.name}>
+              <label className="toolname">
+                <input
+                  type="checkbox"
+                  checked={t.enabled}
+                  disabled={pending}
+                  onChange={(e) => toggleTool(t.name, e.target.checked)}
+                  title={t.enabled ? '关闭后模型不可见不可调' : '开启后恢复注册'}
+                />
+                <span className="toolrow-name">{t.name}</span>
+                {t.tier === 'readonly' ? (
+                  <span className="tierbadge ro">只读</span>
+                ) : (
+                  <span className="tierbadge wr">写</span>
+                )}
+              </label>
+              <select
+                className="sel"
+                value={t.alwaysAllowed ? 'always' : 'ask'}
+                disabled={pending || !t.enabled}
+                onChange={(e) => setToolPermission(t.name, e.target.value as 'ask' | 'always')}
+                title="默认权限：始终允许不会绕过危险命令黑名单（PLAN §9.3）"
+              >
+                <option value="ask">每次询问</option>
+                <option value="always">始终允许</option>
+              </select>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="muted small skillhint">
+        关闭的工具不进模型 schema（不可见不可调）；「始终允许」写入核心白名单
+        （~/.zcode-py/config/tools.json），危险命令黑名单仍强制确认。
+      </div>
+    </div>
+  );
+}
 
 function SkillsTab(): React.JSX.Element {
   const skills = useStore((s) => s.skills);
@@ -336,9 +413,7 @@ export function ToolsView(): React.JSX.Element {
       ) : tab === 'MCP' ? (
         <McpTab />
       ) : (
-        <div className="muted empty-note">
-          工具开关 + 默认权限配置在 M2 工具系统落地后开放（R3）。
-        </div>
+        <ToolsTab />
       )}
     </div>
   );

@@ -68,6 +68,10 @@ CONTROL_COMMANDS = (
     # M9（R13）：内联补全（chat 模型模拟 FIM；宿主 inlineCompletion 发起，
     # detail = 插入文本，超时/失败一律 Result.ok=False 静默降级）
     "inline_complete",
+    # R3：工具开关 + 默认权限（tools.json 持久化；always 规则不绕过黑名单）
+    "tools_list",
+    "tool_toggle",
+    "tool_permission",
 )
 PERMISSION_DECISIONS = ("allow", "deny", "always")
 TOOL_CALL_STATES = ("started", "update", "finished")
