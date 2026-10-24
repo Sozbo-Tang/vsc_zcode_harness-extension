@@ -13,6 +13,14 @@ dependencies = [
 dev = [
     "pytest",
 ]
+# M6（R8）浏览器自动化可选组：browser-use 未安装时 tools/browser.py 的
+# 注册函数返回 False、两个浏览器工具不进注册表（服务侧对幻觉调用返回
+# 结构化安装指引）。uv 用法：
+#   安装：uv sync --project agent --group browser
+#   运行/测试（带浏览器）：uv run --project agent --group browser pytest -q
+browser = [
+    "browser-use",
+]
 
 [build-system]
 requires = ["hatchling"]

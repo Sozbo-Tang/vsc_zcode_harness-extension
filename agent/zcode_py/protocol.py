@@ -41,6 +41,8 @@ CONTROL_COMMANDS = (
     "search_sessions",
     # M5（R7/R21）：环境面板「刷新」——重新探测并广播 env_info
     "env_refresh",
+    # M7（R26）：Skills 面板——已加载 SKILL.md 列表（经 Result.detail JSON 返回）
+    "skills_list",
 )
 PERMISSION_DECISIONS = ("allow", "deny", "always")
 TOOL_CALL_STATES = ("started", "update", "finished")

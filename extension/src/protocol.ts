@@ -630,6 +630,24 @@ export interface WorkspaceSaveExportResult {
   path: string;
 }
 
+export const RPC_WORKSPACE_IMAGE_URI = "workspace.imageUri";
+/**
+ * M6（R8）：本地图片 → webview 可显示的 URI（image_artifact 帧的 path →
+ * <img src>）。webview CSP 的 img-src 只认 cspSource（asWebviewUri 前缀），
+ * 本地文件必须经宿主转换；**不开放任意路径**——path 必须位于首个工作区根
+ * 或 ~/.zcode_py / ~/.zcode-py 之下（截图 artifact 的落盘目录约定），越界
+ * 抛错（安全约束：webview 不应获得读取宿主任意文件的能力）。
+ * 视图未 resolve（无 webview 实例可转换）时同样应答错误。
+ */
+export interface WorkspaceImageUriParams {
+  /** image_artifact.path（扩展宿主侧本地绝对路径，远程下即远程侧路径） */
+  path: string;
+}
+export interface WorkspaceImageUriResult {
+  /** vscode.Webview.asWebviewUri(...).toString()（可直接作 <img src>） */
+  uri: string;
+}
+
 export const RPC_SESSION_ACTIVATE = "session.activate";
 /**
  * 活跃会话切换（R16 并行多开）：更新宿主 activeSessionKey（此后不带

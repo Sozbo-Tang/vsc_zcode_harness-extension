@@ -4,10 +4,13 @@
  *  - 思考块默认折叠（▸ 🧠 思考 12.4s）
  *  - 工具卡（点击发编辑跟随占位 RPC）/ 权限卡（四键 + 写规则）/
  *    diff 审阅卡（+N/−M 统计 + 打开对比页 RPC + 接受/拒绝）/
- *    中继卡 / 子代理卡 —— 全部按转录事件流顺序渲染（见 store.applyEvent
- *    各 reducer 的「交错接线」注释），与消息流正确交错
+ *    中继卡 / 子代理卡（M7 run_child）/ 截图 artifact 卡（M6 image_artifact）
+ *    —— 全部按转录事件流顺序渲染（见 store.applyEvent 各 reducer 的
+ *    「交错接线」注释），与消息流正确交错
  *  - 任务清单条
  *  - 底部控制条 = 车钟 + 模型选择 + 权限模式 + 上下文格 + 性能格
+ *  - M7：输入框整条 /<前缀> 时在 @ 补全同款下拉位置列出匹配 skill
+ *    （数据源 store.skills，点击/Enter 补全 /name）
  *
  * 输入不打断保证：权限卡等流内卡片只追加进 chat-log，绝不 disable /
  * 清空输入框、不抢焦点；running 期间 Enter 静默（发送仍按运行态门控，
@@ -26,6 +29,7 @@ import { PermissionCard } from '../components/PermissionCard';
 import { DiffReviewCard } from '../components/DiffReviewCard';
 import { VisionRelayCard } from '../components/VisionRelayCard';
 import { SubagentCard } from '../components/SubagentCard';
+import { ImageArtifactCard } from '../components/ImageArtifactCard';
 import { TaskListBar } from '../components/TaskListBar';
 import { WelcomePage } from '../components/WelcomePage';
 
@@ -110,6 +114,9 @@ function ItemView({ item }: { item: ChatItem }): React.JSX.Element {
       return <DiffReviewCard item={item} />;
     case 'relay':
       return <VisionRelayCard item={item} />;
+    case 'image':
+      // M6（R8）：image_artifact 帧投影 → 截图卡（宿主 RPC 换 webview URI）
+      return <ImageArtifactCard item={item} />;
     case 'error':
       return (
         <div className="syserr" title={`kind: ${item.errorKind}`}>
@@ -142,6 +149,10 @@ export function ChatView(): React.JSX.Element {
   const pendingContext = useStore((s) => s.pendingContext);
   const attachContext = useStore((s) => s.attachContext);
   const removeContextChip = useStore((s) => s.removeContextChip);
+  // M7 Skills：斜杠命令提示数据源（store.skills ← control skills_list 回执）
+  const skills = useStore((s) => s.skills);
+  const skillsRequested = useStore((s) => s.skillsRequested);
+  const refreshSkills = useStore((s) => s.refreshSkills);
   const rpc = useHostRpc();
 
   const [teleOpen, setTeleOpen] = useState(false);
@@ -153,6 +164,29 @@ export function ChatView(): React.JSX.Element {
   // M4/R27：输入历史回溯指针（null = 不在回溯态；否则指向 history 下标，
   // 键入（非历史选择）即复位 —— 见 onDraftChange）
   const histNavRef = useRef<number | null>(null);
+  // M7 斜杠命令提示：草稿整体是 /<前缀> 时列出匹配 skill（active 高亮下标
+  // + dismissed 关闭标记；换前缀即复位）。与 @ 补全共用 atmenu 下拉样式与
+  // 位置（composer-attach 内 bottom:100%）。
+  const [slashActive, setSlashActive] = useState(0);
+  const [slashDismissed, setSlashDismissed] = useState(false);
+
+  const slashQuery = (() => {
+    const m = /^\/([A-Za-z0-9_-]*)$/.exec(draft);
+    return m === null ? null : m[1].toLowerCase();
+  })();
+  const slashItems =
+    slashQuery === null
+      ? []
+      : skills
+          .filter((sk) => sk.name.toLowerCase().startsWith(slashQuery))
+          .slice(0, 8);
+  const slashMenuOpen = slashQuery !== null && slashItems.length > 0 && !slashDismissed;
+
+  // 前缀变化即重置高亮/关闭态（Escape 只对当前前缀生效）
+  useEffect(() => {
+    setSlashActive(0);
+    setSlashDismissed(false);
+  }, [slashQuery]);
 
   // 本会话输入历史：转录内 user 条目按序取文本（resume 重放同样覆盖）；
   // 「另发过的」消息全部经 store.sendUserMessage 落入 items，无需单独记账
@@ -200,6 +234,8 @@ export function ChatView(): React.JSX.Element {
   const onDraftChange = (text: string): void => {
     histNavRef.current = null; // 键入即离开历史回溯态（历史选择走 setInputDraft 不经此）
     setInputDraft(text);
+    // M7 斜杠命令提示：以 / 起头时惰性拉一次 skills 列表（幂等：skillsRequested）
+    if (text.startsWith('/') && !skillsRequested) refreshSkills();
     const m = /@([A-Za-z0-9_./-]*)$/.exec(text);
     if (m === null) {
       setAtMenu(null);
@@ -228,6 +264,12 @@ export function ChatView(): React.JSX.Element {
     setAtMenu(null);
   };
 
+  /** M7：点击/Enter 选中 skill → 补全完整 /name（尾随空格便于继续输入参数） */
+  const pickSlashSkill = (name: string): void => {
+    setInputDraft(`/${name} `);
+    setSlashDismissed(false);
+  };
+
   const onInputKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>): void => {
     if (atMenu !== null && atMenu.items.length > 0) {
       if (e.key === 'ArrowDown') {
@@ -249,6 +291,31 @@ export function ChatView(): React.JSX.Element {
       if (e.key === 'Escape') {
         e.preventDefault();
         setAtMenu(null);
+        return;
+      }
+    }
+    // M7 斜杠命令提示：菜单开着时 ↑↓ 换高亮、Enter/Tab 补全、Esc 关闭
+    // （与 @ 补全互斥：slash 匹配要求整条草稿是 /<前缀>，不会与 @token 共存）
+    if (slashMenuOpen) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setSlashActive((a) => (a + 1) % slashItems.length);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setSlashActive((a) => (a - 1 + slashItems.length) % slashItems.length);
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        const sk = slashItems[slashActive];
+        if (sk !== undefined) pickSlashSkill(sk.name);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setSlashDismissed(true);
         return;
       }
     }
@@ -402,6 +469,7 @@ export function ChatView(): React.JSX.Element {
       </div>
 
       {(atMenu !== null && atMenu.items.length > 0) ||
+      slashMenuOpen ||
       (pendingContext.fileRefs?.length ?? 0) > 0 ||
       (pendingContext.images?.length ?? 0) > 0 ||
       pendingContext.selection !== undefined ||
@@ -420,6 +488,28 @@ export function ChatView(): React.JSX.Element {
                   onMouseEnter={() => setAtMenu({ ...atMenu, active: i })}
                 >
                   📎 {f}
+                </div>
+              ))}
+            </div>
+          )}
+          {slashMenuOpen && (
+            <div className="atmenu" role="listbox">
+              {slashItems.map((sk, i) => (
+                <div
+                  key={sk.name}
+                  role="option"
+                  aria-selected={i === slashActive}
+                  className={i === slashActive ? 'atitem active' : 'atitem'}
+                  onClick={() => pickSlashSkill(sk.name)}
+                  onMouseEnter={() => setSlashActive(i)}
+                  title={sk.path ?? sk.name}
+                >
+                  <span className="slashname">/{sk.name}</span>
+                  {sk.description !== undefined && sk.description !== '' && (
+                    <span className="slashdesc">
+                      {sk.description.slice(0, 60)}
+                    </span>
+                  )}
                 </div>
               ))}
             </div>
@@ -473,7 +563,7 @@ export function ChatView(): React.JSX.Element {
         <textarea
           className="in inputbox"
           rows={2}
-          placeholder="问点什么… (@引用文件 / Shift+Enter 换行)"
+          placeholder="问点什么… (@引用文件 / 斜杠技能命令 / Shift+Enter 换行)"
           value={draft}
           onChange={(e) => onDraftChange(e.target.value)}
           onKeyDown={onInputKeyDown}

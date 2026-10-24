@@ -54,6 +54,15 @@ export class ZcodeWebviewViewProvider implements vscode.WebviewViewProvider {
     this.rpcHandlers.set(method, handler);
   }
 
+  /**
+   * M6（R8）：本地文件 URI → webview 可加载的 URI（asWebviewUri 是 Webview
+   * 实例方法，实例由本类私有持有；此只读透传是 workspace.imageUri RPC 的
+   * 最小暴露面）。视图未 resolve 时返回 undefined（调用方应答错误即可）。
+   */
+  public asWebviewUriOf(uri: vscode.Uri): string | undefined {
+    return this.view !== undefined ? this.view.webview.asWebviewUri(uri).toString() : undefined;
+  }
+
   public async resolveWebviewView(view: vscode.WebviewView): Promise<void> {
     this.view = view;
     const distUri = vscode.Uri.joinPath(this.extensionUri, "webview", "dist");

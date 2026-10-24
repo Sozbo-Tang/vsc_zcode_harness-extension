@@ -19,6 +19,7 @@ import type {
   PingResult,
   ProviderConfig,
   SessionSummary,
+  SkillInfo,
   TelegraphLevel,
   TodoItem,
   UserMessageContext,
@@ -71,6 +72,12 @@ export type ChatItem =
       accepted?: boolean;
     }
   | { kind: 'relay'; id: string; at: number; model: string; preset: string; description: string }
+  /**
+   * M6（R8）：截图/图片 artifact（image_artifact{path} 帧归约）。path 是宿主侧
+   * 本地绝对路径——渲染端经宿主 RPC workspace.imageUri 换 webview URI 后
+   * <img> 显示（失败回退路径文本）。
+   */
+  | { kind: 'image'; id: string; at: number; path: string }
   | { kind: 'error'; id: string; at: number; errorKind: string; message: string };
 
 export interface PerfState {
@@ -197,6 +204,16 @@ export interface WebviewStore {
   /** env_refresh 已发出、等待 env_info 回流（按钮禁用态；15s 兜底解锁） */
   envRefreshing: boolean;
 
+  /* ---- 切片：skills（M7，R3） ---- */
+  /** skills_list 回执投影（ToolsView Skills 页签 + 输入框 / 命令提示数据源） */
+  skills: SkillInfo[];
+  /** skills_list 已发出、等待 result 回执（刷新按钮禁用态；15s 兜底解锁） */
+  skillsRefreshing: boolean;
+  /** 是否已请求过一次（Skills 页签首开自动拉取一次的幂等标记） */
+  skillsRequested: boolean;
+  /** 发 control skills_list（核心扫描 SKILL.md → result.detail JSON 回执） */
+  refreshSkills(): void;
+
   /* ---- 切片：tasks ---- */
   tasks: BackgroundTask[];
 
@@ -234,6 +251,8 @@ export interface WebviewStore {
   exportSession(sessionId: string): void;
   /** 环境面板刷新（M5/R21）：control env_refresh → 核心重新探测广播 env_info */
   refreshEnv(): void;
+  /** Skills 刷新（M7/R3）：control skills_list → result.detail JSON → skills 切片 */
+  refreshSkills(): void;
   /** 决策按钮 → §5 permission_response；rule 为「写规则」附带文本（可选） */
   respondPermission(id: string, decision: 'allow' | 'deny' | 'always', rule?: string): void;
   reviewDiff(id: string, accepted: boolean): void;
@@ -307,6 +326,44 @@ function patchSessionUi(set: StoreSet, sessionId: string, patch: Partial<Session
 }
 
 /**
+ * M7：skills_list 回执 result.detail（JSON 字符串）→ SkillInfo[]。
+ * Python 侧（skills.py）载荷形状未定稿——宽容解析：数组本身，或
+ * {skills: [...]} 包裹；条目须有 string name，description/path 宽容
+ * （path 兼容 source 命名）；解析失败回空数组（UI 显示空态）。
+ */
+function parseSkillsDetail(detail?: string): SkillInfo[] {
+  if (typeof detail !== 'string' || detail === '') return [];
+  let data: unknown;
+  try {
+    data = JSON.parse(detail);
+  } catch {
+    return [];
+  }
+  const arr = Array.isArray(data)
+    ? data
+    : data !== null && typeof data === 'object' && Array.isArray((data as { skills?: unknown }).skills)
+      ? ((data as { skills: unknown[] }).skills)
+      : [];
+  const out: SkillInfo[] = [];
+  for (const x of arr) {
+    if (x === null || typeof x !== 'object') continue;
+    const o = x as Record<string, unknown>;
+    if (typeof o.name !== 'string' || o.name === '') continue;
+    out.push({
+      name: o.name,
+      description: typeof o.description === 'string' ? o.description : undefined,
+      path:
+        typeof o.path === 'string'
+          ? o.path
+          : typeof o.source === 'string'
+            ? o.source
+            : undefined,
+    });
+  }
+  return out;
+}
+
+/**
  * result 回执归约（M4）：按 pendingControl 对账（result 帧不带 sessionId，
  * command 匹配才消费），处理 export 落盘 / fork / pin / resume 的 busy 与提示。
  * export 的 markdown 经宿主 workspace.saveExport RPC 落盘（R12：核心只产文本）。
@@ -320,6 +377,11 @@ function reduceResult(
   if (pend === undefined || e.command !== pend.command) return;
   const sessionId = pend.sessionId;
   set({ pendingControl: undefined });
+  if (e.command === 'skills_list') {
+    // M7：回执即解锁刷新按钮；ok 时以 detail JSON 覆盖 skills 切片（失败保留旧表）
+    set((s) => ({ skillsRefreshing: false, skills: e.ok ? parseSkillsDetail(e.detail) : s.skills }));
+    return;
+  }
   if (e.command === 'export') {
     if (e.ok && e.markdown != null && e.markdown !== '') {
       patchSessionUi(set, sessionId, { busy: undefined, notice: '已生成导出，选择保存位置…', noticeKind: 'info' });
@@ -406,6 +468,9 @@ export const useStore = create<WebviewStore>()((set, get) => ({
   providerUi: {},
   env: null,
   envRefreshing: false,
+  skills: [],
+  skillsRefreshing: false,
+  skillsRequested: false,
   tasks: [],
   inputDraft: '',
 
@@ -711,6 +776,20 @@ export const useStore = create<WebviewStore>()((set, get) => ({
         }));
         break;
       }
+      case 'image_artifact': {
+        // M6（R8）：截图 artifact 入聊天流（ImageArtifactCard 经宿主 RPC
+        // workspace.imageUri 换 <img src>；失败回退路径文本）
+        set((s) => ({
+          chat: {
+            ...s.chat,
+            items: [
+              ...s.chat.items,
+              { kind: 'image', id: nid('img'), at: Date.now(), path: e.path },
+            ],
+          },
+        }));
+        break;
+      }
       case 'error': {
         set((s) => ({
           chat: {
@@ -721,6 +800,11 @@ export const useStore = create<WebviewStore>()((set, get) => ({
             ],
           },
         }));
+        // M7：skills_list 未被核心识别（Python 侧并行实现中会回 unknown control
+        // command error 帧）时立即解锁刷新按钮——不等 15s 兜底
+        if (get().skillsRefreshing && e.message.includes('skills_list')) {
+          set({ skillsRefreshing: false });
+        }
         break;
       }
       case 'checkpoint': {
@@ -737,10 +821,9 @@ export const useStore = create<WebviewStore>()((set, get) => ({
       case 'rollback_result':
       case 'compaction':
       case 'git_result':
-      case 'image_artifact':
       case 'echo':
-        // 尚不消费：压缩报告=M8、git=M4 宿主侧、图片 artifact 展示=M6、
-        // echo=M0 遗留帧。事件到达即忽略（不报错）。
+        // 尚不消费：压缩报告=M8、git=M4 宿主侧、echo=M0 遗留帧。
+        // 事件到达即忽略（不报错）。
         break;
     }
   },
@@ -859,6 +942,24 @@ export const useStore = create<WebviewStore>()((set, get) => ({
     window.setTimeout(() => {
       if (useStore.getState().envRefreshing) {
         useStore.setState({ envRefreshing: false });
+      }
+    }, 15_000);
+  },
+
+  refreshSkills: () => {
+    if (get().skillsRefreshing) return;
+    // M7/R3：control skills_list → result{command:'skills_list', detail:JSON}
+    // （reduceResult 对账消费 → skills 切片）。核心未实现/命令非法时回 error
+    // 帧（error 归约里按 skills_list 字样立即解锁）+ 15s 兜底。
+    set({
+      skillsRefreshing: true,
+      skillsRequested: true,
+      pendingControl: { command: 'skills_list', sessionId: get().coreSessionId ?? '', at: Date.now() },
+    });
+    hostSendCore({ type: 'control', command: 'skills_list' });
+    window.setTimeout(() => {
+      if (useStore.getState().skillsRefreshing) {
+        useStore.setState({ skillsRefreshing: false });
       }
     }, 15_000);
   },

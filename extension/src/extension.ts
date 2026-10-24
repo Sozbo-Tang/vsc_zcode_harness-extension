@@ -12,6 +12,8 @@
  */
 
 import * as vscode from "vscode";
+import * as os from "node:os";
+import * as path from "node:path";
 import { ApiKeyStore } from "./secrets";
 import {
   ControlMessage,
@@ -31,9 +33,11 @@ import {
   RPC_EDITOR_PICK_FILE,
   RPC_EDITOR_PICK_IMAGE,
   RPC_SESSION_ACTIVATE,
+  RPC_WORKSPACE_IMAGE_URI,
   RPC_WORKSPACE_SAVE_EXPORT,
   SessionActivateParams,
   UserMessageContext,
+  WorkspaceImageUriParams,
   WorkspaceSaveExportParams,
 } from "./protocol";
 import {
@@ -67,6 +71,26 @@ function agentDirFrom(extensionUri: vscode.Uri): string {
   // 扩展装在 <repo>/extension/，agent 在 <repo>/agent/ —— 由扩展位置推导，
   // 不硬编码绝对路径（远程开发时即远程扩展宿主侧路径）
   return vscode.Uri.joinPath(extensionUri, "..", "agent").fsPath;
+}
+
+/**
+ * M6（R8）image_artifact 路径白名单：仅首工作区根与 ~/.zcode_py / ~/.zcode-py
+ * （PLAN §3.2 会话目录约定，两代拼写都放行）之下的文件可转 webview URI ——
+ * 不开放任意路径（protocol.ts RPC_WORKSPACE_IMAGE_URI 契约：webview 不得
+ * 借此读取宿主任意文件）。strict 子路径判定，文件本身必须严格位于根内。
+ */
+function isAllowedArtifactPath(candidate: string): boolean {
+  const allowedRoots = ["/.zcode_py", "/.zcode-py"].map((dir) =>
+    path.join(os.homedir(), dir),
+  );
+  const firstRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (firstRoot !== undefined) {
+    allowedRoots.push(firstRoot);
+  }
+  return allowedRoots.some((root) => {
+    const rel = path.relative(path.resolve(root), path.resolve(candidate));
+    return rel !== "" && rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+  });
 }
 
 function updateStatusBar(rt: Runtime): void {
@@ -264,6 +288,25 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     await vscode.workspace.fs.writeFile(target, Buffer.from(p.markdown, "utf8"));
     return { path: target.fsPath };
+  });
+
+  // M6（R8）：image_artifact.path → webview URI（<img src>）。asWebviewUri 是
+  // Webview 实例方法，经 provider 只读透传（webviewHost.asWebviewUriOf）；
+  // 路径白名单见 isAllowedArtifactPath（首工作区根 / ~/.zcode_py 系），越界抛错
+  provider.registerRpcHandler(RPC_WORKSPACE_IMAGE_URI, (params) => {
+    const p = params as Partial<WorkspaceImageUriParams> | undefined;
+    if (p === undefined || typeof p.path !== "string" || p.path.length === 0) {
+      throw new Error("workspace.imageUri: 参数需为 {path: string}（image_artifact.path）");
+    }
+    const file = vscode.Uri.file(p.path);
+    if (!isAllowedArtifactPath(file.fsPath)) {
+      throw new Error(`workspace.imageUri: 路径不在允许范围（须位于首工作区根或 ~/.zcode_py 下）: ${p.path}`);
+    }
+    const uri = provider.asWebviewUriOf(file);
+    if (uri === undefined) {
+      throw new Error("workspace.imageUri: webview 未就绪，请稍后重试");
+    }
+    return { uri };
   });
 
   // M4：活跃会话切换（R16 并行多开）：更新宿主路由目标 + 状态栏并持久化；

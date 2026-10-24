@@ -13,7 +13,13 @@
 - ``control``：new_session / resume / cancel / telegraph / switch_model / ping
   + M4 四件：fork（分叉点之前轮次复制成新会话并广播）/ pin（收藏切换）/
   export（Markdown 经 result 帧返回）/ set_root（multi-root 切当前根）
+  + M5 env_refresh（环境重探测）+ M7 skills_list（已加载 SKILL.md 列表）
   （compact 属 M8，明确回 unsupported）
+- M6（R8）：browser-use 可选组——可用才注册 browser_navigate/browser_screenshot
+  （截图经 image_artifact 帧）；未安装时对幻觉调用返回安装指引
+- M7（R25/R26）：run_child 子代理工具（上下文防火墙、深度=1、可指定模型）
+  + SKILL.md 加载器（后台扫描注入 system prompt；用户消息 /<name> 开头展开
+  并广播 result 帧注明）
 - git_commit 属后续里程碑，回 unsupported
 
 会话转录（transcript.jsonl + meta.json）由 sessions/ 落盘；resume 重放历史
@@ -79,7 +85,10 @@ from .protocol import (
     encode_message,
 )
 from .sessions import SessionError, SessionStore
+from .skills import SkillsManager, expand_slash, skills_injection
+from .subagents import ChildRuntime, RUN_CHILD_SPEC
 from .tools import ToolSession, default_registry
+from .tools.browser import BROWSER_TOOL_NAMES, browser_unavailable_outcome, register_browser_tools
 
 DEFAULT_PERMISSION_TIMEOUT_S = 300.0
 
@@ -178,6 +187,17 @@ class StdioEmitter:
             self._stream.flush()
 
 
+class _BrowserHintSession(ToolSession):
+    """browser-use 未安装（工具未注册）时的兜底：模型幻觉调用 browser_* 工具
+    名（schema 里没有，但用户点名要浏览器时模型可能猜）→ 返回结构化安装
+    指引而不是干巴巴的 unknown_tool。"""
+
+    def run(self, name: str, args: dict, call_id: str):
+        if name in BROWSER_TOOL_NAMES:
+            return browser_unavailable_outcome(name)
+        return super().run(name, args, call_id)
+
+
 class ZcodeService:
     def __init__(
         self,
@@ -205,13 +225,21 @@ class ZcodeService:
         self._settings: dict = {}
         self._workspace_roots: list = []
         self._usage_by_model: dict[str, dict[str, int]] = {}
-        # M2：工具/权限/检查点；M4：memory 工具（R24）挂进注册表
+        # M2：工具/权限/检查点；M4：memory 工具（R24）挂进注册表；
+        # M6（R8）：browser-use 可选组——未安装不注册（False），幻觉调用由
+        # _BrowserHintSession 返回结构化安装指引；M7（R25）：run_child 子代理
         self._router = ResponseRouter()
         self._registry = default_registry()
         register_memory_tool(self._registry)
+        self._browser_registered = register_browser_tools(self._registry)
+        self._registry.register(RUN_CHILD_SPEC)
         self._checkpoints: CheckpointManager | None = None
         self._workspace_cwd = Path.cwd()
         self._permission_timeout_s = DEFAULT_PERMISSION_TIMEOUT_S
+        # M7（R26）：skills 目录扫描（init 后台线程；快照供 system prompt 注入
+        # 与斜杠展开）；_permissions_engine 供子代理共享权限引擎
+        self._skills = SkillsManager(self._workspace_cwd)
+        self._permissions_engine: MemoryPermissionEngine | None = None
         # M5：环境探测（R7/R21）后台线程状态与注入缓存
         self._env_probe_lock = threading.Lock()
         self._env_probe_thread: threading.Thread | None = None
@@ -281,6 +309,22 @@ class ZcodeService:
         # M5（R7/R21）：init 后台线程探测硬件+工作区语言 → 广播 env_info；
         # 不阻塞读线程与首条消息（环境注入规则见 _system_prompt_with_env）
         self._spawn_env_probe()
+        # M7（R26）：skills 目录后台扫描（不阻塞首条消息；注入规则同环境事实
+        # ——扫描完成前的轮次用裸提示词，完成后生效于后续轮次；斜杠展开在
+        # _on_user_message 里按需同步加载，不受扫描时机影响）
+        self._skills = SkillsManager(self._workspace_cwd)
+        self._spawn_skills_scan()
+
+    # ------------------------------------------------------------------ M7 skills
+
+    def _spawn_skills_scan(self) -> None:
+        def _scan() -> None:
+            loaded = self._skills.ensure_loaded()
+            loop = self._loop
+            if loaded and loop is not None:
+                loop.system_prompt = self._system_prompt_with_env()
+
+        threading.Thread(target=_scan, daemon=True, name="zcode-skills").start()
 
     # ------------------------------------------------------------------ M5 环境探测
 
@@ -422,11 +466,24 @@ class ZcodeService:
         prompt = str(self._settings.get("systemPrompt") or DEFAULT_SYSTEM_PROMPT)
         if self._env_facts:
             prompt += "\n\n" + self._env_facts
+        # M7（R26）：已加载 skills 列表注入（loaded_skills 不触发同步扫描——
+        # 后台扫描完成前不阻塞、不占首轮 token；完成后经 _spawn_skills_scan
+        # 更新 loop.system_prompt 生效于后续轮次）
+        skills_block = skills_injection(self._skills.loaded_skills())
+        if skills_block:
+            prompt += skills_block
         # R24：会话启动注入跨会话记忆尾部（无 MEMORY.md / 空文件不占 token）
         injection = memory_injection()
         if injection:
             prompt += injection
         return prompt
+
+    def _browser_headless(self) -> bool:
+        """R8 有头/无头：init.settings.browser.headless（默认 headless）。"""
+        browser_cfg = self._settings.get("browser")
+        if isinstance(browser_cfg, dict) and isinstance(browser_cfg.get("headless"), bool):
+            return browser_cfg["headless"]
+        return True
 
     def _rebuild_loop(self) -> None:
         perf = PerfTracker()
@@ -435,7 +492,10 @@ class ZcodeService:
             str(r) for r in (self._settings.get("permissionAllow") or []) if isinstance(r, str)
         ]
         engine = MemoryPermissionEngine(allow_rules=allow_rules)
-        session = ToolSession(
+        # 子代理与主会话共享同一个权限引擎（会话内 always 记忆互通，M7/R25）
+        self._permissions_engine = engine
+        session_cls = ToolSession if self._browser_registered else _BrowserHintSession
+        session = session_cls(
             registry=self._registry,
             permissions=engine,
             cwd=self._workspace_cwd,
@@ -443,6 +503,22 @@ class ZcodeService:
             ask_permission=self._ask_permission,
             review_diff=self._review_diff,
             cancel_event=self._cancel,
+        )
+        # 工具 ctx 注入（browser 截图帧广播 / headless 配置 / 子代理运行时）
+        session.ctx.state["emit"] = self._emit
+        session.ctx.state["browserHeadless"] = self._browser_headless()
+        session.ctx.state["child_runtime"] = ChildRuntime(
+            registry=self._registry,
+            permissions=engine,
+            cwd=self._workspace_cwd,
+            emit=self._emit,
+            ask_permission=self._ask_permission,
+            review_diff=self._review_diff,
+            provider_supplier=lambda: (self._provider, self.model_id, self._provider_entry),
+            factory=self._factory,
+            config_supplier=lambda: self._config or {},
+            api_key_env=self._api_key_env,
+            main_cancel=self._cancel,
         )
         if isinstance(self._settings.get("searchBaseUrl"), str):
             session.ctx.state["searchBaseUrl"] = self._settings["searchBaseUrl"]
@@ -507,7 +583,22 @@ class ZcodeService:
                 self._emit(
                     Checkpoint(id=snap.checkpoint_id, sha=snap.sha, atMessageId=message_id)
                 )
-        text = _decorate_user_message(msg)
+        # M7（R26）斜杠命令：/<name> 开头且命中已加载 skill → SKILL.md 正文拼进
+        # 该轮消息前缀（斜杠 token 被展开体替换），广播 result 帧注明展开；
+        # 未命中原样透传
+        skill_prefix, rest, skill = expand_slash(msg.text or "", self._skills.ensure_loaded())
+        if skill is not None:
+            tail = _decorate_user_message(UserMessage(text=rest, context=msg.context))
+            text = skill_prefix + (("\n\n" + tail) if tail else "")
+            self._emit(
+                Result(
+                    ok=True,
+                    command="skill",
+                    detail=f"expanded skill {skill.name!r} from {skill.path}",
+                )
+            )
+        else:
+            text = _decorate_user_message(msg)
         images = [
             str(p)
             for p in ((msg.context.images if msg.context is not None else None) or [])
@@ -601,6 +692,7 @@ class ZcodeService:
             "set_root": self._control_set_root,
             "search_sessions": self._control_search_sessions,
             "env_refresh": self._control_env_refresh,
+            "skills_list": self._control_skills_list,
         }.get(msg.command)
         if handler is None:
             self._emit(Error(kind="protocol", message=f"unknown control command: {msg.command!r}"))
@@ -907,6 +999,17 @@ class ZcodeService:
             )
             return
         self._emit(Result(ok=True, command="env_refresh", detail="probing"))
+
+    def _control_skills_list(self, msg: Control) -> None:
+        """M7 Skills 面板：已加载 SKILL.md 列表（name+description，JSON 直通 UI）。"""
+        skills = self._skills.ensure_loaded()
+        payload = [
+            {"name": s.name, "description": s.description, "path": s.path}
+            for s in sorted(skills.values(), key=lambda s: s.name)
+        ]
+        self._emit(
+            Result(ok=True, command="skills_list", detail=json.dumps(payload, ensure_ascii=False))
+        )
 
     def _restore_session_root(self, meta: dict) -> None:
         """resume 时回到 meta.rootPath 记录的根（仍在当前 workspaceRoots 内才生效）。"""

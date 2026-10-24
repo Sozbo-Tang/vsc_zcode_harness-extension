@@ -1049,3 +1049,119 @@ body {
   color: var(--vscode-foreground);
   border-bottom-color: var(--vscode-focusBorder);
 }
+
+/* ---------- M6：截图 artifact 卡（ImageArtifactCard） ---------- */
+
+.imgcard {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.imgcard-img {
+  max-width: 100%;
+  border-radius: 4px;
+  border: 1px solid var(--vscode-panel-border);
+  display: block;
+}
+
+.imgcard-fallback {
+  border: 1px dashed var(--vscode-panel-border);
+  border-radius: 4px;
+  padding: 8px 6px;
+  text-align: center;
+}
+
+.imgcard-path {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+/* ---------- M6：browser_* 操作时间线（ToolCallCard 结果区） ---------- */
+
+.timeline {
+  margin: 5px 0 2px;
+  padding-left: 22px;
+  font-size: 11.5px;
+}
+
+.timeline li {
+  padding: 1px 0;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- M7：子代理卡（SubagentCard） ---------- */
+
+.subcard summary {
+  cursor: pointer;
+}
+
+.subcard-label {
+  margin-top: 4px;
+}
+
+/* ---------- M7：Skills 页签（ToolsView） ---------- */
+
+.skillspanel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.skillhead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.skilllist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.skillitem {
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+.skillname {
+  font-family: monospace;
+  color: var(--vscode-foreground);
+  overflow-wrap: anywhere;
+}
+
+.skilldesc {
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+
+.skillpath {
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.skillhint {
+  padding-top: 4px;
+}
+
+/* ---------- M7：斜杠命令提示（复用 atmenu 下拉，@ 补全同款位置） ---------- */
+
+.slashname {
+  font-family: monospace;
+}
+
+.slashdesc {
+  margin-left: 8px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+}

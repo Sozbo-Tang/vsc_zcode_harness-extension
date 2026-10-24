@@ -230,7 +230,10 @@ export type CoreSend =
         | 'export'
         | 'set_root'
         // M5（R7/R21）：环境面板「刷新」→ 核心重新探测并广播 env_info
-        | 'env_refresh';
+        | 'env_refresh'
+        // M7（R3）：Skills 列表——核心扫描 SKILL.md 后经 result 帧回执
+        // （Python 侧 CONTROL_COMMANDS 定稿为准；宿主镜像枚举暂缺，宽容转发）
+        | 'skills_list';
       sessionId?: string;
       level?: string;
       providerId?: string;
@@ -336,7 +339,7 @@ export interface SessionActivateResult {
 }
 
 /** M4（R12）：会话导出 Markdown 落盘（宿主保存对话框 + 写文件） */
-export type WorkspaceRpcMethod = 'workspace.saveExport';
+export type WorkspaceRpcMethod = 'workspace.saveExport' | 'workspace.imageUri';
 
 export interface WorkspaceSaveExportParams {
   /** control export 回执 result.markdown 全文 */
@@ -350,6 +353,34 @@ export interface WorkspaceSaveExportResult {
   /** 实际保存路径（用户取消时缺省） */
   path?: string;
   saved?: boolean;
+}
+
+/**
+ * M6（R8）：本地图片路径 → webview URI（image_artifact 帧 → <img src>）。
+ * CSP img-src 只认 cspSource，本地文件必须经宿主 asWebviewUri 转换；宿主侧
+ * 白名单 = 首工作区根 + ~/.zcode_py 系（越界应答错误 → 组件回退显示路径）。
+ */
+export interface WorkspaceImageUriParams {
+  /** image_artifact.path（宿主侧本地绝对路径） */
+  path: string;
+}
+
+export interface WorkspaceImageUriResult {
+  /** 可直接作 <img src> 的 webview URI */
+  uri: string;
+}
+
+/**
+ * M7：Skill 条目（control skills_list 回执 result.detail JSON 解析产物）。
+ * Python 侧（skills.py 并行实现中）字段宽容：name 必有，description/path
+ * （来源 SKILL.md 路径）可选——解析端做形状归一。
+ */
+export interface SkillInfo {
+  name: string;
+  description?: string;
+  /** SKILL.md 来源路径（列表 title 属性展示） */
+  path?: string;
+  [key: string]: unknown;
 }
 
 export interface GetStateResult {
