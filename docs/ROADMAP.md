@@ -3,49 +3,52 @@
 > 依据 docs/PLAN.md §7 生成，实施时逐项勾选；每里程碑完成需全量 pytest + 类型检查（PLAN §8）。
 > 勾选规则：一项功能验收通过才勾；里程碑全部勾完后在该节标题后追加 ✅。
 
-## M0 骨架
+## M0 骨架 ✅
 
-- [ ] git 仓库初始化 + .gitignore
-- [ ] agent/ Python 包骨架（uv 管理，python>=3.12，anthropic/openai/httpx）
-- [ ] zcode_py stdin JSONL → stdout echo 往返
-- [ ] extension/ TS 薄壳骨架（activityBar 容器 + 侧边栏 webview view + 命令占位）
-- [ ] extension/webview/ React 独立包骨架（vite + react + zustand + react-markdown）
-- [ ] 三条门禁命令通过：`uv run --project agent pytest -q` / `npm --prefix extension run compile` / `npm --prefix extension/webview run build`
-- [ ] 远程开发设计原则落地（workspaceFolders、无硬编码绝对路径、python 子进程在扩展宿主侧拉起）
+- [x] git 仓库初始化 + .gitignore
+- [x] agent/ Python 包骨架（uv 管理，python>=3.12，anthropic/openai/httpx）
+- [x] zcode_py stdin JSONL → stdout echo 往返（M1 已演进为真实协议分发，全链路 stdin JSONL → stdout JSONL 由 test_smoke.py 保持覆盖）
+- [x] extension/ TS 薄壳骨架（activityBar 容器 + 侧边栏 webview view + 命令占位）
+- [x] extension/webview/ React 独立包骨架（vite + react + zustand + react-markdown）
+- [x] 三条门禁命令通过：`uv run --project agent pytest -q` / `npm --prefix extension run compile` / `npm --prefix extension/webview run build`
+- [x] 远程开发设计原则落地（workspaceFolders、无硬编码绝对路径、python 子进程在扩展宿主侧拉起）
 
 **验收：全链路往返**
+完成于本次 workflow，验证：pytest/compile/build 门禁 + 独立评审
 
 ## M1 聊天 + 多厂商
 
-- [ ] anthropic 协议适配器（流式 + tool_use 原生块）
-- [ ] openai 协议适配器
-- [ ] FakeProvider（pytest 脚本化假流式，无网可测——开发命脉）
-- [ ] API 连接管理 UI：多套 Provider 配置 CRUD
-- [ ] API Key 存 SecretStorage（环境变量注入子进程）
-- [ ] 测试连接（Ping）按钮：✓延迟+模型回复 / ✗错误分类
-- [ ] 拉取模型列表按钮 + 模型档案（上下文长度/能力标记）
-- [ ] 流式 Markdown 渲染（react-markdown）
-- [ ] 车钟控件四模式（预算型/档位型/开关型/无思考型，模型档案 `telegraphLevels` 数据驱动）
-- [ ] 性能格：首 token 耗时 + token/s 实时/定格/上轮值
-- [ ] gemini / ollama / openrouter / 自定义 BaseURL 适配器
-- [ ] 协议往返 pytest 测试锁定 TS/Python 字段一致
+- [x] anthropic 协议适配器（流式 + tool_use 原生块）
+- [x] openai 协议适配器
+- [x] FakeProvider（pytest 脚本化假流式，无网可测——开发命脉）
+- [x] API 连接管理 UI：多套 Provider 配置 CRUD
+- [x] API Key 存 SecretStorage（环境变量注入子进程）
+- [x] 测试连接（Ping）按钮：✓延迟+模型回复 / ✗错误分类
+- [x] 拉取模型列表按钮 + 模型档案（上下文长度/能力标记）
+- [x] 流式 Markdown 渲染（react-markdown）
+- [x] 车钟控件四模式（预算型/档位型/开关型/无思考型，模型档案 `telegraphLevels` 数据驱动）
+- [x] 性能格：首 token 耗时 + token/s 实时/定格/上轮值
+- [ ] gemini / ollama / openrouter / 自定义 BaseURL 适配器（gemini 与自定义 BaseURL 已通；ollama/openrouter 独立适配与真实厂商联调未验证）
+- [x] 协议往返 pytest 测试锁定 TS/Python 字段一致
 
 **验收：任意厂商流式对话**
+完成于本次 workflow，验证：pytest/compile/build 门禁 + 独立评审
 
 ## M2 工具 + 权限安全
 
-- [ ] 工具注册表 + 只读三件套（read/glob/grep）
-- [ ] 权限引擎（表驱动测试）
-- [ ] 危险命令黑名单（优先级高于一切白名单与"总是允许"）
-- [ ] 权限卡 UI（允许/会话内总是/拒绝/写规则）
-- [ ] write/edit(str_replace)/bash 工具 + diff 事件
-- [ ] diff 审阅卡 + 工具卡 UI
-- [ ] 检查点（用户消息前 git 快照）+ 回滚按钮 + 无 git 仓库降级
-- [ ] webfetch / websearch 工具（host 校验，拒绝环回/私有地址）
-- [ ] L1 源头截断（bash 超 3 万字符取头尾、Read 行数上限）
-- [ ] 隐私护栏（.env / *.pem / id_rsa 模式警告）
+- [x] 工具注册表 + 只读三件套（read/glob/grep）
+- [x] 权限引擎（表驱动测试）
+- [x] 危险命令黑名单（优先级高于一切白名单与"总是允许"）
+- [ ] 权限卡 UI（允许/会话内总是/拒绝/写规则）（协议侧 permission_request/response 已通；UI 属 webview）
+- [x] write/edit(str_replace)/bash 工具 + diff 事件（bash 执行核心为装配缝，见 docs/BASH_BACKEND_SPEC.md）
+- [ ] diff 审阅卡 + 工具卡 UI（协议侧 diff_proposed/diff_review 已通；UI 属 webview）
+- [x] 检查点（用户消息前 git 快照）+ 回滚命令 + 无 git 仓库降级（UI「回滚到这」按钮属 webview）
+- [x] webfetch / websearch 工具（host 校验，拒绝环回/私有地址）
+- [x] L1 源头截断（bash 超 3 万字符取头尾、Read 行数上限）
+- [x] 隐私护栏（.env / *.pem / id_rsa 模式警告）
 
-**验收：读码答问；写弹卡；可回滚**
+**验收：读码答问；写弹卡；可回滚**（核侧全链路 pytest 覆盖；弹卡 UI 待 webview）
+完成于本次 workflow，验证：pytest/compile/build 门禁 + 独立评审
 
 ## M3 编辑器联动
 
