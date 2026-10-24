@@ -1,0 +1,20 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "npm: compile (extension)",
+      "type": "npm",
+      "script": "compile",
+      "path": "extension",
+      "problemMatcher": ["$tsc"],
+      "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "npm: build (webview)",
+      "type": "npm",
+      "script": "build",
+      "path": "extension/webview",
+      "problemMatcher": []
+    }
+  ]
+}

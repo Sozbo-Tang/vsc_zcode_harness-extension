@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "运行 Zcode-Py 扩展（F5）",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}/extension"],
+      "outFiles": ["${workspaceFolder}/extension/dist/**/*.js"],
+      "preLaunchTask": "npm: compile (extension)"
+    }
+  ]
+}
