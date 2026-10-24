@@ -8,6 +8,7 @@
  *    unknown_method，这里静默吞错 —— 注册后同一点击即刻生效。
  */
 import { useHostRpc } from '../host/useHostRpc';
+import { useT } from '../i18n';
 import type { ChatItem } from '../store/store';
 import { formatParam } from '../store/store';
 import type { EditorFollowToolCallParams } from '../protocol';
@@ -126,6 +127,7 @@ function parseNotebookOutputs(result: unknown): NotebookOutput[] | null {
 
 export function ToolCallCard({ item }: { item: Extract<ChatItem, { kind: 'tool' }> }): React.JSX.Element {
   const rpc = useHostRpc();
+  const t = useT();
   const arg = mainArg(item.args);
   // M6：browser_* 完成帧带操作时间线 → 有序步骤列表；失败/无时间线照旧
   const timeline =
@@ -152,22 +154,31 @@ export function ToolCallCard({ item }: { item: Extract<ChatItem, { kind: 'tool' 
   };
 
   return (
-    <details className="card toolcard">
+    <details className={item.state === 'finished' ? 'card toolcard is-done' : 'card toolcard is-running'}>
       <summary
-        title="点击跳转文件行（编辑跟随，M3 编辑器桥接入后生效）"
+        title={t('tool.followTitle')}
         onClick={onFollow}
       >
         <span className="card-title">
-          🔨 {item.name} {arg.length > 52 ? `${arg.slice(0, 52)}…` : arg}
+          <span className="card-kicker">TOOL</span>
+          <span className="tool-name">{item.name}</span>
+          {arg !== '' && (
+            <span className="tool-arg" title={arg}>
+              {arg.length > 52 ? `${arg.slice(0, 52)}…` : arg}
+            </span>
+          )}
         </span>
         <span className="card-side">
           {item.state === 'finished' ? (
-            <span className="ok">✓</span>
+            <span className="ok" title={t('tool.done')}>✓</span>
           ) : (
-            <span className="muted">{item.state === 'update' ? '⟳' : '⋯'}</span>
+            <span className="muted" title={item.state === 'update' ? t('tool.updating') : t('tool.running')}>
+              {item.state === 'update' ? '⟳' : '●'}
+            </span>
           )}
-          {item.elapsedMs != null && <span className="muted"> {fmtElapsed(item.elapsedMs)}</span>}
-          <span className="muted" title="编辑跟随（M3）"> ↗</span>
+          {item.elapsedMs != null && <span className="muted">{fmtElapsed(item.elapsedMs)}</span>}
+          <span className="tool-follow muted" title={t('tool.followHint')}>↗</span>
+          <span className="card-chevron muted">▸</span>
         </span>
       </summary>
       {item.warning && (

@@ -9,15 +9,16 @@
  */
 import { useState } from 'react';
 import { useStore } from '../store/store';
+import { useT, type TranslateParams } from '../i18n';
 import type { ProviderConfig, ProviderProtocol } from '../protocol';
 
-const PROTOCOLS: Array<{ value: ProviderProtocol; label: string }> = [
-  { value: 'anthropic', label: 'anthropic' },
-  { value: 'openai', label: 'openai' },
-  { value: 'gemini', label: 'gemini' },
-  { value: 'ollama', label: 'ollama' },
-  { value: 'openrouter', label: 'openrouter' },
-  { value: 'custom', label: '自定义(anthropic 兼容)' },
+const PROTOCOLS: Array<{ value: ProviderProtocol; labelKey: string }> = [
+  { value: 'anthropic', labelKey: '' }, // 协议名原样显示（zh/en 同文）
+  { value: 'openai', labelKey: '' },
+  { value: 'gemini', labelKey: '' },
+  { value: 'ollama', labelKey: '' },
+  { value: 'openrouter', labelKey: '' },
+  { value: 'custom', labelKey: 'api.protocolCustom' },
 ];
 
 interface Draft {
@@ -57,16 +58,20 @@ function draftFrom(p: ProviderConfig): Draft {
   };
 }
 
-function profileLabel(p: ProviderConfig): string {
+/** 模型档案一行摘要（文案经 t() 渲染期解析，R20 i18n） */
+function profileLabel(
+  p: ProviderConfig,
+  t: (key: string, params?: TranslateParams) => string,
+): string {
   const m = p.models.find((x) => x.id === p.selectedModel);
-  if (!m) return '档案未知（拉取列表或手填后可知）';
-  const ctx = m.contextLength ? `${Math.round(m.contextLength / 1000)}k` : '上下文?';
+  if (!m) return t('api.profileUnknown');
+  const ctx = m.contextLength ? `${Math.round(m.contextLength / 1000)}k` : t('api.profileCtxUnknown');
   const caps = [
     m.capabilities?.thinking ? '🧠✓' : '🧠✗',
     m.capabilities?.vision ? '👁✓' : '👁✗',
     m.capabilities?.tools ? '⚙✓' : '⚙✗',
   ].join(' ');
-  return `档案 ${ctx} · ${caps}`;
+  return t('api.profile', { ctx, caps });
 }
 
 export function ApiView(): React.JSX.Element {
@@ -77,6 +82,7 @@ export function ApiView(): React.JSX.Element {
   const setDefaultProvider = useStore((s) => s.setDefaultProvider);
   const pingProvider = useStore((s) => s.pingProvider);
   const fetchModels = useStore((s) => s.fetchModels);
+  const t = useT();
 
   const [draft, setDraft] = useState<Draft | null>(null);
   const [newApiKey, setNewApiKey] = useState('');
@@ -142,14 +148,14 @@ export function ApiView(): React.JSX.Element {
   return (
     <div className="view apiview">
       <div className="view-head">
-        <span>API 连接</span>
+        <span>{t('api.title')}</span>
         <button className="btn" onClick={onNew}>
-          ＋新增
+          {t('api.add')}
         </button>
       </div>
 
       <div className="provlist">
-        {providers.length === 0 && <div className="muted">尚无 Provider，点「＋新增」创建。</div>}
+        {providers.length === 0 && <div className="muted">{t('api.empty')}</div>}
         {providers.map((p) => (
           <div
             key={p.id}
@@ -158,7 +164,7 @@ export function ApiView(): React.JSX.Element {
           >
             <button
               className={`dot${p.isDefault ? ' on' : ''}`}
-              title={p.isDefault ? '默认 Provider' : '点击设为默认'}
+              title={p.isDefault ? t('api.defaultDotTitle') : t('api.setDefaultDotTitle')}
               disabled={p.isDefault}
               onClick={(e) => {
                 e.stopPropagation();
@@ -166,7 +172,7 @@ export function ApiView(): React.JSX.Element {
               }}
             />
             <span className="prov-name">{p.name}</span>
-            {p.isDefault && <span className="chip">默认</span>}
+            {p.isDefault && <span className="chip">{t('api.defaultChip')}</span>}
             <span className="muted prov-proto">{p.protocol}</span>
           </div>
         ))}
@@ -174,28 +180,30 @@ export function ApiView(): React.JSX.Element {
 
       {draft && (
         <div className="form">
-          <div className="form-title">{draft.isNew ? '新增 Provider' : `编辑：${draft.name || draft.id}`}</div>
-
-          <div className="form-row">
-            <label>名称</label>
-            <input className="in" value={draft.name} onChange={(e) => set('name', e.target.value)} placeholder="如 GLM 编程套餐" />
+          <div className="form-title">
+            {draft.isNew ? t('api.newProvider') : t('api.editProvider', { name: draft.name || draft.id })}
           </div>
 
           <div className="form-row">
-            <label>协议</label>
+            <label>{t('api.nameLabel')}</label>
+            <input className="in" value={draft.name} onChange={(e) => set('name', e.target.value)} placeholder={t('api.namePlaceholder')} />
+          </div>
+
+          <div className="form-row">
+            <label>{t('api.protocolLabel')}</label>
             <select className="sel" value={draft.protocol} onChange={(e) => set('protocol', e.target.value as ProviderProtocol)}>
               {PROTOCOLS.map((o) => (
                 <option key={o.value} value={o.value}>
-                  {o.label}
+                  {o.labelKey === '' ? o.value : t(o.labelKey)}
                 </option>
               ))}
             </select>
-            <label>BaseURL</label>
+            <label>{t('api.baseURLLabel')}</label>
             <input className="in grow" value={draft.baseURL} onChange={(e) => set('baseURL', e.target.value)} placeholder="https://…" />
           </div>
 
           <div className="form-row">
-            <label>API Key</label>
+            <label>{t('api.apiKeyLabel')}</label>
             <input
               className="in grow"
               type={showKey ? 'text' : 'password'}
@@ -203,12 +211,12 @@ export function ApiView(): React.JSX.Element {
               onChange={(e) => setNewApiKey(e.target.value)}
               placeholder={
                 editing?.hasKey
-                  ? `已保存 ••••${editing.apiKeyLast4 ?? ''}（输入则替换）`
-                  : '未配置（仅存 SecretStorage，不落盘）'
+                  ? t('api.keyPlaceholderSaved', { last4: editing.apiKeyLast4 ?? '' })
+                  : t('api.keyPlaceholderUnset')
               }
               autoComplete="off"
             />
-            <button className="btn sec" onClick={() => setShowKey((v) => !v)} title="显示/隐藏输入的 Key">
+            <button className="btn sec" onClick={() => setShowKey((v) => !v)} title={t('api.showKeyTitle')}>
               {showKey ? '🙈' : '👁'}
             </button>
           </div>
@@ -218,30 +226,30 @@ export function ApiView(): React.JSX.Element {
               className="btn"
               disabled={!editing || ui?.pingBusy}
               onClick={() => editing && void pingProvider(editing.id)}
-              title="保存后可测试连接（宿主代理发一条最小请求，显示延迟/错误分类）"
+              title={t('api.pingTitle')}
             >
-              ⚡测试连接
+              {t('api.ping')}
             </button>
             {ui?.pingBusy && <span className="muted">⋯</span>}
             {ui?.ping &&
               (ui.ping.ok ? (
-                <span className="ok">✓ {ui.ping.latencyMs ?? '?'}ms 模型正常</span>
+                <span className="ok">{t('api.pingOk', { ms: ui.ping.latencyMs ?? '?' })}</span>
               ) : (
                 <span className="bad" title={ui.ping.message ?? ''}>
-                  ✗ {ui.ping.errorKind ?? '错误'}
+                  ✗ {ui.ping.errorKind ?? t('api.pingErrorKind')}
                 </span>
               ))}
-            {!editing && <span className="muted">先保存后可测试</span>}
+            {!editing && <span className="muted">{t('api.saveFirst')}</span>}
           </div>
 
           <div className="form-row">
-            <label>模型</label>
+            <label>{t('api.modelLabel')}</label>
             <input
               className="in grow"
               list={`models-${draft.id}`}
               value={draft.selectedModel}
               onChange={(e) => set('selectedModel', e.target.value)}
-              placeholder="拉取列表或手填模型 ID"
+              placeholder={t('api.modelPlaceholder')}
             />
             <datalist id={`models-${draft.id}`}>
               {modelOptions.map((m) => (
@@ -253,21 +261,21 @@ export function ApiView(): React.JSX.Element {
               disabled={!editing || ui?.modelsBusy}
               onClick={() => editing && void fetchModels(editing.id)}
             >
-              ↘{ui?.modelsBusy ? '拉取中⋯' : '拉取列表'}
+              ↘{ui?.modelsBusy ? t('api.fetching') : t('api.fetchList')}
             </button>
           </div>
-          {ui?.modelsError && <div className="bad small">拉取失败：{ui.modelsError}</div>}
-          {editing && <div className="muted small">{profileLabel(editing)}</div>}
+          {ui?.modelsError && <div className="bad small">{t('api.fetchFailed', { error: ui.modelsError })}</div>}
+          {editing && <div className="muted small">{profileLabel(editing, t)}</div>}
 
           <div className="form-row">
-            <label>🖼 视觉中继</label>
+            <label>{t('api.visionRelayLabel')}</label>
             <select
               className="sel"
               value={draft.visionRelayModel}
               onChange={(e) => set('visionRelayModel', e.target.value)}
-              title="主模型不支持视觉时，图片路由给该多模态模型转述（R9/M5）"
+              title={t('api.visionRelayTitle')}
             >
-              <option value="">（未设置）</option>
+              <option value="">{t('api.unset')}</option>
               {modelOptions.map((m) => (
                 <option key={m.id} value={m.id}>
                   {m.id}
@@ -277,14 +285,14 @@ export function ApiView(): React.JSX.Element {
           </div>
 
           <div className="form-row">
-            <label>🗜 压缩专用</label>
+            <label>{t('api.compactionLabel')}</label>
             <select
               className="sel"
               value={draft.compactionModel}
               onChange={(e) => set('compactionModel', e.target.value)}
-              title="上下文 L3 摘要压缩使用的便宜模型（R14/M8）"
+              title={t('api.compactionTitle')}
             >
-              <option value="">（未设置）</option>
+              <option value="">{t('api.unset')}</option>
               {modelOptions.map((m) => (
                 <option key={m.id} value={m.id}>
                   {m.id}
@@ -295,11 +303,11 @@ export function ApiView(): React.JSX.Element {
 
           <div className="form-row end">
             <button className="btn" onClick={onSave} disabled={!draft.name.trim()}>
-              💾 保存
+              {t('api.save')}
             </button>
             {!draft.isNew && (
               <button className="btn sec danger" onClick={onDelete}>
-                {deleteArmed ? '🗑 确认删除？' : '🗑 删除'}
+                {deleteArmed ? t('api.deleteConfirm') : t('api.delete')}
               </button>
             )}
           </div>

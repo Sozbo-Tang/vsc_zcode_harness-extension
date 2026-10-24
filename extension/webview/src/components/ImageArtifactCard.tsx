@@ -9,6 +9,7 @@
  */
 import { useEffect, useState } from 'react';
 import { useHostRpc } from '../host/useHostRpc';
+import { useT } from '../i18n';
 import type { ChatItem } from '../store/store';
 import type { WorkspaceImageUriResult } from '../protocol';
 
@@ -18,6 +19,7 @@ export function ImageArtifactCard({
   item: Extract<ChatItem, { kind: 'image' }>;
 }): React.JSX.Element {
   const rpc = useHostRpc();
+  const t = useT();
   const [uri, setUri] = useState<string | undefined>(undefined);
   /** RPC 失败（路径越界 / webview 未就绪 / 宿主超时）→ 回退路径文本态 */
   const [failed, setFailed] = useState(false);
@@ -56,7 +58,7 @@ export function ImageArtifactCard({
           onError={() => setBroken(true)}
         />
       ) : (
-        <div className="muted small imgcard-fallback">🖼 图片无法显示（路径不在允许范围或 webview 未就绪）</div>
+        <div className="muted small imgcard-fallback">{t('image.fallback')}</div>
       )}
       <figcaption className="imgcard-path" title={item.path}>
         🖼 {item.path}

@@ -5,6 +5,12 @@
 
 匹配对 read/write/edit 取文件**路径**（重点看 basename），对 webfetch 取
 URL 全串（防止从公网拉私钥/.env）。
+
+设置页接线（R15/R20）：basename 通配模式可经 ``privacyFilePatterns``
+（~/.zcode-py/config/settings.json）整体替换——含 ``/`` 的模式额外对完整
+归一化路径做 fnmatch（如 ``.ssh/*``）；路径子串与 URL 后缀两类保持内置
+兜底不开放编辑（设置页覆盖的是文件名维度）。热更新见
+:func:`set_active_file_patterns`，服务层 init 读取 + settings_set 后重放。
 """
 
 from __future__ import annotations
@@ -59,6 +65,25 @@ PRIVACY_URL_SUFFIXES: tuple[str, ...] = (
     "secrets.yml",
 )
 
+# 活动文件模式（设置页 privacyFilePatterns 热替换；缺省 = 内置清单）
+_active_file_patterns: list[str] = list(PRIVACY_BASENAME_PATTERNS)
+
+
+def set_active_file_patterns(patterns: list[str]) -> None:
+    """设置页热应用：整体替换文件名通配模式（空列表 = 关闭该维度警告，
+    用户显式选择；路径子串/URL 后缀兜底不受影响）。"""
+    global _active_file_patterns
+    _active_file_patterns = [str(p) for p in patterns if str(p).strip()]
+
+
+def reset_active_file_patterns() -> None:
+    """恢复内置缺省清单（设置页「恢复默认」/配置缺位时调用）。"""
+    set_active_file_patterns(list(PRIVACY_BASENAME_PATTERNS))
+
+
+def active_file_patterns() -> tuple[str, ...]:
+    return tuple(_active_file_patterns)
+
 
 def privacy_warning_for_path(path: str) -> str | None:
     """文件路径命中敏感模式 → 警告文案；未命中 → None。"""
@@ -66,8 +91,9 @@ def privacy_warning_for_path(path: str) -> str | None:
         return None
     normalized = path.replace("\\", "/")
     name = normalized.rsplit("/", 1)[-1]
-    for pattern in PRIVACY_BASENAME_PATTERNS:
-        if fnmatch(name, pattern):
+    for pattern in _active_file_patterns:
+        # basename 命中；含 / 的模式同时按完整归一化路径匹配（.ssh/* 等）
+        if fnmatch(name, pattern) or ("/" in pattern and fnmatch(normalized, pattern)):
             return (
                 f"privacy: {name!r} matches sensitive file pattern {pattern!r}; "
                 "its contents are likely secrets — think twice before sending "
@@ -103,6 +129,9 @@ __all__ = [
     "PRIVACY_BASENAME_PATTERNS",
     "PRIVACY_PATH_SUBSTRINGS",
     "PRIVACY_URL_SUFFIXES",
+    "active_file_patterns",
     "privacy_warning_for_path",
     "privacy_warning_for_url",
+    "reset_active_file_patterns",
+    "set_active_file_patterns",
 ]

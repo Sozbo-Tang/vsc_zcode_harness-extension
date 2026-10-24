@@ -15,9 +15,17 @@
  */
 import { useEffect, useState } from 'react';
 import { useStore } from '../store/store';
+import { useT } from '../i18n';
 import type { McpServerInfo } from '../protocol';
 
-const TABS = ['工具', 'Skills', 'MCP'] as const;
+/** 页签 id 稳定（与语言无关）；标签经 t() 渲染期解析（R20 i18n） */
+const TABS = ['tools', 'skills', 'mcp'] as const;
+type ToolsTabId = (typeof TABS)[number];
+const TAB_LABEL_KEYS: Record<ToolsTabId, string> = {
+  tools: 'tools.tab.tools',
+  skills: 'tools.tab.skills',
+  mcp: 'tools.tab.mcp',
+};
 
 /* ---------- R3：工具开关 + 默认权限 ---------- */
 
@@ -29,6 +37,7 @@ function ToolsTab(): React.JSX.Element {
   const refreshTools = useStore((s) => s.refreshTools);
   const toggleTool = useStore((s) => s.toggleTool);
   const setToolPermission = useStore((s) => s.setToolPermission);
+  const t = useT();
 
   // 首开自动拉取一次（幂等标记）；之后靠「刷新」手动重发
   useEffect(() => {
@@ -39,58 +48,55 @@ function ToolsTab(): React.JSX.Element {
     <div className="toolspanel">
       <div className="skillhead">
         <span>
-          工具 <span className="muted small">（{tools.length}）</span>
+          {t('tools.toolsHead')} <span className="muted small">（{tools.length}）</span>
         </span>
         <button
           className="btn sec"
           onClick={refreshTools}
           disabled={refreshing}
-          title="重新拉取工具注册表（control tools_list）"
+          title={t('tools.refreshTitle')}
         >
-          {refreshing ? '刷新中…' : '↻ 刷新'}
+          {refreshing ? t('tools.refreshing') : t('tools.refresh')}
         </button>
       </div>
       {tools.length === 0 ? (
         <div className="muted empty-note">
-          {refreshing ? '正在获取工具列表…' : '暂无工具数据（核心未就绪？点「刷新」重试）。'}
+          {refreshing ? t('tools.loading') : t('tools.empty')}
         </div>
       ) : (
         <ul className="toollist">
-          {tools.map((t) => (
-            <li key={t.name} className="toolrow" title={t.description ?? t.name}>
+          {tools.map((tl) => (
+            <li key={tl.name} className="toolrow" title={tl.description ?? tl.name}>
               <label className="toolname">
                 <input
                   type="checkbox"
-                  checked={t.enabled}
+                  checked={tl.enabled}
                   disabled={pending}
-                  onChange={(e) => toggleTool(t.name, e.target.checked)}
-                  title={t.enabled ? '关闭后模型不可见不可调' : '开启后恢复注册'}
+                  onChange={(e) => toggleTool(tl.name, e.target.checked)}
+                  title={tl.enabled ? t('tools.disableHint') : t('tools.enableHint')}
                 />
-                <span className="toolrow-name">{t.name}</span>
-                {t.tier === 'readonly' ? (
-                  <span className="tierbadge ro">只读</span>
+                <span className="toolrow-name">{tl.name}</span>
+                {tl.tier === 'readonly' ? (
+                  <span className="tierbadge ro">{t('tools.readonlyBadge')}</span>
                 ) : (
-                  <span className="tierbadge wr">写</span>
+                  <span className="tierbadge wr">{t('tools.writeBadge')}</span>
                 )}
               </label>
               <select
                 className="sel"
-                value={t.alwaysAllowed ? 'always' : 'ask'}
-                disabled={pending || !t.enabled}
-                onChange={(e) => setToolPermission(t.name, e.target.value as 'ask' | 'always')}
-                title="默认权限：始终允许不会绕过危险命令黑名单（PLAN §9.3）"
+                value={tl.alwaysAllowed ? 'always' : 'ask'}
+                disabled={pending || !tl.enabled}
+                onChange={(e) => setToolPermission(tl.name, e.target.value as 'ask' | 'always')}
+                title={t('tools.permissionTitle')}
               >
-                <option value="ask">每次询问</option>
-                <option value="always">始终允许</option>
+                <option value="ask">{t('tools.permAsk')}</option>
+                <option value="always">{t('tools.permAlways')}</option>
               </select>
             </li>
           ))}
         </ul>
       )}
-      <div className="muted small skillhint">
-        关闭的工具不进模型 schema（不可见不可调）；「始终允许」写入核心白名单
-        （~/.zcode-py/config/tools.json），危险命令黑名单仍强制确认。
-      </div>
+      <div className="muted small skillhint">{t('tools.hint')}</div>
     </div>
   );
 }
@@ -100,6 +106,7 @@ function SkillsTab(): React.JSX.Element {
   const skillsRefreshing = useStore((s) => s.skillsRefreshing);
   const skillsRequested = useStore((s) => s.skillsRequested);
   const refreshSkills = useStore((s) => s.refreshSkills);
+  const t = useT();
 
   // 首开自动拉取一次（幂等：skillsRequested 标记）；之后靠「刷新」手动重发
   useEffect(() => {
@@ -110,22 +117,20 @@ function SkillsTab(): React.JSX.Element {
     <div className="skillspanel">
       <div className="skillhead">
         <span>
-          Skills <span className="muted small">（{skills.length}）</span>
+          {t('tools.skillsHead')} <span className="muted small">（{skills.length}）</span>
         </span>
         <button
           className="btn sec"
           onClick={refreshSkills}
           disabled={skillsRefreshing}
-          title="重新扫描 SKILL.md（control skills_list）"
+          title={t('tools.skillsRefreshTitle')}
         >
-          {skillsRefreshing ? '刷新中…' : '↻ 刷新'}
+          {skillsRefreshing ? t('tools.refreshing') : t('tools.refresh')}
         </button>
       </div>
       {skills.length === 0 ? (
         <div className="muted empty-note">
-          {skillsRefreshing
-            ? '正在获取 Skills 列表…'
-            : '还没有 Skills。把 SKILL.md 放到 ~/.zcode-py/skills/<名称>/（用户级）或 工作区/.zcode-py/skills/<名称>/（项目级，同名覆盖）后点「刷新」。'}
+          {skillsRefreshing ? t('tools.skillsLoading') : t('tools.skillsEmpty')}
         </div>
       ) : (
         <ul className="skilllist">
@@ -142,9 +147,7 @@ function SkillsTab(): React.JSX.Element {
           ))}
         </ul>
       )}
-      <div className="muted small skillhint">
-        输入框键入 / 可按名称补全技能命令。
-      </div>
+      <div className="muted small skillhint">{t('tools.skillsHint')}</div>
     </div>
   );
 }
@@ -171,9 +174,11 @@ function isAssemblyGap(sv: McpServerInfo): boolean {
 }
 
 function McpStatusDot({ status }: { status: string }): React.JSX.Element {
+  const t = useT();
   const cls = statusClass(status);
-  const label = cls === 'on' ? 'connected' : cls === 'bad' ? 'error' : '未连接';
-  return <span className={`mcpdot ${cls}`.trim()} role="img" aria-label={label} title={`状态：${status}（${label}）`} />;
+  const label =
+    cls === 'on' ? t('tools.mcpStatusConnected') : cls === 'bad' ? t('tools.mcpStatusError') : t('tools.mcpStatusDisconnected');
+  return <span className={`mcpdot ${cls}`.trim()} role="img" aria-label={label} title={t('tools.mcpStatusTitle', { status, label })} />;
 }
 
 function McpTab(): React.JSX.Element {
@@ -185,6 +190,7 @@ function McpTab(): React.JSX.Element {
   const refreshMcp = useStore((s) => s.refreshMcp);
   const addMcpServer = useStore((s) => s.addMcpServer);
   const removeMcpServer = useStore((s) => s.removeMcpServer);
+  const t = useT();
 
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [formOpen, setFormOpen] = useState(false);
@@ -202,11 +208,11 @@ function McpTab(): React.JSX.Element {
   const parseEnv = (): Record<string, string> | undefined => {
     const out: Record<string, string> = {};
     for (const line of envText.split('\n')) {
-      const t = line.trim();
-      if (t === '' || t.startsWith('#')) continue;
-      const i = t.indexOf('=');
+      const trimmed = line.trim();
+      if (trimmed === '' || trimmed.startsWith('#')) continue;
+      const i = trimmed.indexOf('=');
       if (i <= 0) return undefined;
-      out[t.slice(0, i).trim()] = t.slice(i + 1);
+      out[trimmed.slice(0, i).trim()] = trimmed.slice(i + 1);
     }
     return out;
   };
@@ -215,12 +221,12 @@ function McpTab(): React.JSX.Element {
     const n = name.trim();
     const c = command.trim();
     if (n === '' || c === '') {
-      setFormError('服务名与启动命令必填');
+      setFormError(t('tools.formErrorName'));
       return;
     }
     const env = parseEnv();
     if (env === undefined) {
-      setFormError('env 格式：每行一条 KEY=VALUE');
+      setFormError(t('tools.formErrorEnv'));
       return;
     }
     setFormError(undefined);
@@ -232,24 +238,24 @@ function McpTab(): React.JSX.Element {
   };
 
   const toolCountLabel = (sv: McpServerInfo): string => {
-    if (sv.tools.length > 0) return `${sv.tools.length} 工具`;
-    if (sv.toolsCount !== undefined) return `${sv.toolsCount} 工具`;
-    return '无工具';
+    if (sv.tools.length > 0) return t('tools.toolCount', { n: sv.tools.length });
+    if (sv.toolsCount !== undefined) return t('tools.toolCount', { n: sv.toolsCount });
+    return t('tools.noTools');
   };
 
   return (
     <div className="skillspanel">
       <div className="skillhead">
         <span>
-          MCP 服务 <span className="muted small">（{servers.length}）</span>
+          {t('tools.mcpHead')} <span className="muted small">（{servers.length}）</span>
         </span>
         <button
           className="btn sec"
           onClick={() => refreshMcp('mcp_refresh')}
           disabled={refreshing}
-          title="重连并重扫 MCP 服务与工具（control mcp_refresh）"
+          title={t('tools.mcpRefreshTitle')}
         >
-          {refreshing ? '刷新中…' : '↻ 刷新'}
+          {refreshing ? t('tools.refreshing') : t('tools.refresh')}
         </button>
       </div>
 
@@ -259,9 +265,7 @@ function McpTab(): React.JSX.Element {
 
       {servers.length === 0 ? (
         <div className="muted empty-note">
-          {refreshing
-            ? '正在获取 MCP 服务列表…'
-            : '还没有 MCP 服务。用下方「＋ 添加服务」接入 stdio MCP server（核心未识别 mcp_* 命令时会回错误提示，属正常——后端并行落地中）。'}
+          {refreshing ? t('tools.mcpLoading') : t('tools.mcpEmpty')}
         </div>
       ) : (
         <ul className="mcplist">
@@ -275,14 +279,14 @@ function McpTab(): React.JSX.Element {
                   <button
                     className="mcpname"
                     onClick={() => setExpanded((e) => ({ ...e, [sv.name]: !open }))}
-                    title={open ? '收起工具清单' : '展开工具清单'}
+                    title={open ? t('tools.collapseTools') : t('tools.expandTools')}
                   >
                     <span className="chev">{open ? '▾' : '▸'}</span> {sv.name}
                   </button>
                   <span className="muted small mcptoolslabel">{toolCountLabel(sv)}</span>
                   <button
                     className="iconbtn"
-                    title="移除服务（control mcp_remove）"
+                    title={t('tools.removeServerTitle')}
                     disabled={pendingAction !== undefined}
                     onClick={() => removeMcpServer(sv.name)}
                   >
@@ -294,27 +298,27 @@ function McpTab(): React.JSX.Element {
                     {sv.detail}
                   </div>
                 )}
-                {gap && (
-                  <div className="mcpgap">
-                    装配缝缺失：核心侧 MCP 装配未就绪。参照 <span className="mcpdoc">docs/MCP_BACKEND_SPEC.md</span>{' '}
-                    补齐装配后点「↻ 刷新」。
-                  </div>
-                )}
+                {gap && <div className="mcpgap">{t('tools.assemblyGap')}</div>}
                 {open &&
                   (sv.tools.length > 0 ? (
                     <ul className="mcptools">
-                      {sv.tools.map((t) => (
-                        <li key={t.name} className="mcptool" title={t.description ?? t.name}>
-                          <span className="mcptoolname">{t.name}</span>
-                          {t.description !== undefined && t.description !== '' && (
-                            <span className="muted small mcptooldesc">{t.description}</span>
+                      {sv.tools.map((mt) => (
+                        <li key={mt.name} className="mcptool" title={mt.description ?? mt.name}>
+                          <span className="mcptoolname">{mt.name}</span>
+                          {mt.description !== undefined && mt.description !== '' && (
+                            <span className="muted small mcptooldesc">{mt.description}</span>
                           )}
                         </li>
                       ))}
                     </ul>
                   ) : (
                     <div className="muted small mcpnotools">
-                      （无工具清单{sv.toolsCount !== undefined ? '，仅计数' : '；连接成功后点「↻ 刷新」拉取'}）
+                      {t('tools.noToolList', {
+                        suffix:
+                          sv.toolsCount !== undefined
+                            ? t('tools.noToolsCountSuffix')
+                            : t('tools.noToolsRefreshSuffix'),
+                      })}
                     </div>
                   ))}
               </li>
@@ -326,30 +330,30 @@ function McpTab(): React.JSX.Element {
       <div className="mcpformrow">
         {formOpen ? (
           <div className="form">
-            <div className="form-title">添加 MCP 服务</div>
+            <div className="form-title">{t('tools.addFormTitle')}</div>
             <div className="form-row">
-              <label htmlFor="mcp-name">名称</label>
+              <label htmlFor="mcp-name">{t('tools.nameLabel')}</label>
               <input
                 id="mcp-name"
                 className="in grow"
                 value={name}
-                placeholder="如 filesystem"
+                placeholder={t('tools.namePlaceholder')}
                 onChange={(e) => setName(e.target.value)}
               />
             </div>
             <div className="form-row">
-              <label htmlFor="mcp-cmd">命令</label>
+              <label htmlFor="mcp-cmd">{t('tools.cmdLabel')}</label>
               <input
                 id="mcp-cmd"
                 className="in grow"
                 value={command}
                 placeholder="npx -y @modelcontextprotocol/server-filesystem /tmp"
-                title="空格分隔的 argv：首段为可执行文件，其余为参数（引号暂不支持，含空格路径请用 env/后端配置）"
+                title={t('tools.cmdTitle')}
                 onChange={(e) => setCommand(e.target.value)}
               />
             </div>
             <div className="form-row top">
-              <label htmlFor="mcp-env" title="每行一条 KEY=VALUE；# 开头行忽略">
+              <label htmlFor="mcp-env" title={t('tools.envTitle')}>
                 env
               </label>
               <textarea
@@ -357,64 +361,55 @@ function McpTab(): React.JSX.Element {
                 className="in grow"
                 rows={2}
                 value={envText}
-                placeholder={'每行一条 KEY=VALUE\n如 API_BASE=http://localhost:9000'}
+                placeholder={t('tools.envPlaceholder')}
                 onChange={(e) => setEnvText(e.target.value)}
               />
             </div>
             {formError !== undefined && <div className="bad small">{formError}</div>}
             <div className="form-row end">
               <button className="btn sec" onClick={() => setFormOpen(false)}>
-                取消
+                {t('sessions.cancel')}
               </button>
               <button
                 className="btn"
                 onClick={submitAdd}
                 disabled={pendingAction !== undefined}
-                title="发 control mcp_add（成功后自动回拉列表）"
+                title={t('tools.addBtnTitle')}
               >
-                {pendingAction === 'add' ? '添加中…' : '添加'}
+                {pendingAction === 'add' ? t('tools.adding') : t('tools.addBtn')}
               </button>
             </div>
-            <div className="muted small">
-              命令按空格分隔成 argv 启动 stdio server；env 为子进程环境变量。协议细节见 docs/MCP_BACKEND_SPEC.md（后端并行定稿中）。
-            </div>
+            <div className="muted small">{t('tools.argvHint')}</div>
           </div>
         ) : (
-          <button className="btn sec" onClick={() => setFormOpen(true)} title="添加 MCP 服务（control mcp_add）">
-            ＋ 添加服务
+          <button className="btn sec" onClick={() => setFormOpen(true)} title={t('tools.addServiceTitle')}>
+            {t('tools.addServiceBtn')}
           </button>
         )}
       </div>
 
-      <div className="muted small skillhint">
-        状态灯：● 绿 = connected · ● 红 = error · ○ 灰 = 未连接/装配中。
-      </div>
+      <div className="muted small skillhint">{t('tools.mcpHint')}</div>
     </div>
   );
 }
 
 export function ToolsView(): React.JSX.Element {
-  const [tab, setTab] = useState<(typeof TABS)[number]>('工具');
+  const t = useT();
+  const [tab, setTab] = useState<ToolsTabId>('tools');
   return (
     <div className="view">
       <div className="tabrow">
-        {TABS.map((t) => (
+        {TABS.map((tabId) => (
           <button
-            key={t}
-            className={tab === t ? 'tab active' : 'tab'}
-            onClick={() => setTab(t)}
+            key={tabId}
+            className={tab === tabId ? 'tab active' : 'tab'}
+            onClick={() => setTab(tabId)}
           >
-            {t}
+            {t(TAB_LABEL_KEYS[tabId])}
           </button>
         ))}
       </div>
-      {tab === 'Skills' ? (
-        <SkillsTab />
-      ) : tab === 'MCP' ? (
-        <McpTab />
-      ) : (
-        <ToolsTab />
-      )}
+      {tab === 'skills' ? <SkillsTab /> : tab === 'mcp' ? <McpTab /> : <ToolsTab />}
     </div>
   );
 }

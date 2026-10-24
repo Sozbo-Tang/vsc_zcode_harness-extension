@@ -10,6 +10,7 @@
  */
 import { useState } from 'react';
 import { useStore } from '../store/store';
+import { useT } from '../i18n';
 import type { ChatItem } from '../store/store';
 import { useHostRpc } from '../host/useHostRpc';
 import { lineDiffStats } from '../lib/diffStats';
@@ -22,6 +23,7 @@ export function DiffReviewCard({
 }): React.JSX.Element {
   const review = useStore((s) => s.reviewDiff);
   const rpc = useHostRpc();
+  const t = useT();
   const [opening, setOpening] = useState(false);
   const [openError, setOpenError] = useState<string | undefined>(undefined);
 
@@ -47,9 +49,13 @@ export function DiffReviewCard({
 
   return (
     <div className="card diffcard">
-      <div className="card-row">
-        <span className="card-title">
-          ✏️ {item.file} <span className="add">+{added}</span>{' '}
+      <div className="card-head">
+        <div className="card-heading">
+          <span className="card-kicker">DIFF</span>
+          <span className="card-title diff-path" title={item.file}>{item.file}</span>
+        </div>
+        <span className="diff-stats" title={t('diff.statsTitle', { added, removed })}>
+          <span className="add">+{added}</span>
           <span className="del">−{removed}</span>
         </span>
       </div>
@@ -57,27 +63,29 @@ export function DiffReviewCard({
         <button
           className="btn sec"
           disabled={opening}
-          title="在 VSCode 对比页审阅（左：改动前 / 右：磁盘文件）"
+          title={t('diff.openTitle')}
           onClick={onOpenDiff}
         >
-          {opening ? '打开中…' : '打开对比页'}
+          {opening ? t('diff.opening') : t('diff.openBtn')}
         </button>
         {item.accepted == null ? (
           <>
             <button className="btn" onClick={() => review(item.id, true)}>
-              ✓ 接受
+              {t('diff.accept')}
             </button>
-            <button className="btn sec" onClick={() => review(item.id, false)}>
-              ✗ 拒绝
+            <button className="btn sec danger" onClick={() => review(item.id, false)}>
+              {t('diff.reject')}
             </button>
           </>
         ) : (
-          <span className="muted">{item.accepted ? '已接受' : '已拒绝'}</span>
+          <span className={item.accepted ? 'card-resolution ok' : 'card-resolution bad'}>
+            {item.accepted ? t('diff.accepted') : t('diff.rejected')}
+          </span>
         )}
       </div>
       {openError != null && (
         <div className="muted small bad" title={openError}>
-          对比页打开失败：{openError.slice(0, 120)}
+          {t('diff.openFailed', { error: openError.slice(0, 120) })}
         </div>
       )}
     </div>

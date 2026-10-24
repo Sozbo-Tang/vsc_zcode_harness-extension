@@ -1,5 +1,6 @@
 """M9 后台任务测试：bash_backend 打桩（run_command 慢速返回），验证启动 /
-输出流 / 结束帧 / 列表 / 停止标记（不强杀语义）；服务层 control 往返。"""
+输出流 / 结束帧 / 列表 / 停止回退语义（装配缝未同步 spawn_command 时的
+标记式取消；真停信号序列见 test_bash_cancel.py）；服务层 control 往返。"""
 
 from __future__ import annotations
 
@@ -57,6 +58,9 @@ def stub_backend(monkeypatch):
     monkeypatch.setattr(
         "zcode_py.tools.bash_backend.run_command", recorder
     )
+    # 强制回退路径：摘掉装配缝 spawn_command（真实装配与否都不影响本组
+    # 打桩语义——真停路径的假进程测试在 test_bash_cancel.py）
+    monkeypatch.delattr("zcode_py.tools.bash_backend.spawn_command", raising=False)
     return recorder
 
 
@@ -154,7 +158,7 @@ def test_timeout_marks_failed(stub_backend, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 停止标记（不强杀）语义
+# 停止（回退路径：装配缝未同步 spawn_command → 标记式）语义
 # ---------------------------------------------------------------------------
 
 
@@ -171,9 +175,9 @@ def test_stop_marks_cancel_requested_then_cancelled(stub_backend, tmp_path):
     record = manager.start("longrun")
 
     ok, message = manager.stop(record["taskId"])
-    assert ok and "cancel requested" in message
+    assert ok and "cancel requested" in message and "mark-only" in message
     assert manager.get(record["taskId"])["cancelRequested"] is True
-    # 命令未返回前仍是 running（无法强杀）
+    # 回退路径无法强杀：命令未返回前仍是 running
     assert manager.get(record["taskId"])["state"] == "running"
 
     release.set()

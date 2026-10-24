@@ -9,6 +9,7 @@
  *   「最终结果」两块（结果载荷形状未定稿：string 直读，对象宽容取
  *   result/summary/output/text 字段，兜底 JSON 全文）。
  */
+import { useT } from '../i18n';
 import type { ChatItem } from '../store/store';
 
 function fmtElapsed(ms: number): string {
@@ -53,6 +54,7 @@ export function SubagentCard({
 }: {
   item: Extract<ChatItem, { kind: 'tool' }>;
 }): React.JSX.Element {
+  const t = useT();
   const description = argString(item.args, ['description', 'subagent_type', 'agent_type']);
   const prompt = argString(item.args, ['prompt', 'task', 'instruction', 'input']);
   const model = argString(item.args, ['model', 'modelId', 'model_id']);
@@ -70,30 +72,32 @@ export function SubagentCard({
 
   return (
     // 运行中默认展开（盯进度）；finished 后 open 变 false 收起——结果折叠展示
-    <details className="card subcard" open={running || undefined}>
+    <details className={running ? 'card subcard is-running' : 'card subcard is-done'} open={running || undefined}>
       <summary title={label}>
         <span className="card-title">
-          🤖 子代理·{summaryLabel}
+          <span className="card-kicker">AGENT</span>
+          <span className="subagent-title">{summaryLabel}</span>
         </span>
         <span className="card-side">
-          {model !== '' && <span className="muted" title="子代理模型（R25）"> @{model}</span>}
+          {model !== '' && <span className="muted" title={t('subagent.modelTitle')}> @{model}</span>}
           {running ? (
-            <span className="muted">{item.state === 'update' ? '⟳' : '运行中…'}</span>
+            <span className="muted">{item.state === 'update' ? '⟳' : '●'}</span>
           ) : (
             <span className="ok">✓</span>
           )}
-          {item.elapsedMs != null && <span className="muted"> {fmtElapsed(item.elapsedMs)}</span>}
+          {item.elapsedMs != null && <span className="muted">{fmtElapsed(item.elapsedMs)}</span>}
+          <span className="card-chevron muted">▸</span>
         </span>
       </summary>
       {prompt !== '' && (
         <>
-          <div className="subcard-label muted small">任务</div>
+          <div className="subcard-label muted small">{t('subagent.taskLabel')}</div>
           <pre className="card-body">{prompt.slice(0, 2000)}</pre>
         </>
       )}
       {!running && result !== '' && (
         <>
-          <div className="subcard-label muted small">最终结果</div>
+          <div className="subcard-label muted small">{t('subagent.resultLabel')}</div>
           <pre className="card-body">{result.slice(0, 4000)}</pre>
         </>
       )}

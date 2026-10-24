@@ -23,7 +23,8 @@ export interface HostRpc {
   request<T = unknown>(method: HostRpcMethod, params?: unknown, timeoutMs?: number): Promise<T>;
   /** sessionKey 缺省 = 活跃会话；携带时定向发往该宿主会话进程（并行多开） */
   sendCore(message: CoreSend, sessionKey?: string): void;
-  onEvent(handler: (e: CoreEvent) => void): () => void;
+  /** 事件回调附信封 sessionKey（M4 补完：store 按会话路由独立投影） */
+  onEvent(handler: (e: CoreEvent, sessionKey: string) => void): () => void;
   onHostError(handler: (e: { sessionKey?: string; errorKind: string; message: string }) => void): () => void;
   onProcessState(handler: (e: { sessionKey: string; state: string; detail?: string }) => void): () => void;
   /** M3 编辑器联动：宿主预填待发提示（编辑器右键/终端选中/Problems） */

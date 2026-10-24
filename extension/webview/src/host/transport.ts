@@ -76,7 +76,7 @@ interface PendingEntry {
   timer: ReturnType<typeof setTimeout>;
 }
 
-type EventHandler = (e: CoreEvent) => void;
+type EventHandler = (e: CoreEvent, sessionKey: string) => void;
 type HostErrorHandler = (e: { sessionKey?: string; errorKind: string; message: string }) => void;
 type ProcessStateHandler = (e: { sessionKey: string; state: string; detail?: string }) => void;
 
@@ -106,7 +106,9 @@ let installed = false;
 function dispatchHostMessage(data: HostEnvelope): void {
   switch (data.kind) {
     case 'core':
-      for (const h of eventHandlers) h(data.message);
+      // sessionKey 一并下发（M4 补完：并行会话独立投影按信封键路由归约；
+      // 每个宿主会话进程一个 key，宿主 forwardCore 全量转发、不带活跃过滤）
+      for (const h of eventHandlers) h(data.message, data.sessionKey);
       break;
     case 'host_error':
       for (const h of hostErrorHandlers) h(data);

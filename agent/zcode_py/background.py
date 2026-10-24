@@ -1,26 +1,29 @@
 """M9 后台任务（R3，任务面板数据源，PLAN §2.1 / §7 M9）。
 
 `background_start{command, name?}` control 的执行核心：对每条任务起一个
-daemon 线程跑 ``bash_backend.run_command``（timeout 参数透传，默认 3600s）。
-**必须走 bash_backend**——动态命令执行在本环境被安全钩子拦截，bash_backend
-是唯一已装配的真实执行点（docs/BASH_BACKEND_SPEC.md），后台任务不得绕开它
-另起 subprocess。
+daemon 线程跑 ``bash_cancel.CancelRegistry.run_tracked``（经装配缝
+``bash_backend.spawn_command`` 拉起、timeout 参数透传，默认 3600s）。
+**必须走 bash_backend/bash_cancel**——动态命令执行在本环境被安全钩子拦截，
+bash_backend 是唯一已装配的真实执行点（docs/BASH_BACKEND_SPEC.md），后台
+任务不得绕开它另起 subprocess。
 
 帧契约（protocol.py §5 风格）：
 
 - ``task_started{taskId, name, command}`` 启动即发；
 - ``task_output{taskId, tail}`` 输出尾部（≤8KB 环形，见 ``TAIL_LIMIT``）。
   监测线程在尾部变化时至多每 2s 广播一次，命令结束时必发一次最终尾部。
-  当前 bash_backend 整段阻塞返回，中间流帧实际不会出现——机制先行，待后端
+  当前收割是整段阻塞返回，中间流帧实际不会出现——机制先行，待后端
   提供流式接口即可自然生效；
 - ``task_finished{taskId, exitCode}`` 终态回执。终态明细
   （finished | failed | cancelled）经 ``tasks_list`` 查询，帧里只有退出码。
 
-**stop 语义（如实声明）**：``task_stop{taskId}`` 只置 ``cancelRequested``
-标记，**无法强杀**——Python Thread 没有 SIGKILL 等价物，bash_backend 也尚无
-可取消接口；命令照常跑完（或超时被 run_command 杀掉），返回后工作线程看到
-标记才置 ``state=cancelled``。SIGKILL 级强杀留待 bash_backend 增加可取消
-接口（如返回 Popen 句柄），本模块的 state 机已为其预留。
+**stop 语义（task_stop 真停，M9 补完）**：``task_stop{taskId}`` 置
+``cancelRequested`` 标记后，对登记进程按**进程组**发 SIGTERM、2s 宽限后
+仍活 SIGKILL（``bash_cancel.terminate_process_tree`` 信号序列）——工作
+线程的阻塞收割随即返回，看到标记置 ``state=cancelled`` 并广播终态帧。
+装配缝缺 ``spawn_command``（用户未按 SPEC 手工同步）时登记表为空，
+``cancel`` 返回 missing——退化为旧的标记式取消（命令照常跑完或超时被杀，
+stop 回执如实提示 mark-only），不炸链路。
 
 线程安全：``_tasks`` 表与每条记录的字段更新都在 ``_lock`` 内；帧广播一律
 放在锁外（emit 自带锁，嵌套虽不死锁但拉长临界区）。
@@ -36,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from .protocol import TaskFinished, TaskOutput, TaskStarted
-from .tools import bash_backend
+from .tools import bash_cancel
 from .tools.bash import sanitize_child_env
 
 DEFAULT_TASK_TIMEOUT_S = 3600.0
@@ -67,10 +70,13 @@ class BackgroundTaskManager:
         emit: Callable[[Any], None],
         cwd_supplier: Callable[[], Path],
         tick_interval: float = OUTPUT_TICK_S,
+        cancel_registry: bash_cancel.CancelRegistry | None = None,
     ):
         self._emit = emit
         self._cwd_supplier = cwd_supplier
         self._tick_interval = tick_interval
+        # task_stop 真停的进程登记表（可注入以便测试换宽限时长）
+        self._cancels = cancel_registry or bash_cancel.CancelRegistry()
         self._lock = threading.Lock()
         self._tasks: dict[str, dict] = {}
         self._monitor_thread: threading.Thread | None = None
@@ -123,7 +129,8 @@ class BackgroundTaskManager:
     # ------------------------------------------------------------------ 停止 / 列表
 
     def stop(self, task_id: str) -> tuple[bool, str]:
-        """标记取消（不强杀）：见模块 docstring「stop 语义」。"""
+        """真停（task_stop）：置标记 + 对登记进程发信号序列（见模块 docstring
+        「stop 语义」）。返回 (ok, message)——message 如实区分强杀与降级。"""
         with self._lock:
             record = self._tasks.get(task_id)
             if record is None:
@@ -131,13 +138,19 @@ class BackgroundTaskManager:
             if record["state"] != "running":
                 return False, f"task {task_id} already {record['state']}"
             record["cancelRequested"] = True
+        outcome = self._cancels.cancel(task_id)
+        if outcome == "killed":
+            return (
+                True,
+                "cancel requested; process group signalled (SIGTERM, escalates "
+                "to SIGKILL after 2s if alive) — state flips to cancelled when "
+                "the worker reaps it",
+            )
         return (
             True,
-            (
-                "cancel requested; state flips to cancelled when the command "
-                "returns (threads cannot be force-killed; SIGKILL awaits a "
-                "cancellable bash_backend interface)"
-            ),
+            "cancel requested; mark-only (no cancellable process registered — "
+            "bash_backend.spawn_command 未装配，见 docs/BASH_BACKEND_SPEC.md) "
+            "state flips to cancelled when the command returns",
         )
 
     def list_tasks(self) -> list[dict]:
@@ -154,7 +167,7 @@ class BackgroundTaskManager:
 
     def shutdown(self) -> None:
         """优雅退出：停监测线程。工作线程为 daemon——命令未完的随进程退出
-        （run_command 的 timeout 兜底进程被杀时的资源回收由 OS 完成）。"""
+        （run_tracked 的 timeout 兜底进程被杀时的资源回收由 OS 完成）。"""
         self._monitor_stop.set()
 
     # ------------------------------------------------------------------ 工作线程
@@ -167,12 +180,19 @@ class BackgroundTaskManager:
         cwd: Path | None,
         env: dict[str, str],
     ) -> None:
-        """跑 run_command（阻塞）→ 更新终态 → 锁外广播 task_output/task_finished。"""
+        """跑 run_tracked（阻塞，登记期间可被 stop 真停）→ 更新终态 → 锁外
+        广播 task_output/task_finished。should_cancel 复检覆盖「stop 先于
+        进程登记到达」的启动竞态（bash_cancel.run_tracked 契约）。"""
         result = None
         error: str | None = None
         try:
-            result = bash_backend.run_command(
-                command, cwd=str(cwd) if cwd else None, timeout=timeout, env=env
+            result = self._cancels.run_tracked(
+                task_id,
+                command,
+                cwd=str(cwd) if cwd else None,
+                timeout=timeout,
+                env=env,
+                should_cancel=lambda: self._cancel_requested(task_id),
             )
         except BaseException as exc:  # noqa: BLE001 —— 后端异常入表，不炸线程
             error = f"{type(exc).__name__}: {exc}"
@@ -251,6 +271,12 @@ class BackgroundTaskManager:
         return alive
 
     # ------------------------------------------------------------------ 内部
+
+    def _cancel_requested(self, task_id: str) -> bool:
+        """stop 标记的锁内安全读取（表项缺失 = False，供 run_tracked 复检）。"""
+        with self._lock:
+            record = self._tasks.get(task_id)
+            return bool(record and record["cancelRequested"])
 
     @staticmethod
     def _append_tail(record: dict, text: str) -> None:

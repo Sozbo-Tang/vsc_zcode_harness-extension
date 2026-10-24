@@ -1,4 +1,5 @@
-"""多厂商 LLM Provider 层：统一抽象 + anthropic / openai(兼容) / gemini / fake 适配器。
+"""多厂商 LLM Provider 层：统一抽象 + anthropic / openai(兼容) / gemini /
+ollama / openrouter / fake 适配器。
 
 内部事件形态与厂商差异说明见各模块 docstring 与 docs/research/llm-apis.md。
 """
@@ -29,12 +30,16 @@ from .base import (
 from .anthropic import AnthropicProvider
 from .openai import OpenAIProvider
 from .gemini import GeminiProvider
+from .ollama import OllamaProvider
+from .openrouter import OpenRouterProvider
 from .fake import FakeProvider, Wait
 
 PROTOCOL_ADAPTERS: dict[str, type[Provider]] = {
     "anthropic": AnthropicProvider,
     "openai": OpenAIProvider,
     "gemini": GeminiProvider,
+    "ollama": OllamaProvider,
+    "openrouter": OpenRouterProvider,
 }
 
 
@@ -42,7 +47,8 @@ def default_provider_factory(provider_entry: dict, api_key: str | None) -> Provi
     """按 provider 条目（providers.json）构造 Provider 实例。
 
     条目字段：id / protocol / baseUrl / auth("none" 可免 Key，本地端点) /
-    maxTokensParam("max_completion_tokens")。
+    maxTokensParam("max_completion_tokens")；openrouter 另收 httpReferer /
+    appTitle（站点可选归因头）；ollama 免 Key（本地端点）。
     """
     protocol = (provider_entry.get("protocol") or "").lower()
     provider_id = provider_entry.get("id") or "provider"
@@ -60,12 +66,23 @@ def default_provider_factory(provider_entry: dict, api_key: str | None) -> Provi
             )
         if protocol == "gemini":
             return GeminiProvider(provider_id, base_url=base_url, api_key=api_key)
+        if protocol == "ollama":
+            # 本地端点免 Key：api_key 仍透传（服务端配 OLLAMA_AUTH 时发 Bearer）
+            return OllamaProvider(provider_id, base_url=base_url, api_key=api_key)
+        if protocol == "openrouter":
+            return OpenRouterProvider(
+                provider_id,
+                base_url=base_url,
+                api_key=api_key,
+                http_referer=provider_entry.get("httpReferer"),
+                app_title=provider_entry.get("appTitle"),
+            )
     except Exception as exc:  # noqa: BLE001
         raise ProviderError("config", f"cannot build provider {provider_id!r}: {exc}") from exc
     raise ProviderError(
         "config",
         f"unsupported protocol {protocol!r} for provider {provider_id!r} "
-        "(expected anthropic | openai | gemini)",
+        "(expected anthropic | openai | gemini | ollama | openrouter)",
     )
 
 
@@ -94,6 +111,8 @@ __all__ = [
     "AnthropicProvider",
     "OpenAIProvider",
     "GeminiProvider",
+    "OllamaProvider",
+    "OpenRouterProvider",
     "FakeProvider",
     "Wait",
     "PROTOCOL_ADAPTERS",

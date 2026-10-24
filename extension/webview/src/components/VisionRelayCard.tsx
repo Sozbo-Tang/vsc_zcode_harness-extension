@@ -5,14 +5,15 @@
  * 每图一帧，入转录可回放）经 store.applyEvent 归约为 relay 条目，由 ChatView
  * 按事件流顺序渲染在消息流内。
  */
+import { useT } from '../i18n';
 import type { ChatItem } from '../store/store';
 
-/** vision_relay.preset（vision_relay.py PRESET_IDS）→ 档名展示 */
-const PRESET_LABELS: Record<string, string> = {
-  ocr: 'OCR 提取',
-  describe: '通用描述',
-  frontend: '前端还原',
-  custom: '自定义',
+/** vision_relay.preset（vision_relay.py PRESET_IDS）→ 档名文案键 */
+const PRESET_LABEL_KEYS: Record<string, string> = {
+  ocr: 'presets.ocr',
+  describe: 'presets.describe',
+  frontend: 'presets.frontend',
+  custom: 'presets.custom',
 };
 
 export function VisionRelayCard({
@@ -20,14 +21,20 @@ export function VisionRelayCard({
 }: {
   item: Extract<ChatItem, { kind: 'relay' }>;
 }): React.JSX.Element {
-  const presetLabel = PRESET_LABELS[item.preset] ?? item.preset;
+  const t = useT();
+  const presetKey = PRESET_LABEL_KEYS[item.preset];
+  const presetLabel = presetKey !== undefined ? t(presetKey) : item.preset;
   return (
     <details className="card relaycard">
       <summary>
         <span className="card-title">
-          🖼 图片已由 {item.model} 转述（{presetLabel}）
+          <span className="card-kicker">RELAY</span>
+          <span>{t('relay.title', { preset: presetLabel })}</span>
         </span>
-        <span className="muted">审计 ▾</span>
+        <span className="card-side muted">
+          <span className="relay-model" title={item.model}>{item.model}</span>
+          <span className="card-chevron">▸</span>
+        </span>
       </summary>
       <pre className="card-body">{item.description}</pre>
     </details>

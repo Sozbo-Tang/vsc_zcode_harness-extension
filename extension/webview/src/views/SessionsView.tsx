@@ -6,12 +6,15 @@
  *  - 会话条目：●当前 / ○其他 · 标题（📌 收藏、↳ 分叉自）· 相对时间 · 消息数
  *  - 操作（⋯ 展开）：恢复（control resume + session.activate RPC + 切聊天
  *    视图）/ 从此会话分叉（control fork）/ 📌 收藏切换（control pin）/
- *    导出 Markdown（control export → result.markdown → workspace.saveExport）
+ *    导出 Markdown（control export → result.markdown → workspace.saveExport）/
+ *    🗑 删除（control session_delete，两步确认；当前活跃会话禁用——核侧
+ *    同样拒绝，成功后 sessions_list 收敛）
  *  - 新建会话按钮（control new_session）
  * 数据源：sessions_list 事件 → sessions 切片（init/每次会话变迁时核心广播）。
  */
 import { useMemo, useState } from 'react';
 import { useStore } from '../store/store';
+import { useT, type TranslateParams } from '../i18n';
 import { FORK_AT_LAST_USER_MESSAGE, type SessionSummary } from '../protocol';
 
 function tsOf(s: SessionSummary): number {
@@ -19,19 +22,21 @@ function tsOf(s: SessionSummary): number {
   return raw ? Date.parse(raw) : NaN;
 }
 
-function fmtAgo(ts: number): string {
+/** 相对时间（文案经 t() 渲染期解析，R20 i18n） */
+function fmtAgo(ts: number, t: (key: string, params?: TranslateParams) => string): string {
   if (Number.isNaN(ts)) return '';
   const d = Date.now() - ts;
-  if (d < 60_000) return '刚刚';
-  if (d < 3600_000) return `${Math.floor(d / 60_000)}分钟前`;
-  if (d < 86_400_000) return `${Math.floor(d / 3600_000)}小时前`;
-  if (d < 7 * 86_400_000) return `${Math.floor(d / 86_400_000)}天前`;
+  if (d < 60_000) return t('sessions.justNow');
+  if (d < 3600_000) return t('sessions.minutesAgo', { n: Math.floor(d / 60_000) });
+  if (d < 86_400_000) return t('sessions.hoursAgo', { n: Math.floor(d / 3600_000) });
+  if (d < 7 * 86_400_000) return t('sessions.daysAgo', { n: Math.floor(d / 86_400_000) });
   return new Date(ts).toLocaleDateString();
 }
 
 interface DayGroup {
   key: 'today' | 'week' | 'older';
-  label: string;
+  /** 分组标签键（sessions.today / .week / .older，渲染期经 t() 解析） */
+  labelKey: string;
   items: SessionSummary[];
 }
 
@@ -39,7 +44,7 @@ interface DayGroup {
 function groupByDate(list: SessionSummary[]): DayGroup[] {
   const now = new Date();
   const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const buckets: Record<DayGroup['key'], SessionSummary[]> = { today: [], week: [], older: [] };
+  const buckets: Record<'today' | 'week' | 'older', SessionSummary[]> = { today: [], week: [], older: [] };
   for (const s of list) {
     const ts = tsOf(s);
     const key: DayGroup['key'] = Number.isNaN(ts)
@@ -52,9 +57,9 @@ function groupByDate(list: SessionSummary[]): DayGroup[] {
     buckets[key].push(s);
   }
   const out: DayGroup[] = [];
-  if (buckets.today.length > 0) out.push({ key: 'today', label: '今天', items: buckets.today });
-  if (buckets.week.length > 0) out.push({ key: 'week', label: '本周', items: buckets.week });
-  if (buckets.older.length > 0) out.push({ key: 'older', label: '更早', items: buckets.older });
+  if (buckets.today.length > 0) out.push({ key: 'today', labelKey: 'sessions.today', items: buckets.today });
+  if (buckets.week.length > 0) out.push({ key: 'week', labelKey: 'sessions.week', items: buckets.week });
+  if (buckets.older.length > 0) out.push({ key: 'older', labelKey: 'sessions.older', items: buckets.older });
   return out;
 }
 
@@ -65,8 +70,11 @@ function SessionRow({ s }: { s: SessionSummary }): React.JSX.Element {
   const forkSession = useStore((st) => st.forkSession);
   const togglePinSession = useStore((st) => st.togglePinSession);
   const exportSession = useStore((st) => st.exportSession);
+  const deleteSession = useStore((st) => st.deleteSession);
+  const t = useT();
   const [expanded, setExpanded] = useState(false);
   const [confirmFork, setConfirmFork] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const current = s.sessionId === coreSessionId;
 
   const doFork = (): void => {
@@ -74,31 +82,38 @@ function SessionRow({ s }: { s: SessionSummary }): React.JSX.Element {
     setConfirmFork(false);
   };
 
+  const doDelete = (): void => {
+    // 破坏性操作两步确认（同 ApiView 删除）；回执后由 sessions_list 收敛
+    deleteSession(s.sessionId);
+    setConfirmDelete(false);
+    setExpanded(false);
+  };
+
   return (
     <div className="session-block">
       <div
         className={`session${current ? ' sel' : ''}`}
         onClick={() => activateSession(s.sessionId)}
-        title="点击恢复此会话（切换活跃并回放转录）"
+        title={t('sessions.rowTitle')}
         role="button"
         tabIndex={0}
         onKeyDown={(e) => {
           if (e.key === 'Enter' || e.key === ' ') activateSession(s.sessionId);
         }}
       >
-        <span title={current ? '当前会话' : '点击切换'}>{current ? '●' : '○'}</span>
+        <span title={current ? t('sessions.currentTitle') : t('sessions.switchTitle')}>{current ? '●' : '○'}</span>
         <span className="session-title">
           {s.pinned === true && '📌 '}
           {s.title ?? s.sessionId}
         </span>
         {s.parentSessionId != null && (
-          <span className="muted small" title={`分叉自 ${s.parentSessionId}`}>
+          <span className="muted small" title={t('sessions.forkedFrom', { id: s.parentSessionId })}>
             ↳
           </span>
         )}
         <span className="muted small session-meta">
-          {fmtAgo(tsOf(s))}
-          {s.messageCount != null ? ` · ${s.messageCount}条` : ''}
+          {fmtAgo(tsOf(s), t)}
+          {s.messageCount != null ? t('sessions.messagesSuffix', { n: s.messageCount }) : ''}
         </span>
         <button
           className="iconbtn"
@@ -106,23 +121,23 @@ function SessionRow({ s }: { s: SessionSummary }): React.JSX.Element {
             e.stopPropagation();
             setExpanded((v) => !v);
           }}
-          title="更多操作（分叉 / 收藏 / 导出）"
+          title={t('sessions.moreActions')}
         >
           ⋯
         </button>
       </div>
       {expanded && (
         <div className="session-actions">
-          <button className="btn sec" onClick={() => activateSession(s.sessionId)} title="恢复并切换为活跃会话">
-            ▶ 恢复
+          <button className="btn sec" onClick={() => activateSession(s.sessionId)} title={t('sessions.resumeTitle')}>
+            {t('sessions.resume')}
           </button>
           {confirmFork ? (
             <>
-              <button className="btn" onClick={doFork} title="以「最后一条用户消息」为分叉点复制前缀轮次">
-                ⑂ 确认分叉
+              <button className="btn" onClick={doFork} title={t('sessions.confirmForkTitle')}>
+                {t('sessions.confirmFork')}
               </button>
               <button className="btn sec" onClick={() => setConfirmFork(false)}>
-                取消
+                {t('sessions.cancel')}
               </button>
             </>
           ) : (
@@ -131,24 +146,43 @@ function SessionRow({ s }: { s: SessionSummary }): React.JSX.Element {
               onClick={() => setConfirmFork(true)}
               title={
                 current
-                  ? '从此会话分叉：分叉点 = 最后一条用户消息（该轮不带走，用于改写提问重新展开）'
-                  : `从此会话分叉：非当前会话无法取到分叉点 id，将发送约定哨兵 ${FORK_AT_LAST_USER_MESSAGE}（核心侧支持前会收到 not_found 错误）`
+                  ? t('sessions.forkTitleCurrent')
+                  : t('sessions.forkTitleOther', { sentinel: FORK_AT_LAST_USER_MESSAGE })
               }
             >
-              ⑂ 从此会话分叉
+              {t('sessions.fork')}
             </button>
           )}
           <button className="btn sec" onClick={() => togglePinSession(s.sessionId)}>
-            {s.pinned === true ? '📌 取消收藏' : '📌 收藏'}
+            {s.pinned === true ? t('sessions.unpin') : t('sessions.pin')}
           </button>
           <button
             className="btn sec"
             onClick={() => exportSession(s.sessionId)}
             disabled={ui?.busy === 'export'}
-            title="导出为 Markdown（选择保存位置后落盘）"
+            title={t('sessions.exportTitle')}
           >
-            {ui?.busy === 'export' ? '⤓ 导出中…' : '⤓ 导出 Markdown'}
+            {ui?.busy === 'export' ? t('sessions.exporting') : t('sessions.export')}
           </button>
+          {confirmDelete ? (
+            <>
+              <button className="btn danger" onClick={doDelete} title={t('sessions.confirmDeleteTitle')}>
+                {t('sessions.confirmDelete')}
+              </button>
+              <button className="btn sec" onClick={() => setConfirmDelete(false)}>
+                {t('sessions.cancel')}
+              </button>
+            </>
+          ) : (
+            <button
+              className="btn sec danger"
+              onClick={() => setConfirmDelete(true)}
+              disabled={current || ui?.busy === 'delete'}
+              title={current ? t('sessions.deleteDisabledTitle') : t('sessions.deleteTitle')}
+            >
+              {ui?.busy === 'delete' ? t('sessions.deleting') : t('sessions.delete')}
+            </button>
+          )}
         </div>
       )}
       {ui?.notice != null && (
@@ -163,6 +197,7 @@ export function SessionsView(): React.JSX.Element {
   const coreSessionId = useStore((s) => s.coreSessionId);
   const items = useStore((s) => s.chat.items);
   const newSession = useStore((s) => s.newSession);
+  const t = useT();
   const [q, setQ] = useState('');
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
 
@@ -221,28 +256,26 @@ export function SessionsView(): React.JSX.Element {
   return (
     <div className="view">
       <div className="view-head">
-        <span>会话</span>
-        <button className="btn" onClick={newSession} title="新建会话（control new_session）">
+        <span>{t('sessions.title')}</span>
+        <button className="btn" onClick={newSession} title={t('sessions.newTitle')}>
           ＋
         </button>
       </div>
       <input
         className="in grow"
-        placeholder="🔍 搜索标题 / 当前会话全文…"
+        placeholder={t('sessions.searchPlaceholder')}
         value={q}
         onChange={(e) => setQ(e.target.value)}
       />
       <div className="sessionlist">
         {sessions.length === 0 ? (
-          <div className="muted empty-note">
-            暂无历史会话 —— 发送第一条消息后自动建立（转录持久化于 ~/.zcode-py/sessions）。
-          </div>
+          <div className="muted empty-note">{t('sessions.empty')}</div>
         ) : filtered.length === 0 ? (
-          <div className="muted empty-note">无匹配会话（全文检索当前仅覆盖已载入的当前会话转录）。</div>
+          <div className="muted empty-note">{t('sessions.noMatch')}</div>
         ) : (
           <>
-            {pinned.length > 0 && renderGroup('pinned', '📌 置顶', pinned)}
-            {groups.map((g) => renderGroup(g.key, g.label, g.items))}
+            {pinned.length > 0 && renderGroup('pinned', t('sessions.pinnedGroup'), pinned)}
+            {groups.map((g) => renderGroup(g.key, t(g.labelKey), g.items))}
           </>
         )}
       </div>

@@ -146,6 +146,12 @@ def telegraph_state(profile: TelegraphProfile, current: str) -> TelegraphState:
 
 def reference_telegraph(protocol: str) -> dict:
     """按协议返回参考 telegraph 块（PLAN §3.3 参考值，以档案声明为准）。"""
+    if protocol in ("ollama", "openrouter"):
+        # 两家按「无思考型」参考档案处理（ROADMAP M1 决策）：ollama 的
+        # think 参数 / OpenRouter 的 reasoning 扩展都是模型子集支持，缺省
+        # 不发；具体模型要开思考时在模型档案 telegraph 块声明参数即可
+        # （如 {"think": true} / {"reasoning": {...}}，载荷直接合并进请求体）。
+        return {"mode": "none", "levels": []}
     if protocol == "anthropic":
         return {
             "mode": "budget",

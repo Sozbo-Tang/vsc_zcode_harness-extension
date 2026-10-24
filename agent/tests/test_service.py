@@ -306,7 +306,10 @@ def test_unsupported_and_pre_init_guards(tmp_home):
         if f["type"] == "result" and f.get("command") == "compact"
     ]
     assert compact_results and compact_results[0]["ok"] is False
-    assert kinds[4] == "unsupported"  # git_commit 属后续里程碑
+    # R17/R22 起 git_commit 已实装：repoRoot 在 workspaceRoots 白名单外 →
+    # git_result{error}（白名单拒绝，不再回 unsupported）
+    git_results = harness.frames_of_type("git_result")
+    assert git_results and "白名单" in (git_results[0].get("error") or "")
 
 
 def test_broken_config_falls_back_to_defaults(tmp_home):
@@ -649,3 +652,39 @@ def test_control_inline_complete(tmp_home):
     assert result["detail"] == "print('hi')"
     # 请求确实不带工具（纯补全提示词）
     assert provider.requests and provider.requests[0].tools is None
+
+
+def test_usage_by_model_session_scoped_and_perf_carries_model(tmp_home):
+    """R19 会话统计：perf 帧带 model 分组键；usage.byModel 按「本会话」累计
+    ——new_session 清零、resume 从转录最后一次 usage 帧播种接续。"""
+    from zcode_py.llm.base import UsageUpdate
+
+    fake = FakeProvider(turns=[[TextDelta("回复一"), UsageUpdate(input_tokens=10, output_tokens=5)]])
+    harness = Harness(fake)
+    harness.send({"type": "init", "workspaceRoots": []})
+    first_session = harness.frames()[0]["sessionId"]
+
+    harness.send({"type": "user_message", "text": "问题一"})
+    assert harness.wait_frames("usage")
+    perf_done = [f for f in harness.frames_of_type("perf") if f.get("phase") == "done"][-1]
+    assert perf_done["model"] == "glm-5.3"  # 与 meta.modelId 同源（默认模型）
+    usage1 = harness.frames_of_type("usage")[-1]
+    assert usage1["byModel"] == {"glm-5.3": {"input": 10, "output": 5}}
+
+    # 新会话清零：同进程内上一会话的按模型计数不带入
+    harness.send({"type": "control", "command": "new_session"})
+    fake.turns.append([TextDelta("回复二"), UsageUpdate(input_tokens=3, output_tokens=1)])
+    harness.send({"type": "user_message", "text": "问题二"})
+    assert harness.wait_frames("message_complete", count=2)
+    usage2 = harness.frames_of_type("usage")[-1]
+    assert usage2["byModel"] == {"glm-5.3": {"input": 3, "output": 1}}
+
+    # resume 播种：恢复会话一后，usage 接续该会话历史（10/5 打底再加新回合）。
+    # usage 帧计数 = 回合一 + 回合二 + 重放的历史 usage + 回合三（resume 的
+    # 重放是同步 emit_raw，回合三在回合线程——须等第 4 帧再断言）
+    harness.send({"type": "control", "command": "resume", "sessionId": first_session})
+    fake.turns.append([TextDelta("回复三"), UsageUpdate(input_tokens=7, output_tokens=2)])
+    harness.send({"type": "user_message", "text": "问题三"})
+    assert harness.wait_frames("usage", count=4)
+    usage3 = harness.frames_of_type("usage")[-1]
+    assert usage3["byModel"] == {"glm-5.3": {"input": 17, "output": 7}}

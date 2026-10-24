@@ -7,26 +7,40 @@
  * 经宿主 {kind:'core'} 转发）进来后只增改 items 投影，视图层纯消费。
  * 轻量 UI 态（当前视图/输入草稿/权限模式）经 vscode getState/setState 注水
  * 兜底（research §1.4 / §7 决策 2）；真相态以宿主 ready+replay 重放与事件流为准。
+ *
+ * M4 补完（并行会话独立投影）：applyEvent 按事件信封的宿主会话键路由——
+ * 活跃会话归约进顶层切片（视图层零改动），外来会话归约进 sessionProjections
+ * 保留投影（换入/换出复用同一归约路径；上限最近 20 个 LRU）。切回任一会话
+ * 走 resume → session_started → replay 重建（转录是真相源）。
  */
 import { create } from 'zustand';
 import { RpcTimeoutError, getVsCodeApi, hostRequest, hostSendCore } from '../host/transport';
+import { useI18nStore, resolveLocale, setLocale, t } from '../i18n';
 import type {
   BackgroundTask,
   CoreEvent,
+  CoreSettings,
   CronEntry,
   GetStateResult,
+  GitFileStat,
+  GitPreviewPayload,
   HardwareInfo,
   McpServerInfo,
   McpToolInfo,
+  PerfTurn,
   PermissionMode,
   PingResult,
   ProviderConfig,
+  SessionEnsureResult,
+  SessionActivateResult,
   SessionSummary,
   SkillInfo,
   ToolInfo,
   TelegraphLevel,
   TodoItem,
+  UsageModelBucket,
   UserMessageContext,
+  VisionRelayPreset,
   WorkflowInfo,
   WorkspaceLang,
 } from '../protocol';
@@ -35,7 +49,20 @@ import { FORK_AT_LAST_USER_MESSAGE } from '../protocol';
 /* ---------- 聊天条目投影（由事件归约产生） ---------- */
 
 export type ChatItem =
-  | { kind: 'user'; id: string; at: number; text: string; context?: UserMessageContext }
+  | {
+      kind: 'user';
+      id: string;
+      at: number;
+      text: string;
+      context?: UserMessageContext;
+      /**
+       * R30「回滚到这」：该消息触发的 git 检查点（checkpoint 帧倒序回填，
+       * 见 applyEvent 'checkpoint'）。无检查点（无 git 仓库 / 快照失败 /
+       * cron 注入的消息）缺省 → 不显示回滚按钮。
+       */
+      checkpointId?: string;
+      checkpointSha?: string;
+    }
   | { kind: 'assistant'; id: string; at: number; text: string; streaming: boolean }
   | {
       kind: 'thinking';
@@ -105,13 +132,99 @@ export type ChatItem =
       /** 原始 report（宽容兜底展示） */
       raw?: Record<string, unknown>;
     }
-  | { kind: 'error'; id: string; at: number; errorKind: string; message: string };
+  | { kind: 'error'; id: string; at: number; errorKind: string; message: string }
+  /**
+   * R30：中性系统提示行（回滚成功等非错误回执）。与 error（syserr 红样式）
+   * 区分——成功反馈不该长着错误脸。
+   */
+  | { kind: 'system'; id: string; at: number; text: string };
 
 export interface PerfState {
   phase: 'idle' | 'streaming' | 'done';
   ttftMs?: number;
   tokPerSec?: number;
-  lastTurn?: { ttftMs: number; avgTokPerSec: number };
+  /** 上一轮（空回合为 null 值字段，见 protocol.PerfTurn 判空说明） */
+  lastTurn?: PerfTurn;
+}
+
+/**
+ * R19 会话统计：按模型聚合的每轮性能（PerfChip 弹层数据源）。
+ *  - 首 token 耗时：平均 = ttftSum/turns；最差 = ttftWorst（最慢一次）。
+ *    「峰值」与最差同值（延迟的极值即最差），弹层不重复列。
+ *  - 输出速度：平均 = tpsSum/turns（回合均速的均值）；最差 = tpsWorst
+ *    （最低回合均速，Infinity = 尚无完整回合）；峰值 = tpsPeak（streaming
+ *    采样帧的瞬时最高，比回合均值更接近瞬时尖峰）。
+ * 数据在事件归约时增量累计（perf 帧带 model 分组键，含 resume 重放的
+ * 历史帧——转录逐轮记录，聚合即「从转录聚合」的 UI 侧等价物）。
+ */
+export interface PerfModelStats {
+  /** 计入统计的完整回合数（lastTurn 双值非 null 才计） */
+  turns: number;
+  ttftSum: number;
+  ttftWorst: number;
+  tpsSum: number;
+  tpsWorst: number;
+  tpsPeak: number;
+}
+
+export const emptyPerfStats = (): PerfModelStats => ({
+  turns: 0,
+  ttftSum: 0,
+  ttftWorst: 0,
+  tpsSum: 0,
+  tpsWorst: Number.POSITIVE_INFINITY,
+  tpsPeak: 0,
+});
+
+/** perf 帧 → perfStats 增量归约（不可变更新；model 缺省归「未知」桶） */
+function applyPerfStats(
+  prev: Record<string, PerfModelStats>,
+  e: Extract<CoreEvent, { type: 'perf' }>,
+): Record<string, PerfModelStats> {
+  const key = e.model && e.model !== '' ? e.model : '未知';
+  const cur = prev[key] ?? emptyPerfStats();
+  let next = cur;
+  if (e.phase === 'streaming') {
+    // 峰值：streaming 采样帧的瞬时速度
+    if (typeof e.tokPerSec === 'number' && e.tokPerSec > cur.tpsPeak) {
+      next = { ...cur, tpsPeak: e.tokPerSec };
+    }
+  } else if (e.phase === 'done' && e.lastTurn != null) {
+    // 每轮统计：lastTurn 双值非 null 才计（空回合/取消回合为 null）
+    const ttft = e.lastTurn.ttftMs;
+    const tps = e.lastTurn.avgTokPerSec;
+    if (typeof ttft === 'number' && typeof tps === 'number') {
+      next = {
+        turns: cur.turns + 1,
+        ttftSum: cur.ttftSum + ttft,
+        ttftWorst: Math.max(cur.ttftWorst, ttft),
+        tpsSum: cur.tpsSum + tps,
+        tpsWorst: Math.min(cur.tpsWorst, tps),
+        tpsPeak: Math.max(cur.tpsPeak, tps),
+      };
+    }
+  }
+  return next === cur ? prev : { ...prev, [key]: next };
+}
+
+/**
+ * usage.byModel 宽容归一：值须为 {input, output} 桶（核侧 main.
+ * _accumulate_usage 的形状）；字段缺失按 0 计，形状不对丢该桶（latest-wins
+ * 全量快照，坏桶不会残留旧值）。
+ */
+function normalizeUsageByModel(
+  raw: Record<string, UsageModelBucket> | undefined,
+): Record<string, UsageModelBucket> {
+  const out: Record<string, UsageModelBucket> = {};
+  if (raw == null || typeof raw !== 'object') return out;
+  for (const [model, v] of Object.entries(raw)) {
+    if (v === null || typeof v !== 'object') continue;
+    out[model] = {
+      input: typeof v.input === 'number' && Number.isFinite(v.input) ? v.input : 0,
+      output: typeof v.output === 'number' && Number.isFinite(v.output) ? v.output : 0,
+    };
+  }
+  return out;
 }
 
 export type ViewId = 'chat' | 'sessions' | 'api' | 'env' | 'tools' | 'tasks' | 'settings';
@@ -133,7 +246,7 @@ interface ProviderUiState {
 
 /** 会话条目级瞬态 UI（M4：R16/R28/R12 动作的 busy 与回执提示），key = sessionId */
 export interface SessionUiState {
-  busy?: 'resume' | 'fork' | 'pin' | 'export';
+  busy?: 'resume' | 'fork' | 'pin' | 'export' | 'delete';
   notice?: string;
   noticeKind?: 'info' | 'error';
 }
@@ -152,6 +265,14 @@ interface PersistedUi {
   view?: ViewId;
   inputDraft?: string;
   permissionMode?: PermissionMode;
+  /**
+   * R15/R20 设置页「通用」组：界面语言。只持久「用户显式选择」——跟随
+   * 宿主语言自动解析的结果不落盘（否则首次猜测被固化，宿主语言变更即
+   * 失效），门控见 persistUi 的 uiLanguageExplicit。
+   */
+  uiLanguage?: 'zh' | 'en';
+  /** R15/R20 设置页「通用」组：字号缩放百分比（85–150，100 = 不缩放） */
+  fontScale?: number;
 }
 
 function readPersisted(): PersistedUi {
@@ -166,11 +287,36 @@ function readPersisted(): PersistedUi {
 
 function persistUi(get: () => WebviewStore): void {
   try {
-    const { view, inputDraft, permissionMode } = get();
-    getVsCodeApi().setState({ view, inputDraft, permissionMode });
+    const { view, inputDraft, permissionMode, uiLanguage, uiLanguageExplicit, fontScale } = get();
+    getVsCodeApi().setState({
+      view,
+      inputDraft,
+      permissionMode,
+      // 仅显式选择持久（自动跟随宿主语言的结果不固化，见 PersistedUi 注释）
+      uiLanguage: uiLanguageExplicit ? uiLanguage : undefined,
+      fontScale,
+    });
   } catch {
     /* setState 失败不影响功能 */
   }
+}
+
+/**
+ * 冷启动自愈后再发 core 消息（sendUserMessage / newSession / refreshEnv 共用）：
+ * 窗口重载后宿主恢复 activeSessionKey 但 Python 进程不复活，直接发会撞
+ * no_active_session / session_not_found（且错误只落聊天记录，设置/环境页
+ * 用户完全看不见——表现为「点图标没反应」）。先 ensure：进程健在是宿主侧
+ * 一次本地 no-op；不在则宿主新建会话（init 探测即广播 env_info 等）。
+ * ensure 失败（如 agentDir 缺失）时宿主已广播错误，此处静默放弃发送。
+ */
+function ensureSessionThenSend(message: Parameters<typeof hostSendCore>[0]): void {
+  hostRequest<SessionEnsureResult>('session.ensure', undefined, 10_000)
+    .then(() => {
+      hostSendCore(message);
+    })
+    .catch(() => {
+      /* 宿主已广播错误（process_error/host_error），不重复 */
+    });
 }
 
 /* ---------- 默认值 ---------- */
@@ -178,16 +324,126 @@ function persistUi(get: () => WebviewStore): void {
 /**
  * 车钟兜底盘面：宿主尚未下发 telegraph_state 时的中性默认
  * （按 PLAN §3.3 参考值构造；真实盘面永远以模型档案 telegraphLevels 为准）。
+ * R20 i18n：挡位名/说明走字典（t 调用时读当前 locale），语言落定后经
+ * refreshFallbackTelegraph 重建（仅 telegraphIsFallback 期间）。
  */
-const FALLBACK_TELEGRAPH: TelegraphState = {
-  levels: [
-    { id: 'off', label: '关闭', param: '不发送思考参数', ok: true },
-    { id: 'low', label: '低', param: { budget_tokens: 8192 }, ok: true },
-    { id: 'mid', label: '中', param: { budget_tokens: 24576 }, ok: true },
-    { id: 'high', label: '高', param: { budget_tokens: 65536 }, ok: true },
-  ],
-  current: 'mid',
-};
+function fallbackTelegraph(): TelegraphState {
+  return {
+    levels: [
+      { id: 'off', label: t('telegraph.levelOff'), param: t('telegraph.levelOffParam'), ok: true },
+      { id: 'low', label: t('telegraph.levelLow'), param: { budget_tokens: 8192 }, ok: true },
+      { id: 'mid', label: t('telegraph.levelMid'), param: { budget_tokens: 24576 }, ok: true },
+      { id: 'high', label: t('telegraph.levelHigh'), param: { budget_tokens: 65536 }, ok: true },
+    ],
+    current: 'mid',
+  };
+}
+
+/** 初始兜底（模块加载期 locale 已按 navigator 兜底解析） */
+const FALLBACK_TELEGRAPH: TelegraphState = fallbackTelegraph();
+
+/** 语言落定后重建兜底盘面（真盘面由 telegraph_state 事件接管，不受影响） */
+function refreshFallbackTelegraph(): void {
+  if (useStore.getState().telegraphIsFallback) {
+    useStore.setState({ telegraph: fallbackTelegraph() });
+  }
+}
+
+/**
+ * M4 补完（并行会话独立投影）：单会话投影的完整快照。活跃会话的投影住在
+ * 顶层切片（chat/todos/perf/perfStats/usageByModel，视图层零改动）；非活跃
+ * 会话保留在 sessionProjections（key = 核心会话 id），切走时归档、外来事件
+ * 持续更新。切回任一会话都走 resume → session_started → replay 重建顶层
+ * 投影（转录是真相源，保留表只是并行期间的活缓存，不是恢复源）。
+ */
+export interface SessionProjection {
+  chat: { items: ChatItem[]; running: boolean };
+  todos: TodoItem[];
+  perf: PerfState;
+  /** R19 会话统计（按模型每轮聚合；随会话归档） */
+  perfStats: Record<string, PerfModelStats>;
+  /** R19 token 累计（latest-wins 快照；随会话归档） */
+  usageByModel: Record<string, UsageModelBucket>;
+}
+
+/** 保留上限：最近 20 个会话投影防内存膨胀（LRU 淘汰最旧；恢复走 replay） */
+export const PROJECTION_RETAIN_LIMIT = 20;
+
+function activeProjectionOf(s: {
+  chat: { items: ChatItem[]; running: boolean };
+  todos: TodoItem[];
+  perf: PerfState;
+  perfStats: Record<string, PerfModelStats>;
+  usageByModel: Record<string, UsageModelBucket>;
+}): SessionProjection {
+  return {
+    chat: s.chat,
+    todos: s.todos,
+    perf: s.perf,
+    perfStats: s.perfStats,
+    usageByModel: s.usageByModel,
+  };
+}
+
+/** 空投影不归档（避免 newSession 乐观清空后把空态覆盖既有保留） */
+function projectionHasContent(p: SessionProjection): boolean {
+  return (
+    p.chat.items.length > 0 ||
+    p.chat.running ||
+    p.todos.length > 0 ||
+    p.perf.phase !== 'idle' ||
+    Object.keys(p.perfStats).length > 0 ||
+    Object.keys(p.usageByModel).length > 0
+  );
+}
+
+/** LRU 触碰：key 挪到序尾（最近使用）；归档与外来更新共用 */
+function touchProjectionOrder(order: string[], key: string): string[] {
+  const next = order.filter((k) => k !== key);
+  next.push(key);
+  return next;
+}
+
+/**
+ * 归档当前活跃会话的投影（M4 补完）：非空才写入保留表（空投影不覆盖既有
+ * 保留——newSession 乐观清空后 session_started 再归档时快照已是空态），
+ * 超过 PROJECTION_RETAIN_LIMIT 淘汰最旧。返回归档补丁（无需归档 = 空对象）。
+ */
+function archiveActiveProjection(s: WebviewStore): Partial<WebviewStore> {
+  const key = s.coreSessionId;
+  if (key === undefined) return {};
+  const proj = activeProjectionOf(s);
+  if (!projectionHasContent(proj)) return {};
+  const projections = { ...s.sessionProjections, [key]: proj };
+  const order = touchProjectionOrder(s.projectionOrder, key);
+  while (order.length > PROJECTION_RETAIN_LIMIT) {
+    const evict = order.shift();
+    if (evict !== undefined) delete projections[evict];
+  }
+  return { sessionProjections: projections, projectionOrder: order };
+}
+
+/**
+ * 外来会话事件中「属于会话投影」的类型。其余类型（任务表/环境/设置/会话
+ * 列表/ping 等）是活跃会话视角的服务级状态——非活跃进程的帧不混入（此前
+ * 单投影时代它们会污染活跃视图，正是 M4 遗留问题的一部分）。
+ */
+const PROJECTION_EVENT_TYPES = new Set<string>([
+  'thinking_delta',
+  'stream_delta',
+  'message_complete',
+  'tool_call',
+  'permission_request',
+  'diff_proposed',
+  'vision_relay',
+  'perf',
+  'usage',
+  'image_artifact',
+  'checkpoint',
+  'compaction',
+  'rollback_result',
+  'error',
+]);
 
 export interface WebviewStore {
   /* ---- 切片：view ---- */
@@ -217,6 +473,13 @@ export interface WebviewStore {
   chat: { items: ChatItem[]; running: boolean };
   todos: TodoItem[];
   perf: PerfState;
+  /**
+   * R19 会话统计：按模型的每轮 TTFT/速度聚合（perf 帧累计；换会话
+   * （session_started 新 id）与 newSession 重置——重放帧随后重建）。
+   */
+  perfStats: Record<string, PerfModelStats>;
+  /** R19：按模型 token 累计（usage 帧 byModel 全量快照，latest-wins） */
+  usageByModel: Record<string, UsageModelBucket>;
   contextPct?: number;
   usageTokens?: number;
   /**
@@ -226,6 +489,18 @@ export interface WebviewStore {
   lastCompaction?: { layer: string; afterTokens?: number; at: number };
   permissionMode: PermissionMode;
   telegraph: TelegraphState;
+  /** telegraph 切片仍是兜底盘面（宿主 telegraph_state 未到达；语言落定时重建） */
+  telegraphIsFallback: boolean;
+
+  /* ---- M4 补完：并行会话独立投影 ---- */
+  /** 非活跃会话的保留投影（key = 核心会话 id；上限见 PROJECTION_RETAIN_LIMIT） */
+  sessionProjections: Record<string, SessionProjection>;
+  /** 保留顺序（LRU：尾 = 最近使用；超上限淘汰头部） */
+  projectionOrder: string[];
+  /** 宿主会话键 → 核心会话 id（session_started 信封学习，latest-wins） */
+  coreByHostKey: Record<string, string>;
+  /** 核心会话 id → 宿主会话键（反查；activateSession 定向 resume/activate 用） */
+  hostKeyByCore: Record<string, string>;
 
   /* ---- 切片：providers ---- */
   providers: ProviderConfig[];
@@ -328,6 +603,71 @@ export interface WebviewStore {
   /** 发 control workflow_run{name}（运行态沿 workflowRuns + 工具卡显示） */
   runWorkflow(name: string): void;
 
+  /* ---- 切片：settings（R15/R20 设置页） ---- */
+  /** 核心受管设置投影（settings_get 回执；null = 未拉取） */
+  settings: CoreSettings | null;
+  /** settings_get 已发出、等待回执（刷新按钮禁用；15s 兜底） */
+  settingsRefreshing: boolean;
+  /** settings_set / clear_sessions 进行中（单飞：保存/清除按钮禁用；15s 兜底） */
+  settingsSaving: boolean;
+  /** 设置页操作回执提示（保存/清除/失败） */
+  settingsNotice?: { kind: 'info' | 'error'; text: string };
+  /** 会话目录绝对路径（settings_get 附带，「数据」组展示） */
+  sessionsDirPath?: string;
+  /** 发 control settings_get（设置页首开自动拉取一次） */
+  refreshSettings(): void;
+  /** 发 control settings_set{settings: patch}（核侧校验 + 持久 + 热应用） */
+  saveSettings(patch: Partial<CoreSettings> & { compaction?: Partial<CoreSettings['compaction']> }): void;
+  /** 发 control clear_sessions（UI 已二次确认；核侧清空后重建空会话） */
+  clearSessionsData(): void;
+
+  /* ---- 切片：git（R17/R22 一键 Commit & Push） ---- */
+  /** 面板开关（ChatView ⚡Commit 按钮切换；GitCommitCard 渲染条件） */
+  gitPanelOpen: boolean;
+  /** workspaceRoots（getState RPC 惰性拉取；multi-root 时仓库下拉数据源） */
+  gitRepos: string[];
+  /** 当前选中仓库根（缺省第一个 root；核心按 workspaceRoots 白名单校验） */
+  gitRepoRoot?: string;
+  gitScope: 'staged' | 'all';
+  gitPush: boolean;
+  /** git_preview 回执投影（ok=false 时 error 即降级文案，卡片内展示） */
+  gitPreview?: GitPreviewPayload;
+  gitPreviewLoading: boolean;
+  /** git_commit / git_pr 执行中（按钮禁用；git_result 帧 / error 帧 / 兜底解锁） */
+  gitBusy: boolean;
+  /** 最近一次 git_result 帧投影（sha / 可点网址 / PR / error+hint 降级） */
+  gitResult?: {
+    commitSha?: string;
+    remoteUrl?: string;
+    commitUrl?: string;
+    prUrl?: string;
+    error?: string;
+    hint?: string;
+    at: number;
+  };
+  /** 打开面板（重置上次回执；workspaceRoots 惰性拉取由组件 useEffect 驱动） */
+  openGitPanel(): void;
+  closeGitPanel(): void;
+  setGitRepo(repoRoot: string): void;
+  setGitScope(scope: 'staged' | 'all'): void;
+  setGitPush(push: boolean): void;
+  /** 发 control git_preview{repoRoot, scope}（回执 reduceM9Result 消费） */
+  requestGitPreview(): void;
+  /** 发 git_commit 执行帧（message = 预览卡上用户编辑过的提交信息；
+   * pushOverride = 「仅提交」按钮强制不推送，缺省按推送勾选走） */
+  sendGitCommit(message: string, pushOverride?: boolean): void;
+  /** 发 control git_pr（gh pr create；回 git_result 带 prUrl） */
+  sendGitPr(): void;
+
+  /* ---- 切片：本地 UI 设置（「通用」组；vscode getState 持久） ---- */
+  uiLanguage: 'zh' | 'en';
+  /** uiLanguage 是否用户显式选择（true 才随 vscode getState 持久，见 persistUi） */
+  uiLanguageExplicit: boolean;
+  /** 字号缩放百分比（85–150；App 根节点 font-size，100 = 不缩放） */
+  fontScale: number;
+  setUiLanguage(lang: 'zh' | 'en'): void;
+  setFontScale(scale: number): void;
+
   /* ---- 输入态 ---- */
   inputDraft: string;
   setInputDraft(text: string): void;
@@ -342,13 +682,27 @@ export interface WebviewStore {
 
   /* ---- 动作 ---- */
   boot(): Promise<void>;
-  applyEvent(e: CoreEvent): void;
+  /**
+   * 事件归约入口。sessionKey = 事件信封的宿主会话键（M4 补完）：绑定到
+   * 非活跃核心会话时归约进该会话的保留投影（换入→活跃路径→换出，全局
+   * 切片快照还原），否则归约进活跃投影。缺省（旧调用方/无信封键）= 活跃。
+   */
+  applyEvent(e: CoreEvent, sessionKey?: string): void;
+  /** 活跃投影事件归约（原 applyEvent 主体，applyEvent 路由后调用；独立
+   * 暴露便于外来会话换入/换出复用与测试直呼） */
+  reduceActiveEvent(e: CoreEvent): void;
   applyHostError(e: { sessionKey?: string; errorKind: string; message: string }): void;
   applyProcessState(e: { sessionKey: string; state: string; detail?: string }): void;
 
   sendUserMessage(text: string, context?: UserMessageContext): void;
   newSession(): void;
   cancelRunning(): void;
+  /**
+   * R30「回滚到这」：发 rollback{checkpointId}（UI 已弹确认；核侧收到即
+   * 执行 git checkout <sha> -- .，回执 rollback_result + 失败时 error 帧）。
+   * 冷启动自愈与其他 core 消息同款（ensureSessionThenSend）。
+   */
+  rollbackToCheckpoint(checkpointId: string): void;
 
   /* ---- M4 会话动作（R16/R28/R12；均发 control，回执经 result 归约） ---- */
   /** 恢复/切换活跃会话：control resume（重放转录，session_started 切投影）
@@ -360,6 +714,9 @@ export interface WebviewStore {
   togglePinSession(sessionId: string): void;
   /** 导出 Markdown（R12）：control export → result.markdown → workspace.saveExport 落盘 */
   exportSession(sessionId: string): void;
+  /** 删除会话（M4 补完）：control session_delete → result 回执 + 核心广播
+   * sessions_list 收敛列表；破坏性操作不做乐观删除，busy 态等回执 */
+  deleteSession(sessionId: string): void;
   /** 环境面板刷新（M5/R21）：control env_refresh → 核心重新探测广播 env_info */
   refreshEnv(): void;
   /** Skills 刷新（M7/R3）：control skills_list → result.detail JSON → skills 切片 */
@@ -470,6 +827,118 @@ function parseToolsDetail(detail?: string): ToolInfo[] {
     });
   }
   return out;
+}
+
+/**
+ * R17/R22：git_preview 回执 result.detail（JSON 字符串）→ GitPreviewPayload。
+ * 宽容解析（镜像 Python gitflow.PreviewPayload.to_dict）：summary.files 条目
+ * 须有 string path，计数缺省按 files 累加/计数回退；解析失败回 null（调用
+ * 方降级为 error 载荷，卡片显示文案而非空白）。
+ */
+export function parseGitPreview(detail?: string): GitPreviewPayload | null {
+  if (typeof detail !== 'string' || detail === '') return null;
+  let data: unknown;
+  try {
+    data = JSON.parse(detail);
+  } catch {
+    return null;
+  }
+  if (data === null || typeof data !== 'object') return null;
+  const o = data as Record<string, unknown>;
+  const summary = (o.summary ?? {}) as Record<string, unknown>;
+  const files: GitFileStat[] = [];
+  for (const x of Array.isArray(summary.files) ? summary.files : []) {
+    if (x === null || typeof x !== 'object') continue;
+    const f = x as Record<string, unknown>;
+    if (typeof f.path !== 'string' || f.path === '') continue;
+    files.push({
+      path: f.path,
+      status: typeof f.status === 'string' ? f.status : 'M',
+      insertions: typeof f.insertions === 'number' ? f.insertions : null,
+      deletions: typeof f.deletions === 'number' ? f.deletions : null,
+    });
+  }
+  return {
+    ok: o.ok === true,
+    repoRoot: typeof o.repoRoot === 'string' ? o.repoRoot : '',
+    scope: o.scope === 'all' ? 'all' : 'staged',
+    files,
+    insertions:
+      typeof summary.insertions === 'number'
+        ? summary.insertions
+        : files.reduce((acc, f) => acc + (f.insertions ?? 0), 0),
+    deletions:
+      typeof summary.deletions === 'number'
+        ? summary.deletions
+        : files.reduce((acc, f) => acc + (f.deletions ?? 0), 0),
+    untracked:
+      typeof summary.untracked === 'number'
+        ? summary.untracked
+        : files.filter((f) => f.status === '??').length,
+    subject: typeof o.subject === 'string' ? o.subject : '',
+    body: typeof o.body === 'string' ? o.body : '',
+    styleNote: typeof o.styleNote === 'string' ? o.styleNote : '',
+    remoteUrl: typeof o.remoteUrl === 'string' ? o.remoteUrl : null,
+    remoteKind: typeof o.remoteKind === 'string' ? o.remoteKind : 'none',
+    canPr: o.canPr === true,
+    ghAvailable: o.ghAvailable === true,
+    error: typeof o.error === 'string' ? o.error : null,
+  };
+}
+
+/**
+ * R15/R20：settings_get / settings_set 回执 result.detail（JSON 字符串）→
+ * {settings, homeDir, sessionsDir}。双形状宽容：settings_get 是
+ * {settings, homeDir, sessionsDir} 包裹；settings_set 直接回生效值（无
+ * 包裹）。字段缺失/类型不符回 null（UI 显示空态）；compaction 组与
+ * privacyFilePatterns 宽容缺省。
+ */
+export function parseSettingsDetail(detail?: string): {
+  settings: CoreSettings;
+  homeDir: string;
+  sessionsDir: string;
+} | null {
+  if (typeof detail !== 'string' || detail === '') return null;
+  let data: unknown;
+  try {
+    data = JSON.parse(detail);
+  } catch {
+    return null;
+  }
+  if (data === null || typeof data !== 'object') return null;
+  const o = data as Record<string, unknown>;
+  const wrapped = o.settings !== null && typeof o.settings === 'object';
+  const raw = (wrapped ? o.settings : o) as Record<string, unknown>;
+  const compaction = (raw.compaction ?? {}) as Record<string, unknown>;
+  const preset = raw.visionRelayPreset;
+  const threshold = compaction.summarizeThreshold;
+  const maxTurns = raw.maxTurns;
+  return {
+    settings: {
+      systemPromptAppend: typeof raw.systemPromptAppend === 'string' ? raw.systemPromptAppend : '',
+      maxTurns: typeof maxTurns === 'number' && Number.isFinite(maxTurns) ? Math.round(maxTurns) : 8,
+      compaction: {
+        summarizeThreshold:
+          typeof threshold === 'number' && Number.isFinite(threshold) && threshold > 0 && threshold <= 1
+            ? threshold
+            : 0.85,
+        compactionModel: typeof compaction.compactionModel === 'string' ? compaction.compactionModel : '',
+      },
+      visionRelayPreset: (['ocr', 'describe', 'frontend', 'custom'] as const).includes(preset as VisionRelayPreset)
+        ? (preset as VisionRelayPreset)
+        : 'describe',
+      visionRelayCustomPrompt:
+        typeof raw.visionRelayCustomPrompt === 'string' ? raw.visionRelayCustomPrompt : '',
+      privacyFilePatterns: Array.isArray(raw.privacyFilePatterns)
+        ? raw.privacyFilePatterns.filter((p): p is string => typeof p === 'string')
+        : [],
+      // R6 收尾：车钟咔哒开关缺省开（与核侧 _settings_view 同语义：
+      // 只有显式 false 才关，字段缺失/脏值都回落 true）
+      telegraphClickSound: raw.telegraphClickSound === false ? false : true,
+    },
+    homeDir: typeof o.homeDir === 'string' ? o.homeDir : '',
+    sessionsDir: typeof o.sessionsDir === 'string' ? o.sessionsDir : '',
+  };
 }
 
 function parseSkillsDetail(detail?: string): SkillInfo[] {
@@ -791,7 +1260,7 @@ function reduceM9Result(
       set((s) => ({
         cronsRefreshing: false,
         crons: e.ok ? parseCronsDetail(e.detail) : s.crons,
-        cronNotice: e.ok ? s.cronNotice : { kind: 'error' as const, text: e.detail ?? '定时任务列表获取失败' },
+        cronNotice: e.ok ? s.cronNotice : { kind: 'error' as const, text: e.detail ?? t('tasks.cronListFailed') },
       }));
       return true;
     }
@@ -802,7 +1271,7 @@ function reduceM9Result(
         cronPendingAction: undefined,
         cronNotice: {
           kind: e.ok ? 'info' : 'error',
-          text: e.detail ?? (e.ok ? '操作成功' : '操作失败'),
+          text: e.detail ?? (e.ok ? t('common.ok') : t('common.failed')),
         },
       });
       if (e.ok) useStore.getState().refreshCrons();
@@ -812,7 +1281,7 @@ function reduceM9Result(
       set((s) => ({
         workflowsRefreshing: false,
         workflows: e.ok ? parseWorkflowsDetail(e.detail) : s.workflows,
-        workflowNotice: e.ok ? s.workflowNotice : { kind: 'error' as const, text: e.detail ?? '工作流列表获取失败' },
+        workflowNotice: e.ok ? s.workflowNotice : { kind: 'error' as const, text: e.detail ?? t('tasks.workflowListFailed') },
       }));
       return true;
     }
@@ -828,6 +1297,68 @@ function reduceM9Result(
               }
             : s.workflowRuns,
       }));
+      return true;
+    }
+    case 'settings_get': {
+      // R15/R20：回执即解锁；ok 时以 detail JSON 覆盖 settings 切片 + 会话目录
+      const parsed = e.ok ? parseSettingsDetail(e.detail) : null;
+      set((s) => ({
+        settingsRefreshing: false,
+        settings: parsed?.settings ?? s.settings,
+        sessionsDirPath: parsed?.sessionsDir || s.sessionsDirPath,
+        settingsNotice: e.ok
+          ? undefined
+          : { kind: 'error' as const, text: e.detail ?? t('settings.getFailed') },
+      }));
+      return true;
+    }
+    case 'settings_set': {
+      // 成功回执 detail 即核侧热应用后的生效值（免二次拉取直接覆盖）
+      const parsed = e.ok ? parseSettingsDetail(e.detail) : null;
+      set((s) => ({
+        settingsSaving: false,
+        settings: parsed ? { ...parsed.settings } : s.settings,
+        settingsNotice: {
+          kind: e.ok ? ('info' as const) : ('error' as const),
+          text: e.ok ? t('settings.savedApplied') : e.detail ?? t('settings.saveFailed'),
+        },
+      }));
+      return true;
+    }
+    case 'clear_sessions': {
+      set({
+        settingsSaving: false,
+        settingsNotice: {
+          kind: e.ok ? 'info' : 'error',
+          text: e.ok ? t('settings.cleared') : e.detail ?? t('settings.clearFailed'),
+        },
+      });
+      return true;
+    }
+    case 'git_preview': {
+      // R17/R22：预览回执 detail JSON → gitPreview 切片（含 ok=false 的降级
+      // 载荷——非仓库/scope 非法等文案只在卡片内展示，不进聊天流）
+      const parsed = parseGitPreview(e.detail);
+      set({
+        gitPreviewLoading: false,
+        gitPreview:
+          parsed ?? {
+            ok: false,
+            repoRoot: get().gitRepoRoot ?? '',
+            scope: get().gitScope,
+            files: [],
+            insertions: 0,
+            deletions: 0,
+            untracked: 0,
+            subject: '',
+            body: '',
+            styleNote: '',
+            remoteKind: 'none',
+            canPr: false,
+            ghAvailable: false,
+            error: e.detail ?? t('git.previewUnparseable'),
+          },
+      });
       return true;
     }
     default:
@@ -875,7 +1406,7 @@ function reduceResult(
     set((s) => ({
       mcpRefreshing: false,
       mcpServers: e.ok ? parseMcpDetail(e.detail) : s.mcpServers,
-      mcpNotice: e.ok ? s.mcpNotice : { kind: 'error', text: e.detail ?? 'MCP 列表获取失败' },
+      mcpNotice: e.ok ? s.mcpNotice : { kind: 'error', text: e.detail ?? t('tools.mcpListFailed') },
     }));
     return;
   }
@@ -886,7 +1417,11 @@ function reduceResult(
         kind: e.ok ? 'info' : 'error',
         text:
           e.detail ??
-          (e.ok ? (e.command === 'mcp_add' ? '已添加，装配中…' : '已移除') : '操作失败'),
+          (e.ok
+            ? e.command === 'mcp_add'
+              ? t('tools.mcpAdded')
+              : t('tools.mcpRemoved')
+            : t('common.failed')),
       },
     });
     if (e.ok) {
@@ -897,7 +1432,7 @@ function reduceResult(
   }
   if (e.command === 'export') {
     if (e.ok && e.markdown != null && e.markdown !== '') {
-      patchSessionUi(set, sessionId, { busy: undefined, notice: '已生成导出，选择保存位置…', noticeKind: 'info' });
+      patchSessionUi(set, sessionId, { busy: undefined, notice: t('sessions.exportPreparing'), noticeKind: 'info' });
       void hostRequest<{ path?: string; saved?: boolean }>('workspace.saveExport', {
         markdown: e.markdown,
         sessionId,
@@ -907,7 +1442,7 @@ function reduceResult(
           set({ hostConnected: true });
           patchSessionUi(set, sessionId, {
             busy: undefined,
-            notice: r?.path ? `已导出：${r.path}` : '已导出',
+            notice: r?.path ? t('sessions.exportedPath', { path: r.path }) : t('sessions.exported'),
             noticeKind: 'info',
           });
         })
@@ -915,14 +1450,16 @@ function reduceResult(
           set({ hostConnected: classifyRpcError(err) });
           patchSessionUi(set, sessionId, {
             busy: undefined,
-            notice: `导出失败：${err instanceof Error ? err.message : String(err)}`,
+            notice: t('sessions.exportFailedPath', {
+              error: err instanceof Error ? err.message : String(err),
+            }),
             noticeKind: 'error',
           });
         });
     } else {
       patchSessionUi(set, sessionId, {
         busy: undefined,
-        notice: e.detail ?? '导出失败',
+        notice: e.detail ?? t('sessions.exportFailed'),
         noticeKind: 'error',
       });
     }
@@ -931,7 +1468,9 @@ function reduceResult(
   if (e.command === 'fork') {
     patchSessionUi(set, sessionId, {
       busy: undefined,
-      notice: e.ok ? `已分叉 → ${e.detail ?? '新会话'}` : e.detail ?? '分叉失败',
+      notice: e.ok
+        ? t('sessions.forked', { target: e.detail ?? t('sessions.forkTargetNew') })
+        : e.detail ?? t('sessions.forkFailed'),
       noticeKind: e.ok ? 'info' : 'error',
     });
     return;
@@ -945,8 +1484,22 @@ function reduceResult(
     }
     patchSessionUi(set, sessionId, {
       busy: undefined,
-      notice: e.ok ? (e.detail === 'pinned' ? '已收藏' : '已取消收藏') : e.detail ?? '收藏切换失败',
+      notice: e.ok
+        ? e.detail === 'pinned'
+          ? t('sessions.pinnedNotice')
+          : t('sessions.unpinnedNotice')
+        : e.detail ?? t('sessions.pinFailed'),
       noticeKind: e.ok ? 'info' : 'error',
+    });
+    return;
+  }
+  if (e.command === 'session_delete') {
+    // ok：条目由随后的 sessions_list 广播收敛（回执可能晚于广播，此时条目
+    // 已不在列表，patchSessionUi 落在空 ui 上无害）；失败保留提示
+    patchSessionUi(set, sessionId, {
+      busy: undefined,
+      notice: e.ok ? undefined : (e.detail ?? t('sessions.deleteFailed')),
+      noticeKind: 'error',
     });
     return;
   }
@@ -973,10 +1526,18 @@ export const useStore = create<WebviewStore>()((set, get) => ({
   chat: { items: [], running: false },
   todos: [],
   perf: { phase: 'idle' },
+  perfStats: {},
+  usageByModel: {},
   contextPct: undefined,
   usageTokens: undefined,
   permissionMode: 'build',
   telegraph: FALLBACK_TELEGRAPH,
+  telegraphIsFallback: true,
+  // M4 补完：并行会话独立投影（保留表 + LRU 序 + 宿主键绑定，均为空起步）
+  sessionProjections: {},
+  projectionOrder: [],
+  coreByHostKey: {},
+  hostKeyByCore: {},
   providers: [],
   providerUi: {},
   env: null,
@@ -1008,6 +1569,26 @@ export const useStore = create<WebviewStore>()((set, get) => ({
   workflowRuns: {},
   pendingWorkflowRun: undefined,
   workflowNotice: undefined,
+  settings: null,
+  settingsRefreshing: false,
+  settingsSaving: false,
+  settingsNotice: undefined,
+  sessionsDirPath: undefined,
+  // R17/R22：git 切片（repoRoot 在 openGitPanel 后按 getState 回填）
+  gitPanelOpen: false,
+  gitRepos: [],
+  gitRepoRoot: undefined,
+  gitScope: 'staged',
+  gitPush: false,
+  gitPreview: undefined,
+  gitPreviewLoading: false,
+  gitBusy: false,
+  gitResult: undefined,
+  // R20：初值与 i18n 模块加载期的 navigator 兜底解析对齐（boot 随后按
+  // 持久选择/宿主语言覆写），避免设置页语言下拉首帧闪显默认值
+  uiLanguage: useI18nStore.getState().locale,
+  uiLanguageExplicit: false,
+  fontScale: 100,
   inputDraft: '',
 
   setInputDraft: (text) => {
@@ -1072,24 +1653,154 @@ export const useStore = create<WebviewStore>()((set, get) => ({
     if (saved.view) set({ view: saved.view });
     if (typeof saved.inputDraft === 'string') set({ inputDraft: saved.inputDraft });
     if (saved.permissionMode) set({ permissionMode: saved.permissionMode });
+    // R15/R20 设置页「通用」组：语言 / 字号缩放注水（App 根节点消费）。
+    // R20 语言解析链：持久显式选择 > 宿主语言（下方 getState.language，即
+    // vscode.env.language）> navigator.language 兜底（i18n 模块加载期已解析
+    // 过一次，此处补写主 store 切片保持两处一致）。自动跟随的结果不标
+    // explicit、不持久——宿主语言变更在下次启动继续生效。
+    if (saved.uiLanguage === 'zh' || saved.uiLanguage === 'en') {
+      set({ uiLanguage: saved.uiLanguage, uiLanguageExplicit: true });
+      setLocale(saved.uiLanguage);
+    } else {
+      const nav = resolveLocale(
+        typeof navigator !== 'undefined' ? navigator.language : undefined,
+      );
+      set({ uiLanguage: nav, uiLanguageExplicit: false });
+      setLocale(nav);
+    }
+    refreshFallbackTelegraph();
+    if (typeof saved.fontScale === 'number' && Number.isFinite(saved.fontScale)) {
+      set({ fontScale: Math.max(85, Math.min(150, Math.round(saved.fontScale))) });
+    }
     // 宿主 getState（已注册）：拿 activeSessionKey；ready+replay 由 transport 负责
     try {
       const st = await hostRequest<GetStateResult>('getState', undefined, 4000);
       set({ hostConnected: true, activeSessionKey: st?.activeSessionKey });
+      // 未显式选择时跟随宿主显示语言（vscode.env.language；旧宿主缺字段
+      // 或值空则维持 navigator 兜底结果）
+      const s = useStore.getState();
+      if (!s.uiLanguageExplicit && typeof st?.language === 'string' && st.language !== '') {
+        const host = resolveLocale(st.language);
+        useStore.setState({ uiLanguage: host });
+        setLocale(host);
+        refreshFallbackTelegraph();
+      }
     } catch (err) {
       set({ hostConnected: classifyRpcError(err) });
     }
   },
 
-  applyEvent: (e) => {
+  applyEvent: (e, sessionKey) => {
+    // M4 补完（并行会话独立投影）路由（判定先于绑定学习——活跃进程
+    // resume/new_session 换绑的 session_started 若先学习（键→新会话）再路由，
+    // 本帧会被误判为外来而丢弃切换）：
+    //  - 信封键 = 活跃会话键（hostKeyByCore[coreSessionId]）→ 活跃投影；
+    //  - 我方定向 resume 的回执（pendingControl 对账：resume 目标 = 本帧
+    //    sessionId，信封键 = 拥有它的进程）→ 活跃投影（这就是切换本身）；
+    //  - 其余一律外来：绑定已知 → 更新该核心会话的保留投影；未绑定 → 丢弃
+    //    （外来进程 init 的 session_started 只学绑定不抢投影，下一帧起有目标）。
+    const s0 = get();
+    let foreign = false;
+    if (sessionKey !== undefined && s0.coreSessionId !== undefined) {
+      const activeHostKey = s0.hostKeyByCore[s0.coreSessionId];
+      const isSwitchWeAskedFor =
+        e.type === 'session_started' &&
+        s0.pendingControl?.command === 'resume' &&
+        s0.pendingControl.sessionId === e.sessionId;
+      if (sessionKey !== activeHostKey && !isSwitchWeAskedFor) foreign = true;
+    }
+    if (sessionKey !== undefined && e.type === 'session_started') {
+      // 绑定学习（活跃与外来路径都要学）：信封键随每条核 → 壳事件下发
+      //（transport dispatchHostMessage）；每个并行会话进程一个键，
+      // session_started 告知该进程当前绑定的核心会话（latest-wins——进程
+      // resume/new_session 换绑后旧核心会话不再来信）。
+      set((s) => {
+        const prevBound = s.coreByHostKey[sessionKey];
+        const hostKeyByCore = { ...s.hostKeyByCore, [e.sessionId]: sessionKey };
+        if (prevBound !== undefined && prevBound !== e.sessionId) {
+          delete hostKeyByCore[prevBound];
+        }
+        return {
+          coreByHostKey: { ...s.coreByHostKey, [sessionKey]: e.sessionId },
+          hostKeyByCore,
+        };
+      });
+    }
+    if (!foreign) {
+      useStore.getState().reduceActiveEvent(e);
+      return;
+    }
+    // 外来会话：只处理投影类事件（其余是活跃会话视角的服务级状态，不混入）
+    if (!PROJECTION_EVENT_TYPES.has(e.type)) return;
+    const bound = sessionKey !== undefined ? s0.coreByHostKey[sessionKey] : undefined;
+    const foreignCore =
+      bound !== undefined && bound !== s0.coreSessionId ? bound : undefined;
+    if (foreignCore === undefined) {
+      // 键未绑定（外来进程早期帧，session_started 已学绑定随后即有目标）或
+      // 键声索的是活跃会话（双进程同会话的僵尸侧）——无保留目标，丢弃；
+      // 切换过去时由 resume replay 按转录重建（恢复链路兼容）
+      return;
+    }
+    const retained = s0.sessionProjections[foreignCore];
+    if (retained === undefined) {
+      // 从未在本 webview 激活过（或已被 LRU 淘汰）：丢弃，理由同上
+      return;
+    }
+    // 换入保留投影 → 复用活跃归约路径（语义同源）→ 换出：全局切片按快照
+    // 原样还原，五个会话切片存回保留投影。同步块内完成，无中间渲染。
+    const snapshot = { ...s0 };
+    useStore.setState({ ...retained });
+    useStore.getState().reduceActiveEvent(e);
+    const after = get();
+    useStore.setState({
+      ...snapshot,
+      sessionProjections: {
+        ...after.sessionProjections,
+        [foreignCore]: {
+          chat: after.chat,
+          todos: after.todos,
+          perf: after.perf,
+          perfStats: after.perfStats,
+          usageByModel: after.usageByModel,
+        },
+      },
+      projectionOrder: touchProjectionOrder(after.projectionOrder, foreignCore),
+    });
+  },
+
+  reduceActiveEvent: (e) => {
     switch (e.type) {
       case 'session_started': {
-        // 换了核心会话 id 才清空投影（同一会话的重复/重放事件不清）
-        set((s) => ({
-          coreSessionId: e.sessionId,
-          chat: s.coreSessionId === e.sessionId ? s.chat : { items: [], running: false },
-          todos: s.coreSessionId === e.sessionId ? s.todos : [],
-        }));
+        // 换了核心会话 id 才切投影（同一会话的重复/重放事件不清）。
+        // M4 补完：切走时旧会话投影归档进保留表（上限 PROJECTION_RETAIN_LIMIT，
+        // LRU 淘汰），新会话从空投影开始、由随后的 resume replay 按转录重建
+        // （恢复链路不变——保留表是并行期间的活缓存，不是恢复源）。
+        // R19 统计同款重置（perf 一并回 idle——此前漏重置是潜伏不一致）。
+        const same = get().coreSessionId === e.sessionId;
+        if (same) {
+          set({ coreSessionId: e.sessionId });
+          break;
+        }
+        set((s) => {
+          const archived = archiveActiveProjection(s);
+          const projections = { ...(archived.sessionProjections ?? s.sessionProjections) };
+          // 新会话成为活跃：清掉它的保留记录（顶层切片即真相，避免陈旧残留
+          // 被外来事件继续更新）；切走时由归档覆写
+          const order = (archived.projectionOrder ?? s.projectionOrder).filter(
+            (k) => k !== e.sessionId,
+          );
+          delete projections[e.sessionId];
+          return {
+            coreSessionId: e.sessionId,
+            chat: { items: [], running: false },
+            todos: [],
+            perf: { phase: 'idle' },
+            perfStats: {},
+            usageByModel: {},
+            sessionProjections: projections,
+            projectionOrder: order,
+          };
+        });
         break;
       }
       case 'thinking_delta': {
@@ -1262,6 +1973,7 @@ export const useStore = create<WebviewStore>()((set, get) => ({
             current: e.current,
             paramTranslation: e.paramTranslation,
           },
+          telegraphIsFallback: false, // 真盘面到达，兜底盘面不再随语言重建
         });
         break;
       }
@@ -1273,6 +1985,8 @@ export const useStore = create<WebviewStore>()((set, get) => ({
             tokPerSec: e.tokPerSec ?? s.perf.tokPerSec,
             lastTurn: e.lastTurn ?? s.perf.lastTurn,
           },
+          // R19 会话统计：按 model 分组增量累计（含 resume 重放的历史帧）
+          perfStats: applyPerfStats(s.perfStats, e),
           chat:
             e.phase === 'done'
               ? { items: closeStreaming(s.chat.items), running: false }
@@ -1285,6 +1999,8 @@ export const useStore = create<WebviewStore>()((set, get) => ({
         set({
           usageTokens: e.tokens,
           contextPct: ctx ? Math.min(100, Math.round((e.tokens / ctx) * 100)) : undefined,
+          // R19：byModel 全量快照 latest-wins（核侧按会话累计，见 protocol 注释）
+          usageByModel: normalizeUsageByModel(e.byModel),
         });
         break;
       }
@@ -1403,6 +2119,9 @@ export const useStore = create<WebviewStore>()((set, get) => ({
         // 已先行生效（setPermissionMode 乐观切换），此类错误不入聊天流
         // （不打断交互；Python 侧并行实现落地后帧自然消失）
         if (e.message.includes('permission_mode')) break;
+        // 分离语义：环境探测进行中的 busy 提示不入聊天流（env_info 到达
+        // 即完成；曾因探测帧打断车钟拖拽）——探测期间 UI 一切照旧
+        if (e.kind === 'busy' && e.message.includes('环境探测')) break;
         // M9 宽容同款：任务/定时任务/工作流/补全命令未被核心识别（Python
         // 并行定稿期常态）——解锁对应页签 busy 并把提示带过去，不入聊天流
         // （页签首开即发列表命令，进聊天流会被 unknown control 噪音淹没）
@@ -1463,13 +2182,44 @@ export const useStore = create<WebviewStore>()((set, get) => ({
             mcpNotice: { kind: 'error', text: e.message },
           }));
         }
+        // R17/R22：git_* 的协议级错误（白名单拒绝 / busy 门）立即解锁 git
+        // busy——执行结果的降级文案走 git_result.error，不进聊天流
+        if (
+          get().gitPreviewLoading
+          && (e.message.includes('git_preview') || e.message.includes('workspaceRoots'))
+        ) {
+          set({ gitPreviewLoading: false });
+        }
+        if (get().gitBusy && e.message.includes('git_')) {
+          set({ gitBusy: false });
+        }
         break;
       }
       case 'checkpoint': {
         // atMessageId 与入站 user_message 的 messageId 同源（main.py 生成同一
         // id 后先落转录再广播 checkpoint）——这是 UI 侧唯一可得的分叉点真实
-        // 标识，forkSession 据此发 control fork
-        set({ lastAtMessageId: e.atMessageId });
+        // 标识，forkSession 据此发 control fork。
+        // R30「回滚到这」：checkpoint 帧在 main._on_user_message 里同步快照后、
+        // 回合线程启动前广播，即「紧随其触发的 user 消息到达」——UI 的 user
+        // 条目没有核侧 messageId（本地 nid），按位置配对：倒序找最后一条尚未
+        // 关联检查点的 user 条目回填 {id, sha}，遇到已关联的更早条目即停
+        // （一一配对，不越位）。resume 重放只回放 out 帧、user 帧不在其中
+        // （_control_resume），重放的 checkpoint 找不到可回填条目 → 仅更新
+        // lastAtMessageId，按钮随 user 条目缺席而不显示（与聊天投影现状一致）。
+        // 已知边界：cron 注入的 prompt 走同一核侧路径（也产 checkpoint）但
+        // UI 无对应条目——若它恰好是首个可用检查点，可能回填到上一条真实
+        // user 消息（回滚目标仍是最新快照，语义可接受）。
+        set((s) => {
+          const items = s.chat.items.slice();
+          for (let i = items.length - 1; i >= 0; i--) {
+            const it = items[i];
+            if (it.kind !== 'user') continue; // 跳过流内工具卡等，只看 user 条目
+            if (it.checkpointId != null) break; // 更早消息已配对完成
+            items[i] = { ...it, checkpointId: e.id, checkpointSha: e.sha };
+            break;
+          }
+          return { lastAtMessageId: e.atMessageId, chat: { ...s.chat, items } };
+        });
         break;
       }
       case 'result': {
@@ -1510,16 +2260,76 @@ export const useStore = create<WebviewStore>()((set, get) => ({
         }));
         break;
       }
-      case 'rollback_result':
-      case 'git_result':
+      case 'git_result': {
+        // R17/R22：git_commit / git_pr 的回执 → git 切片（GitCommitCard 展示
+        // sha / 可点 commit 网址 / PR 网址；error + hint 降级文案），解锁 busy
+        set({
+          gitBusy: false,
+          gitResult: {
+            commitSha: e.commitSha,
+            remoteUrl: e.remoteUrl,
+            commitUrl: e.commitUrl,
+            prUrl: e.prUrl,
+            error: e.error,
+            hint: e.hint,
+            at: Date.now(),
+          },
+        });
+        break;
+      }
+      case 'rollback_result': {
+        // R30「回滚到这」回执：成功落一行中性系统提示（详细文案在伴随的
+        // result 帧 detail，不重复展示）；失败时核侧紧跟 error 帧带原因
+        // （not_found / busy / 快照被 GC 等），此处不重复入流
+        if (e.ok) {
+          set((s) => ({
+            chat: {
+              ...s.chat,
+              items: [
+                ...s.chat.items,
+                {
+                  kind: 'system',
+                  id: nid('sys'),
+                  at: Date.now(),
+                  text: t('chat.rollbackDone'),
+                },
+              ],
+            },
+          }));
+        }
+        break;
+      }
       case 'echo':
-        // 尚不消费：git=M4 宿主侧、echo=M0 遗留帧。
-        // 事件到达即忽略（不报错）。
+        // M0 遗留帧：事件到达即忽略（不报错）。
         break;
     }
   },
 
   applyHostError: (e) => {
+    // M4 补完：外来会话进程的宿主错误进该会话的保留投影（有则入卡），
+    // 不再混进活跃聊天流；未绑定/无保留时维持旧行为（活跃投影）。
+    const bound =
+      e.sessionKey !== undefined ? get().coreByHostKey[e.sessionKey] : undefined;
+    if (bound !== undefined && bound !== get().coreSessionId) {
+      const proj = get().sessionProjections[bound];
+      if (proj === undefined) return;
+      set((s) => ({
+        sessionProjections: {
+          ...s.sessionProjections,
+          [bound]: {
+            ...proj,
+            chat: {
+              ...proj.chat,
+              items: [
+                ...proj.chat.items,
+                { kind: 'error', id: nid('hosterr'), at: Date.now(), errorKind: e.errorKind, message: e.message },
+              ],
+            },
+          },
+        },
+      }));
+      return;
+    }
     set((s) => ({
       chat: {
         ...s.chat,
@@ -1548,13 +2358,30 @@ export const useStore = create<WebviewStore>()((set, get) => ({
       },
     }));
     persistUi(get);
-    hostSendCore({ type: 'user_message', text: t, context: merged });
+    ensureSessionThenSend({ type: 'user_message', text: t, context: merged });
   },
 
   newSession: () => {
-    // 本地乐观清空；核心 session_started 会带回新 sessionId
-    set({ chat: { items: [], running: false }, todos: [], perf: { phase: 'idle' } });
-    hostSendCore({ type: 'control', command: 'new_session' });
+    // 本地乐观清空；核心 session_started 会带回新 sessionId。
+    // 冷启动（首次/重载后无进程）经 ensure 自愈建会话，control 才有归宿。
+    // M4 补完：先归档旧会话投影再清空（session_started 到达时快照已空，
+    // archiveActiveProjection 的非空守卫不会用空态覆盖）；R19 统计随会话
+    // 切换一并清零（核侧 usage_by_model 同步重置）。
+    set((s) => ({
+      ...archiveActiveProjection(s),
+      chat: { items: [], running: false },
+      todos: [],
+      perf: { phase: 'idle' },
+      perfStats: {},
+      usageByModel: {},
+    }));
+    ensureSessionThenSend({ type: 'control', command: 'new_session' });
+  },
+
+  rollbackToCheckpoint: (checkpointId) => {
+    // R30：确认已在 UI 弹窗完成（PLAN §5 rollback 无二次确认往返），
+    // 核侧收到即 git checkout <sha> -- .（sha 凭转录找回，_checkpoint_sha）
+    ensureSessionThenSend({ type: 'rollback', checkpointId });
   },
 
   cancelRunning: () => {
@@ -1568,13 +2395,26 @@ export const useStore = create<WebviewStore>()((set, get) => ({
         sessionsUi: { ...s.sessionsUi, [sessionId]: { ...s.sessionsUi[sessionId], busy: 'resume' } },
         pendingControl: { command: 'resume', sessionId, at: Date.now() },
       }));
-      // 顺序：先 resume（发往当前活跃进程，核心绑定该会话并重放转录 ——
-      // session_started 到达时 store 切投影），再 session.activate（宿主把
-      // 活跃 sessionKey 指到绑定该会话的进程；并行多开 R16。方法名调用，
-      // 宿主侧并行实现，未注册时静默降级 —— 路由仍走默认活跃会话）
-      hostSendCore({ type: 'control', command: 'resume', sessionId });
-      void hostRequest('session.activate', { sessionId })
-        .then(() => set({ hostConnected: true }))
+      // M4 补完：绑定已知（hostKeyByCore 学习自 session_started 信封）时
+      // resume 定向发往「拥有该会话的进程」——并行多开下活跃进程 resume
+      // 别的会话会造成双进程绑同一转录；未知绑定维持旧行为（活跃进程）。
+      // 顺序：先 resume（重放转录，session_started 到达时 store 切投影——
+      // 旧会话投影随即归档保留），再 session.activate（宿主把活跃
+      // sessionKey 指到目标进程；未知绑定时载荷退化为 sessionId，宿主
+      // 解析能力并行定稿中，见 protocol.ts SessionActivateParams 注释）。
+      const knownKey = get().hostKeyByCore[sessionId];
+      hostSendCore({ type: 'control', command: 'resume', sessionId }, knownKey);
+      void hostRequest<SessionActivateResult>('session.activate', {
+        sessionId,
+        ...(knownKey !== undefined ? { sessionKey: knownKey } : {}),
+      })
+        .then((r) =>
+          set((s) => ({
+            hostConnected: true,
+            activeSessionKey:
+              typeof r?.activeSessionKey === 'string' ? r.activeSessionKey : s.activeSessionKey,
+          })),
+        )
         .catch((err) => set({ hostConnected: classifyRpcError(err) }));
       armSessionBusyTimeout(sessionId, 'resume');
     }
@@ -1624,12 +2464,35 @@ export const useStore = create<WebviewStore>()((set, get) => ({
     armSessionBusyTimeout(sessionId, 'export');
   },
 
+  deleteSession: (sessionId) => {
+    // M4 补完：破坏性操作不做乐观删除——result ok 后核心广播 sessions_list
+    // 收敛列表；核侧拒绝当前活跃会话（UI 侧按钮已禁用，error 帧兜底提示）
+    set((s) => ({
+      sessionsUi: { ...s.sessionsUi, [sessionId]: { ...s.sessionsUi[sessionId], busy: 'delete', notice: undefined } },
+      pendingControl: { command: 'session_delete', sessionId, at: Date.now() },
+    }));
+    hostSendCore({ type: 'control', command: 'session_delete', sessionId });
+    armSessionBusyTimeout(sessionId, 'delete');
+  },
+
   refreshEnv: () => {
     if (get().envRefreshing) return;
     // M5/R21：核心重新探测并广播 env_info（归约清除 envRefreshing）；
-    // 核心未实现该命令时回 error 帧，兜底超时解锁按钮
+    // 核心未实现该命令时回 error 帧，兜底超时解锁按钮。
+    // 冷启动经 ensure 自愈，且探测与其他功能完全分离：
+    //  - ensure 新建了会话 → init 自带环境探测并广播 env_info，不补发
+    //    env_refresh（否则双重探测，探测中再刷还会往聊天流回帧）；
+    //  - ensure 复用既有会话 → 照常 env_refresh。
     set({ envRefreshing: true });
-    hostSendCore({ type: 'control', command: 'env_refresh' });
+    hostRequest<SessionEnsureResult>('session.ensure', undefined, 10_000)
+      .then((r) => {
+        if (!r.created) {
+          hostSendCore({ type: 'control', command: 'env_refresh' });
+        }
+      })
+      .catch(() => {
+        /* 宿主已广播错误（process_error/host_error），不重复 */
+      });
     window.setTimeout(() => {
       if (useStore.getState().envRefreshing) {
         useStore.setState({ envRefreshing: false });
@@ -1927,13 +2790,200 @@ export const useStore = create<WebviewStore>()((set, get) => ({
             ...s.workflowRuns,
             [name]: {
               status: 'failed',
-              report: '运行回执超时（核心未实现 workflow_run 或无活跃会话）',
+              report: t('tasks.workflowTimeout'),
               at: Date.now(),
             },
           },
         }));
       }
     }, 60_000);
+  },
+
+  /* ---------- R15/R20：设置页（settings 切片） ---------- */
+
+  refreshSettings: () => {
+    if (get().settingsRefreshing) return;
+    // control settings_get → result.detail JSON {settings, homeDir, sessionsDir}
+    //（reduceM9Result 消费）；15s 兜底解锁刷新按钮
+    set({ settingsRefreshing: true, settingsNotice: undefined });
+    ensureSessionThenSend({ type: 'control', command: 'settings_get' });
+    window.setTimeout(() => {
+      if (useStore.getState().settingsRefreshing) {
+        useStore.setState({
+          settingsRefreshing: false,
+          settingsNotice: { kind: 'error', text: t('settings.getTimeout') },
+        });
+      }
+    }, 15_000);
+  },
+
+  saveSettings: (patch) => {
+    if (get().settingsSaving) return; // 单飞
+    // control settings_set{settings: patch} —— 核侧 normalize_patch 校验受管键，
+    // 非法值回 error 帧（settingsSaving 由兜底解锁并提示）；成功回执 detail
+    // 即生效值（reduceM9Result 直接覆盖 settings 切片）
+    set({ settingsSaving: true, settingsNotice: undefined });
+    hostSendCore({
+      type: 'control',
+      command: 'settings_set',
+      settings: patch as Record<string, unknown>,
+      query: JSON.stringify({ settings: patch }),
+    });
+    window.setTimeout(() => {
+      if (useStore.getState().settingsSaving) {
+        useStore.setState({
+          settingsSaving: false,
+          settingsNotice: { kind: 'error', text: t('settings.saveTimeout') },
+        });
+      }
+    }, 15_000);
+  },
+
+  clearSessionsData: () => {
+    if (get().settingsSaving) return; // 单飞
+    // control clear_sessions —— UI 侧已完成二次确认；核侧清空 sessions 目录
+    // 后重建空会话并广播 sessions_list / session_started（聊天投影随之重置）
+    set({ settingsSaving: true, settingsNotice: undefined });
+    hostSendCore({ type: 'control', command: 'clear_sessions' });
+    window.setTimeout(() => {
+      if (useStore.getState().settingsSaving) {
+        useStore.setState({
+          settingsSaving: false,
+          settingsNotice: { kind: 'error', text: t('settings.clearTimeout') },
+        });
+      }
+    }, 15_000);
+  },
+
+  /* ---------- R17/R22：一键 git 流（git 切片） ---------- */
+
+  openGitPanel: () => {
+    // 重置上次回执；workspaceRoots 惰性拉取一次（multi-root 下拉数据源，
+    // 与 boot 的 getState 同源）——首根即默认 repoRoot，预览由卡片 effect 驱动
+    set({ gitPanelOpen: true, gitResult: undefined });
+    if (get().gitRepos.length === 0) {
+      void hostRequest<GetStateResult>('getState', undefined, 5000)
+        .then((r) => {
+          const roots = (Array.isArray(r?.workspaceRoots) ? r.workspaceRoots : []).filter(
+            (x): x is string => typeof x === 'string' && x !== '',
+          );
+          set((s) => ({
+            gitRepos: roots,
+            gitRepoRoot:
+              s.gitRepoRoot !== undefined && roots.includes(s.gitRepoRoot)
+                ? s.gitRepoRoot
+                : roots[0],
+          }));
+        })
+        .catch(() => {
+          /* 宿主不可达：repoRoot 缺省，卡片显示无仓库降级文案 */
+        });
+    }
+  },
+
+  closeGitPanel: () => {
+    set({ gitPanelOpen: false, gitPreview: undefined, gitPreviewLoading: false });
+  },
+
+  setGitRepo: (repoRoot) => {
+    if (repoRoot === get().gitRepoRoot) return;
+    set({ gitRepoRoot: repoRoot, gitPreview: undefined, gitResult: undefined });
+  },
+
+  setGitScope: (scope) => {
+    if (scope === get().gitScope) return;
+    set({ gitScope: scope, gitPreview: undefined });
+  },
+
+  setGitPush: (push) => {
+    set({ gitPush: push });
+  },
+
+  requestGitPreview: () => {
+    const { gitRepoRoot, gitScope, gitPreviewLoading } = get();
+    if (!gitRepoRoot || gitPreviewLoading) return;
+    // control git_preview{repoRoot, scope} → result.detail JSON（reduceM9Result
+    // 消费 → gitPreview）；冷启动经 ensure 自愈；15s 兜底降级文案
+    set({ gitPreviewLoading: true });
+    ensureSessionThenSend({ type: 'control', command: 'git_preview', repoRoot: gitRepoRoot, scope: gitScope });
+    const repo = gitRepoRoot;
+    const scope2 = gitScope;
+    window.setTimeout(() => {
+      if (useStore.getState().gitPreviewLoading) {
+        useStore.setState({
+          gitPreviewLoading: false,
+          gitPreview: {
+            ok: false,
+            repoRoot: repo,
+            scope: scope2,
+            files: [],
+            insertions: 0,
+            deletions: 0,
+            untracked: 0,
+            subject: '',
+            body: '',
+            styleNote: '',
+            remoteKind: 'none',
+            canPr: false,
+            ghAvailable: false,
+            error: t('git.previewTimeout'),
+          },
+        });
+      }
+    }, 15_000);
+  },
+
+  sendGitCommit: (message, pushOverride) => {
+    const { gitRepoRoot, gitScope, gitPush, gitBusy } = get();
+    if (!gitRepoRoot || gitBusy) return;
+    const text = message.trim();
+    if (text === '') return;
+    // git_commit 执行帧（预览卡「确认 / 仅提交」按钮 = 用户显式确认；push
+    // 缺省按勾选、仅提交强制 false；回执 git_result 帧归约解锁 busy）；
+    // 60s 兜底（push 可能耗时）
+    set({ gitBusy: true, gitResult: undefined });
+    ensureSessionThenSend({
+      type: 'git_commit',
+      repoRoot: gitRepoRoot,
+      scope: gitScope,
+      push: pushOverride ?? gitPush,
+      message: text,
+    });
+    window.setTimeout(() => {
+      if (useStore.getState().gitBusy) {
+        useStore.setState({ gitBusy: false });
+      }
+    }, 60_000);
+  },
+
+  sendGitPr: () => {
+    const { gitRepoRoot, gitBusy } = get();
+    if (!gitRepoRoot || gitBusy) return;
+    // control git_pr{repoRoot}（gh pr create --fill——用刚提交的 message；
+    // 回 git_result 带 prUrl / error+hint）；60s 兜底
+    set({ gitBusy: true });
+    ensureSessionThenSend({ type: 'control', command: 'git_pr', repoRoot: gitRepoRoot });
+    window.setTimeout(() => {
+      if (useStore.getState().gitBusy) {
+        useStore.setState({ gitBusy: false });
+      }
+    }, 60_000);
+  },
+
+  setUiLanguage: (lang) => {
+    // 「通用」组：R20 显式选择——标 explicit 才持久 + 同步 i18n locale
+    // 即时切换界面 + 兜底车钟盘面按新语言重建
+    set({ uiLanguage: lang, uiLanguageExplicit: true });
+    setLocale(lang);
+    refreshFallbackTelegraph();
+    persistUi(get);
+  },
+
+  setFontScale: (scale) => {
+    // 「通用」组：字号缩放百分比，钳制 85–150（App 根节点 font-size 消费）
+    const clamped = Math.max(85, Math.min(150, Math.round(scale)));
+    set({ fontScale: clamped });
+    persistUi(get);
   },
 
   respondPermission: (id, decision, rule) => {
@@ -2071,7 +3121,7 @@ export const useStore = create<WebviewStore>()((set, get) => ({
       models = Array.isArray(r?.models) ? r.models : [];
     } catch (err) {
       set({ hostConnected: classifyRpcError(err) });
-      error = err instanceof RpcTimeoutError ? '宿主未连接' : err instanceof Error ? err.message : String(err);
+      error = err instanceof RpcTimeoutError ? t('api.hostUnreachable') : err instanceof Error ? err.message : String(err);
     }
     set((s) => ({
       providers: s.providers.map((p) =>

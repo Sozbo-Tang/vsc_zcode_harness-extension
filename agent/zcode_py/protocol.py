@@ -36,6 +36,9 @@ CONTROL_COMMANDS = (
     "fork",
     "pin",
     "export",
+    # M4 补完：删除会话（整目录 rmtree；sessionId 白名单校验防路径逃逸；
+    # 当前活跃会话拒绝——先切走再删；成功后广播 sessions_list）
+    "session_delete",
     "set_root",
     # M4：全文搜索（query 承载关键词；结果经 Result.detail JSON 返回）
     "search_sessions",
@@ -72,6 +75,19 @@ CONTROL_COMMANDS = (
     "tools_list",
     "tool_toggle",
     "tool_permission",
+    # R15/R20：设置页——settings.json 持久层在核侧（agent/zcode_py/
+    # settings_store.py）。settings_get 回 Result.detail JSON（settings +
+    # homeDir/sessionsDir）；settings_set 收 {key,value} 单键或 {settings}
+    # 整体合并（受管键校验见 settings_store.normalize_patch）；clear_sessions
+    # 清空 sessions 目录后重建空会话（config 目录不动）
+    "settings_get",
+    "settings_set",
+    "clear_sessions",
+    # R17/R22：一键 git 流——git_preview 预览（diff 统计 + 风格建议信息经
+    # Result.detail JSON 回 UI 编辑）；git_pr 创建 PR（gh pr create，回
+    # git_result 帧）。执行帧是独立的 git_commit（非 control）
+    "git_preview",
+    "git_pr",
 )
 PERMISSION_DECISIONS = ("allow", "deny", "always")
 TOOL_CALL_STATES = ("started", "update", "finished")
@@ -178,6 +194,18 @@ class Control:
     prefix: str | None = None  # inline_complete：光标前文
     suffix: str | None = None  # inline_complete：光标后文
     path: str | None = None  # inline_complete：文件路径（提示词语境用）
+    # R15/R20 设置页（settings_set）：整体/部分合并通道（受管键见
+    # settings_store.MANAGED_KEYS）；与单键 {key, value} 二选一，settings 优先
+    settings: dict | None = None
+    key: str | None = None  # settings_set：单键名
+    value: Any | None = None  # settings_set：单键值（None 编码时省略 → 清空请传 ""）
+    # R17/R22 git 流（git_preview / git_pr）：repoRoot 须在 init.workspaceRoots
+    # 白名单内（main.py _git_repo_within_roots）；scope 仅 git_preview 用
+    # （staged | all）；title/body 仅 git_pr 用（缺省 --fill）
+    repoRoot: str | None = None
+    scope: str | None = None
+    title: str | None = None
+    body: str | None = None
 
 
 @dataclass
@@ -187,9 +215,14 @@ class Rollback:
 
 @dataclass
 class GitCommit:
+    """R17/R22 执行帧：scope=all 时核侧先 ``git add -A``；message 缺省时
+    按仓库风格现场生成（正常路径：UI 已在 git_preview 预览里让用户编辑过）。
+    回执是 ``git_result``（commitSha/remoteUrl/commitUrl/prUrl/error）。"""
+
     repoRoot: str
     scope: str  # staged | all
     push: bool = False
+    message: str | None = None  # 完整提交信息（subject + 空行 + body）
 
 
 # ---------------------------------------------------------------------------
@@ -266,10 +299,15 @@ class TelegraphState:
 
 @dataclass
 class Perf:
+    """性能帧。R19 会话统计：model = 产生本帧的模型 id（主循环当前模型，
+    loop 侧填充）——UI 按 model 分组聚合 平均/最差/峰值；None（旧帧/无模型
+    场景）时 UI 归入「未知」桶。"""
+
     phase: str  # streaming | done
     ttftMs: float | None = None
     tokPerSec: float | None = None
     lastTurn: dict | None = None  # {"ttftMs": float, "avgTokPerSec": float}
+    model: str | None = None  # R19：按模型分组统计的分组键
 
 
 @dataclass
@@ -323,11 +361,16 @@ class PingResult:
 
 @dataclass
 class GitResult:
+    """R17/R22 回执帧：commit 主体失败（add/commit）→ ok 语义由 error 承载
+    （commitSha 为空）；push 失败时 commitSha 已有值、error 记推送原因。
+    prUrl 仅 git_pr 命令填（git_commit 不自动建 PR）。"""
+
     commitSha: str | None = None
     remoteUrl: str | None = None
     commitUrl: str | None = None
     prUrl: str | None = None
     error: str | None = None
+    hint: str | None = None  # 降级/后续动作提示（无 remote、gh 缺失…）
 
 
 @dataclass

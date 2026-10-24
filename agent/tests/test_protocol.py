@@ -41,8 +41,15 @@ def _samples() -> list:
         P.Control(command="cron_toggle", cronId="cron_ab12", enabled=True),
         P.Control(command="workflow_run", name="daily-report"),
         P.Control(command="workflows_list"),
+        # R17/R22：git 流载荷（git_preview 的 repoRoot/scope、git_pr 的
+        # title/body；GitCommit.message 用户编辑后的完整提交信息）
+        P.Control(command="git_preview", repoRoot="/w/proj", scope="staged"),
+        P.Control(command="git_preview", repoRoot="/w/proj", scope="all"),
+        P.Control(command="git_pr", repoRoot="/w/proj"),
+        P.Control(command="git_pr", repoRoot="/w/proj", title="feat: x", body="正文\n两行"),
         P.Rollback(checkpointId="ck1"),
         P.GitCommit(repoRoot="/r", scope="staged", push=False),
+        P.GitCommit(repoRoot="/r", scope="all", push=True, message="feat: x\n\n- M a.py"),
         P.SessionStarted(sessionId="s1"),
         P.ThinkingDelta(text="思考"),
         P.StreamDelta(text="正文"),
@@ -56,6 +63,9 @@ def _samples() -> list:
         P.TelegraphState(levels=[{"id": "off", "label": "关闭", "param": None, "ok": True}], current="off", paramTranslation={}),
         P.Perf(phase="streaming", ttftMs=120.5, tokPerSec=41.2),
         P.Perf(phase="done", lastTurn={"ttftMs": 120.5, "avgTokPerSec": 38.0}),
+        # R19 会话统计：perf 帧带 model 分组键（None 编码省略 / 非空保留）
+        P.Perf(phase="streaming", ttftMs=90.0, tokPerSec=55.0, model="glm-5.3"),
+        P.Perf(phase="done", lastTurn={"ttftMs": 90.0, "avgTokPerSec": 50.0}, model="gpt-5.2"),
         P.EnvInfo(hardware={"cpu": "M4"}, workspaceLangs=["python"]),
         P.Compaction(layer="L2", report={"removed": 3}),
         P.Checkpoint(id="ck1", sha="abc", atMessageId="m1"),
@@ -65,6 +75,7 @@ def _samples() -> list:
         P.PingResult(ok=True, latencyMs=412),
         P.PingResult(ok=False, errorKind="auth", message="bad key"),
         P.GitResult(commitSha="a1", remoteUrl="https://x", commitUrl="https://y", prUrl=None, error=None),
+        P.GitResult(prUrl="https://github.com/o/r/pull/7", hint="已设置 upstream 并推送"),
         P.ImageArtifact(path="/tmp/a.png"),
         # M9（R3）：后台任务帧
         P.TaskStarted(taskId="bg_1", name="train", command="python train.py"),

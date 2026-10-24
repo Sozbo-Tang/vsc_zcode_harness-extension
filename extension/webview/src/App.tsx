@@ -13,29 +13,35 @@ import { EnvView } from './views/EnvView';
 import { ToolsView } from './views/ToolsView';
 import { TasksView } from './views/TasksView';
 import { SettingsView } from './views/SettingsView';
+import { Icon, type IconName } from './components/Icon';
+import { useT } from './i18n';
 import type { ViewId } from './store/store';
 
-const NAV: Array<{ id: ViewId; label: string }> = [
-  { id: 'chat', label: '聊天' },
-  { id: 'sessions', label: '会话' },
-  { id: 'api', label: 'API' },
-  { id: 'env', label: '环境' },
-  { id: 'tools', label: '工具' },
-  { id: 'tasks', label: '任务' },
-  { id: 'settings', label: '设置' },
+/** 视图导航配置：label 键在渲染期经 t() 解析（R20 i18n，切换语言即时生效） */
+const NAV: Array<{ id: ViewId; labelKey: string; icon: IconName }> = [
+  { id: 'chat', labelKey: 'nav.chat', icon: 'chat' },
+  { id: 'sessions', labelKey: 'nav.sessions', icon: 'sessions' },
+  { id: 'api', labelKey: 'nav.api', icon: 'api' },
+  { id: 'env', labelKey: 'nav.env', icon: 'env' },
+  { id: 'tools', labelKey: 'nav.tools', icon: 'tools' },
+  { id: 'tasks', labelKey: 'nav.tasks', icon: 'tasks' },
+  { id: 'settings', labelKey: 'nav.settings', icon: 'settings' },
 ];
 
 export function App(): React.JSX.Element {
   const view = useStore((s) => s.view);
   const setView = useStore((s) => s.setView);
+  const newSession = useStore((s) => s.newSession);
   const hostConnected = useStore((s) => s.hostConnected);
+  const fontScale = useStore((s) => s.fontScale);
   const rpc = useHostRpc();
+  const t = useT();
 
   useEffect(() => {
     const store = useStore.getState();
-    const offEvents = rpc.onEvent((e) => {
+    const offEvents = rpc.onEvent((e, sessionKey) => {
       useStore.setState({ hostConnected: true });
-      useStore.getState().applyEvent(e);
+      useStore.getState().applyEvent(e, sessionKey);
     });
     const offErr = rpc.onHostError((e) => {
       useStore.setState({ hostConnected: true });
@@ -58,24 +64,41 @@ export function App(): React.JSX.Element {
     };
   }, [rpc]);
 
+  // R15/R20 设置页「通用」组：字号缩放应用到 webview 根部 font-size——相对
+  // --vscode-font-size 基准按百分比缩放（绝对 px 的控件字号不受影响，正文
+  // 文本层级整体跟随）
+  const rootStyle: React.CSSProperties =
+    fontScale === 100 ? {} : { fontSize: `calc(var(--vscode-font-size, 13px) * ${fontScale / 100})` };
+
   return (
-    <div className="root">
-      <nav className="topnav">
-        {NAV.map((n) => (
-          <button
-            key={n.id}
-            className={view === n.id ? 'navbtn active' : 'navbtn'}
-            onClick={() => setView(n.id)}
+    <div className="root" style={rootStyle}>
+      <nav className="topnav" aria-label={t('app.viewsAria')}>
+        <div className="navviews">
+          {NAV.map((n) => (
+            <button
+              key={n.id}
+              className={view === n.id ? 'navbtn active' : 'navbtn'}
+              onClick={() => setView(n.id)}
+              title={t(n.labelKey)}
+              aria-label={t(n.labelKey)}
+              aria-current={view === n.id ? 'page' : undefined}
+            >
+              <Icon name={n.icon} />
+              <span className="nav-label">{t(n.labelKey)}</span>
+            </button>
+          ))}
+        </div>
+        <div className="navactions">
+          <span
+            className={`conn${hostConnected ? ' on' : ''}`}
+            title={hostConnected ? t('app.connected') : t('app.disconnected')}
           >
-            {n.label}
+            {hostConnected ? '●' : '○'}
+          </span>
+          <button className="navbtn nav-new" onClick={newSession} title={t('app.newSession')} aria-label={t('app.newSession')}>
+            <Icon name="plus" />
           </button>
-        ))}
-        <span
-          className={`conn${hostConnected ? ' on' : ''}`}
-          title={hostConnected ? '已连接扩展宿主' : '未连接扩展宿主（M1 宿主接线后自动恢复）'}
-        >
-          {hostConnected ? '●' : '○'}
-        </span>
+        </div>
       </nav>
       <div className="viewhost">
         {view === 'chat' && <ChatView />}

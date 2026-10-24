@@ -25,27 +25,37 @@
   30s 调度线程；prompt 动作经 _intake_lock 串行化的同一用户消息路径注入，
   task 动作走后台任务）+ 工作流（~/.zcode-py/workflows/*.py 声明式 STEPS，
   顺序受限子代理执行，报告经 result 帧）
-- git_commit 属后续里程碑，回 unsupported
+- R15/R20：设置页——settings_get/settings_set（~/.zcode-py/config/
+  settings.json 持久层，maxTurns/systemPromptAppend/压缩阈值+专用模型/
+  视觉中继档位+自定义提示词/隐私文件模式，改后热应用）+ clear_sessions
+  （清空 sessions 目录保 config，UI 二次确认）
+- R17/R22：一键 git 流——control git_preview（diff 统计 + git log 风格
+  学习的建议信息，经 Result.detail JSON 回 UI 编辑）→ git_commit 帧执行
+  add/commit/可选 push（凭据走系统 credential-helper，插件不经手 token）
+  → git_result（sha/commit 网址）；control git_pr 用 gh 建 PR（输出抽
+  URL）。repoRoot 必须命中 workspaceRoots 白名单（_git_repo_within_roots）
 
 会话转录（transcript.jsonl + meta.json）由 sessions/ 落盘；resume 重放历史
 out 帧（不重复入账）。入站 user_message 落转录时附 messageId（fork 分叉点与
 checkpoint.atMessageId 对齐）。MEMORY.md 跨会话记忆（R24）在会话启动时注入
 system prompt 尾部，``memory`` 工具读写它（read 免批 / 写与 write 同档）。
 API Key 只从环境变量读（config.api_key_for），且不随 bash 子进程环境泄漏
-（tools/bash.sanitize_child_env）。
+（tools/bash.sanitize_child_env），也不随 gitflow 的 git/gh 子进程下发
+（gitflow._child_env——commit/push 触发的仓库 hook 读不到）。
 """
 
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Callable, TextIO
+from typing import Any, Callable, TextIO
 
-from . import telegraph, vision_relay
+from . import gitflow, privacy, telegraph, vision_relay
 from .background import DEFAULT_TASK_TIMEOUT_S, BackgroundTaskManager
 from .checkpoints import CheckpointManager
 from .compaction import SEARCH_HISTORY_SPEC, CompactionManager
@@ -79,6 +89,7 @@ from .protocol import (
     EnvInfo,
     Error,
     GitCommit,
+    GitResult,
     Init,
     MessageContext,
     PermissionRequest,
@@ -98,6 +109,15 @@ from .protocol import (
     encode_message,
 )
 from .sessions import SessionError, SessionStore
+from .settings_store import (
+    DEFAULT_MAX_TURNS,
+    apply_patch,
+    load_settings,
+    merge_settings,
+    normalize_patch,
+    save_settings,
+    settings_path,
+)
 from .skills import SkillsManager, expand_slash, skills_injection
 from .subagents import RUN_CHILD_SPEC, ChildRuntime
 from .tools import ToolSession, default_registry
@@ -225,11 +245,13 @@ class ZcodeService:
         provider_factory: Callable[[dict, str | None], Provider] = default_provider_factory,
         config_file: Path | None = None,
         store: SessionStore | None = None,
+        settings_file: Path | None = None,
     ):
         self._emitter = emitter
         self._factory = provider_factory
         self._config_file = config_file
         self._store = store or SessionStore()
+        self._settings_file = settings_file or settings_path()
         self._config: dict | None = None
         self._provider: Provider | None = None
         self._provider_entry: dict | None = None
@@ -241,7 +263,12 @@ class ZcodeService:
         self._cancel = threading.Event()
         self._turn_thread: threading.Thread | None = None
         self._api_key_env: dict[str, str] = {}
+        # R15/R20 设置页：_settings 是运行时生效值（settings.json ⊕ init.settings
+        # 宿主覆盖）；_persisted_settings 是 settings.json 的内存镜像（只含
+        # 用户显式设置过的受管键，settings_set 只回写它）
         self._settings: dict = {}
+        self._persisted_settings: dict = {}
+        self._init_settings: dict = {}
         self._workspace_roots: list = []
         self._usage_by_model: dict[str, dict[str, int]] = {}
         # M2：工具/权限/检查点；M4：memory 工具（R24）挂进注册表；
@@ -329,7 +356,7 @@ class ZcodeService:
         elif isinstance(msg, Rollback):
             self._on_rollback(msg)
         elif isinstance(msg, GitCommit):
-            self._emit(Error(kind="unsupported", message="git flow lands in a later milestone"))
+            self._on_git_commit(msg)
         else:  # pragma: no cover —— 注册表里核→壳类型不该出现在入站方向
             self._emit(Error(kind="protocol", message=f"unexpected inbound frame: {type(msg).__name__}"))
 
@@ -356,7 +383,18 @@ class ZcodeService:
 
     def _on_init(self, msg: Init) -> None:
         self._workspace_roots = list(msg.workspaceRoots or [])
-        self._settings = dict(msg.settings or {})
+        # R15/R20 设置页：settings.json（核侧真源）⊕ init.settings（宿主注入
+        # 的 VS Code 侧配置，键级覆盖——宿主只注入 permissionMode/compaction
+        # 等运行时键，与设置页受管键基本不相交）。持久镜像单独保存，
+        # settings_set 只回写受管键（见 _control_settings_set）。
+        self._init_settings = dict(msg.settings or {})
+        try:
+            self._persisted_settings = load_settings(self._settings_file)
+        except OSError as exc:
+            self._persisted_settings = {}
+            self._emit(Error(kind="config", message=f"cannot read settings.json: {exc}"))
+        self._settings = merge_settings(self._persisted_settings, self._init_settings)
+        self._apply_settings_live()
         # apiKeyEnv 原位更新：compaction manager 等持有同一 dict 的组件不落旧值
         self._api_key_env.clear()
         self._api_key_env.update(msg.apiKeyEnv or {})
@@ -369,16 +407,8 @@ class ZcodeService:
         # 可随切；非法值回 build）
         mode = str(self._settings.get("permissionMode") or "build")
         self._permission_mode = mode if mode in PERMISSION_MODES else "build"
-        # M8（R14）：压缩阈值（settings.compaction.evictThreshold / summarizeThreshold）
-        compaction_cfg = self._settings.get("compaction")
-        if isinstance(compaction_cfg, dict):
-            for key, attr in (
-                ("evictThreshold", "evict_threshold"),
-                ("summarizeThreshold", "summarize_threshold"),
-            ):
-                value = compaction_cfg.get(key)
-                if isinstance(value, (int, float)) and 0 < value <= 1:
-                    setattr(self._compaction, attr, float(value))
+        # M8（R14）压缩阈值 + R15/R20 隐私模式：init 已在 _apply_settings_live
+        # 统一热应用（compaction 阈值 / privacy 文件模式 / loop 参数）
         try:
             self._permission_timeout_s = max(
                 1.0, float(self._settings.get("permissionTimeoutSec") or DEFAULT_PERMISSION_TIMEOUT_S)
@@ -486,6 +516,9 @@ class ZcodeService:
             model_id=(self._model_entry or {}).get("id"),
             root_path=str(self._workspace_cwd) if self._workspace_roots else None,
         )
+        # R19 会话统计：usage.byModel 是「本会话」累计——新会话清零（进程内
+        # 上一会话的计数不带到新会话；resume 的接续播种在 _control_resume）
+        self._usage_by_model = {}
         self._emitter.bind_session(meta["sessionId"])
         self._cancel.clear()
         self._rebuild_loop()
@@ -568,6 +601,11 @@ class ZcodeService:
         每轮从 loop.system_prompt 现取）。
         """
         prompt = str(self._settings.get("systemPrompt") or DEFAULT_SYSTEM_PROMPT)
+        # R15/R20 设置页「Agent」组：追加文本接在基础提示词之后、环境事实/
+        # skills/记忆之前（用户补充的行为约束优先于机器注入段落）
+        append = str(self._settings.get("systemPromptAppend") or "").strip()
+        if append:
+            prompt += "\n\n" + append
         if self._env_facts:
             prompt += "\n\n" + self._env_facts
         # M7（R26）：已加载 skills 列表注入（loaded_skills 不触发同步扫描——
@@ -588,6 +626,183 @@ class ZcodeService:
         if isinstance(browser_cfg, dict) and isinstance(browser_cfg.get("headless"), bool):
             return browser_cfg["headless"]
         return True
+
+    # ------------------------------------------------------------------ R15/R20：设置页
+
+    def _effective_max_turns(self) -> int:
+        """maxTurns 生效值（int 钳制 1..200；非法/缺省回 8）。"""
+        from .settings_store import MAX_TURNS_LIMIT
+
+        raw = self._settings.get("maxTurns")
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return DEFAULT_MAX_TURNS
+        return max(1, min(raw, MAX_TURNS_LIMIT))
+
+    def _apply_settings_live(self) -> None:
+        """设置热应用（init 与 settings_set 共用）：
+
+        - ``maxTurns`` → ``loop.max_turns``（下一回合生效——range() 在回合
+          开始时求值）；
+        - ``systemPromptAppend`` → ``loop.system_prompt`` 重建（本轮后续
+          模型调用即生效——LLMRequest.system 每轮现取）；
+        - 压缩阈值 → CompactionManager 属性；
+        - ``privacyFilePatterns`` → privacy 模块活动模式；
+        - ``visionRelayPreset`` / ``visionRelayCustomPrompt`` / ``compactionModel``
+          经 settings_supplier 现读（vision_relay / compaction 消费点），
+          无需在此接线；
+        - ``telegraphClickSound`` 纯 webview 消费（车钟咔哒音频开关），核侧
+          只存取与回显，无核心消费点。
+        """
+        loop = self._loop
+        if loop is not None:
+            loop.max_turns = self._effective_max_turns()
+            loop.system_prompt = self._system_prompt_with_env()
+        self._apply_compaction_thresholds()
+        self._apply_privacy_patterns()
+
+    def _apply_compaction_thresholds(self) -> None:
+        """settings.compaction.{evict,summarize}Threshold → manager 属性。"""
+        compaction_cfg = self._settings.get("compaction")
+        if isinstance(compaction_cfg, dict):
+            for key, attr in (
+                ("evictThreshold", "evict_threshold"),
+                ("summarizeThreshold", "summarize_threshold"),
+            ):
+                value = compaction_cfg.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= 1:
+                    setattr(self._compaction, attr, float(value))
+
+    def _apply_privacy_patterns(self) -> None:
+        """privacyFilePatterns 存在（含空表 = 用户显式清空）→ 整体替换；
+        缺省/类型非法 → 内置缺省清单。"""
+        patterns = self._settings.get("privacyFilePatterns")
+        if isinstance(patterns, list):
+            privacy.set_active_file_patterns([p for p in patterns if str(p).strip()])
+        else:
+            privacy.reset_active_file_patterns()
+
+    def _settings_view(self) -> dict:
+        """settings_get 载荷：受管键的**生效值**（缺省填充，UI 表单直读）。"""
+        preset = str(
+            self._settings.get("visionRelayPreset")
+            or (self._provider_entry or {}).get("visionRelayPreset")
+            or vision_relay.DEFAULT_PRESET
+        )
+        if preset not in vision_relay.PRESET_IDS:
+            preset = vision_relay.DEFAULT_PRESET
+        sound = self._settings.get("telegraphClickSound")
+        return {
+            "systemPromptAppend": str(self._settings.get("systemPromptAppend") or ""),
+            "maxTurns": self._effective_max_turns(),
+            "compaction": {
+                "summarizeThreshold": self._compaction.summarize_threshold,
+                "compactionModel": str(self._settings.get("compactionModel") or ""),
+            },
+            "visionRelayPreset": preset,
+            "visionRelayCustomPrompt": str(
+                self._settings.get("visionRelayCustomPrompt") or ""
+            ),
+            "privacyFilePatterns": list(privacy.active_file_patterns()),
+            # R6 收尾：车钟咔哒开关默认开（缺省不落盘 = 开）；只认 bool，
+            # 手改文件等脏值回落 True
+            "telegraphClickSound": sound if isinstance(sound, bool) else True,
+        }
+
+    def _control_settings_get(self, msg: Control) -> None:
+        """设置页数据源：Result.detail JSON = {settings, homeDir, sessionsDir}。"""
+        payload = {
+            "settings": self._settings_view(),
+            "homeDir": str(home_dir()),
+            "sessionsDir": str(self._store.base_dir),
+        }
+        self._emit(
+            Result(ok=True, command="settings_get", detail=json.dumps(payload, ensure_ascii=False))
+        )
+
+    def _control_settings_set(self, msg: Control) -> None:
+        """settings_set：单键 {key, value} 或整体 {settings}（受管键合并）。
+
+        校验失败回 protocol error（不落盘不应用）；成功 = 回写 settings.json
+        + 内存合并 + 热应用，Result.detail 回写后的生效值（UI 免二次拉取）。
+        回合进行中不拒绝——热应用只改后续轮次参数，不打断在途流。
+        """
+        patch: Any = msg.settings if isinstance(msg.settings, dict) else None
+        if patch is None and msg.key is not None:
+            patch = {msg.key: msg.value}
+        if not patch:
+            self._emit(
+                Error(
+                    kind="protocol",
+                    message="settings_set requires {settings:{...}} or {key, value}",
+                )
+            )
+            return
+        cleaned, error = normalize_patch(patch)
+        if error:
+            self._emit(Error(kind="protocol", message=f"settings_set: {error}"))
+            return
+        if not cleaned:
+            # 只带未知键：前向兼容按成功 no-op 处理（回当前生效值）
+            self._emit(
+                Result(
+                    ok=True,
+                    command="settings_set",
+                    detail=json.dumps(self._settings_view(), ensure_ascii=False),
+                )
+            )
+            return
+        # settings_store.apply_patch：受管补丁并入持久层（区别于运行时合并）
+        self._persisted_settings = apply_patch(self._persisted_settings, cleaned)
+        try:
+            save_settings(self._persisted_settings, self._settings_file)
+        except OSError as exc:
+            self._emit(Error(kind="config", message=f"cannot write settings.json: {exc}"))
+            return
+        self._settings = merge_settings(self._persisted_settings, self._init_settings)
+        self._apply_settings_live()
+        self._emit(
+            Result(
+                ok=True,
+                command="settings_set",
+                detail=json.dumps(self._settings_view(), ensure_ascii=False),
+            )
+        )
+
+    def _control_clear_sessions(self, msg: Control) -> None:
+        """清空会话数据（设置页「数据」组，UI 已做二次确认）。
+
+        语义：sessions 目录下全部会话目录删除（config/settings/cron 等不
+        动），随后重建空会话（当前会话转录一并删除，继续用旧绑定会写入悬
+        空目录）；回合/工作流进行中拒绝。shutil.rmtree 是纯库调用，无子
+        进程、无 shell（PLAN §9）。
+        """
+        with self._intake_lock:
+            if self._turn_alive() or self._workflow_alive():
+                self._emit(
+                    Error(kind="busy", message="cannot clear sessions while a turn or workflow is running")
+                )
+                return
+            base = self._store.base_dir
+            removed = 0
+            if base.is_dir():
+                for child in base.iterdir():
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                        removed += 1
+                    else:
+                        try:
+                            child.unlink()
+                        except OSError:
+                            pass
+            self._ensure_config()
+            self._start_session()
+        self._emit(
+            Result(
+                ok=True,
+                command="clear_sessions",
+                detail=f"cleared {removed} session(s); config kept",
+            )
+        )
 
     def _rebuild_loop(self) -> None:
         perf = PerfTracker()
@@ -648,7 +863,7 @@ class ZcodeService:
             emit=self._emit,
             perf=perf,
             system_prompt=system_prompt,
-            max_turns=int(self._settings.get("maxTurns") or 8),
+            max_turns=self._effective_max_turns(),
             max_output_tokens=(self._model_entry or {}).get("maxOutput"),
             thinking_resolver=lambda: telegraph.translate(self._profile, self._level),
             tool_session=session,
@@ -831,6 +1046,7 @@ class ZcodeService:
             "fork": self._control_fork,
             "pin": self._control_pin,
             "export": self._control_export,
+            "session_delete": self._control_session_delete,
             "set_root": self._control_set_root,
             "search_sessions": self._control_search_sessions,
             "env_refresh": self._control_env_refresh,
@@ -855,6 +1071,14 @@ class ZcodeService:
             "tools_list": self._control_tools_list,
             "tool_toggle": self._control_tool_toggle,
             "tool_permission": self._control_tool_permission,
+            # R15/R20：设置页（settings.json 持久层 + 热应用；clear_sessions
+            # 清会话数据保 config）
+            "settings_get": self._control_settings_get,
+            "settings_set": self._control_settings_set,
+            "clear_sessions": self._control_clear_sessions,
+            # R17/R22：一键 git 流（预览 / 创建 PR；执行帧 git_commit 独立）
+            "git_preview": self._control_git_preview,
+            "git_pr": self._control_git_pr,
         }.get(msg.command)
         if handler is None:
             self._emit(Error(kind="protocol", message=f"unknown control command: {msg.command!r}"))
@@ -900,6 +1124,10 @@ class ZcodeService:
                 )
                 return
             self._apply_model(entry, model, keep_level=self._level)
+            # R19 会话统计：usage.byModel 按「本会话」累计——恢复会话时从转录
+            # 里最后一次 usage 帧播种（进程内存里的计数属于换入前的会话），
+            # 后续回合的 usage 帧才能接续该会话的历史总量
+            self._usage_by_model = self._usage_seed_from_frames(frames)
             # R11：恢复会话回到它记录的根（meta.rootPath 须仍在当前 workspaceRoots
             # 内——工作区已移除的根不能复活）；检查点管理器随根重建（sha 绑定仓库）
             self._restore_session_root(meta)
@@ -1215,6 +1443,32 @@ class ZcodeService:
             return
         self._emit(Result(ok=True, command="pin", detail="pinned" if target else "unpinned"))
 
+    def _control_session_delete(self, msg: Control) -> None:
+        """M4 补完：删除会话（SessionStore.delete 整目录，不可恢复）。
+
+        当前活跃会话拒绝——转录句柄、会话投影与后续 append 都指向它，
+        强删会留下悬空写；先切到别的会话（或新建）再删。可预期的拒绝
+        （活跃会话 / 不存在）走 Result(ok=False) 而非 Error 帧——webview 侧
+        经 pendingControl 对账立即解锁按钮并显示提示（Error 帧要等 15s
+        兜底超时）。成功回执后广播 sessions_list（record=False）收敛列表。
+        """
+        session_id = msg.sessionId
+        if not session_id:
+            self._emit(Error(kind="protocol", message="session_delete requires sessionId"))
+            return
+        if session_id == self._emitter.session_id:
+            self._emit(
+                Result(ok=False, command="session_delete", detail="不能删除当前活跃会话，请先切换到其他会话")
+            )
+            return
+        try:
+            self._store.delete(session_id)
+        except SessionError as exc:
+            self._emit(Result(ok=False, command="session_delete", detail=str(exc)))
+            return
+        self._emit(Result(ok=True, command="session_delete", detail=session_id))
+        self._emitter.emit(SessionsList(sessions=self._session_summaries()), record=False)
+
     def _control_export(self, msg: Control) -> None:
         """R12：transcript → Markdown，经 result.markdown 返回全文；
         保存落盘由 UI 决定（核侧不替用户选路径）。"""
@@ -1291,11 +1545,15 @@ class ZcodeService:
         )
 
     def _control_env_refresh(self, msg: Control) -> None:
-        """M5 环境面板「刷新」：重新探测并广播 env_info（探测线程内完成广播）。"""
+        """M5 环境面板「刷新」：重新探测并广播 env_info（探测线程内完成广播）。
+
+        分离语义（用户要求「环境探测不影响其他任何功能」）：探测已在跑时
+        不发 error 帧——error 会进 webview 聊天流打断无关交互（曾致车钟
+        拖拽中途收到帧而卡死）。已在探测 = 本次刷新为幂等 no-op，env_info
+        到达即完成，回成功 Result 即可。
+        """
         if not self._spawn_env_probe():
-            self._emit(
-                Error(kind="busy", message="环境探测正在进行中，请稍候（env_info 到达即完成）")
-            )
+            self._emit(Result(ok=True, command="env_refresh", detail="already-probing"))
             return
         self._emit(Result(ok=True, command="env_refresh", detail="probing"))
 
@@ -1527,8 +1785,10 @@ class ZcodeService:
         )
 
     def _control_task_stop(self, msg: Control) -> None:
-        """停止标记（不强杀）：cancelRequested 置位，run_command 返回后置
-        cancelled；SIGKILL 级强杀待 bash_backend 可取消接口。"""
+        """真停（M9 补完）：置 cancelRequested + 对登记进程按组发
+        SIGTERM→2s→SIGKILL（bash_cancel 信号序列，装配缝 spawn_command 缺位
+        时如实降级 mark-only，回执区分两种语义）；工作线程收割后置
+        cancelled 并广播 task_finished。"""
         task_id = msg.taskId
         if not task_id:
             self._emit(Error(kind="protocol", message="task_stop requires taskId"))
@@ -1913,6 +2173,120 @@ class ZcodeService:
                 return event.get("sha")
         return None
 
+    @staticmethod
+    def _usage_seed_from_frames(frames: list) -> dict[str, dict[str, int]]:
+        """R19：转录里最后一次 usage 帧的 byModel（倒序找，找不到回空 dict）。
+
+        resume 播种用——usage 帧是每回合末的全量快照（main._run_turn），
+        取最后一帧即该会话截至上次活跃的按模型累计。"""
+        for envelope in reversed(frames):
+            event = envelope.get("event") or {}
+            if envelope.get("dir") == "out" and event.get("type") == "usage":
+                by_model = event.get("byModel")
+                if isinstance(by_model, dict):
+                    return json.loads(json.dumps(by_model))  # 深拷贝防转录别名
+        return {}
+
+    # ------------------------------------------------------------------ R17/R22 git 流
+
+    def _git_repo_within_roots(self, repo_root: str | None) -> str | None:
+        """repoRoot 白名单：resolve 后必须等于或位于 init.workspaceRoots 某
+        根之内（工作区外的仓库不接受——git 子进程的 cwd 越界等于任意目录
+        执行；与 set_root 同一信任边界，multi-root 嵌套仓库也放行）。"""
+        if not repo_root:
+            return None
+        try:
+            target = Path(repo_root).expanduser().resolve()
+        except (OSError, RuntimeError):  # resolve 对坏 symlink 抛 OSError
+            return None
+        for raw in self._workspace_roots or []:
+            try:
+                root = Path(raw).expanduser().resolve()
+            except (OSError, RuntimeError):
+                continue
+            if target == root or root in target.parents:
+                return str(target)
+        return None
+
+    def _control_git_preview(self, msg: Control) -> None:
+        """git_preview：diff 统计 + 风格学习的建议提交信息（Result.detail
+        JSON 回 UI 编辑）。git 层失败（非仓库/scope 非法）同样走 Result
+        ok=False——错误只进预览卡的降级文案，不进聊天流。"""
+        repo = self._git_repo_within_roots(msg.repoRoot)
+        if repo is None:
+            self._emit(
+                Error(
+                    kind="protocol",
+                    message="git_preview: repoRoot 不在 init.workspaceRoots 白名单内",
+                )
+            )
+            return
+        payload = gitflow.GitFlow(repo, api_key_env=self._api_key_env).preview(
+            msg.scope or "staged"
+        )
+        self._emit(
+            Result(
+                ok=payload.ok,
+                command="git_preview",
+                detail=json.dumps(payload.to_dict(), ensure_ascii=False),
+            )
+        )
+
+    def _control_git_pr(self, msg: Control) -> None:
+        """git_pr：gh pr create（--fill 或 --title/--body）→ git_result 帧
+        （prUrl 或 error/hint）。gh 不在 PATH / 非 GitHub remote 优雅降级。"""
+        repo = self._git_repo_within_roots(msg.repoRoot)
+        if repo is None:
+            self._emit(
+                Error(
+                    kind="protocol",
+                    message="git_pr: repoRoot 不在 init.workspaceRoots 白名单内",
+                )
+            )
+            return
+        outcome = gitflow.GitFlow(
+            repo, api_key_env=self._api_key_env
+        ).create_pr(msg.title, msg.body)
+        self._emit(self._git_result_from(outcome))
+
+    def _on_git_commit(self, msg: GitCommit) -> None:
+        """git_commit 执行帧：add（仅 all）→ commit →（可选）push → git_result。
+
+        与 rollback 同一确认语义：帧本身即用户在预览卡上的显式确认动作。
+        回合/工作流进行中拒绝（工具可能正在写文件，提交会拍下中间态）。
+        """
+        if self._turn_alive() or self._workflow_alive():
+            self._emit(
+                Error(kind="busy", message="cannot commit while a turn or workflow is running")
+            )
+            return
+        repo = self._git_repo_within_roots(msg.repoRoot)
+        if repo is None:
+            # 白名单拒绝走 git_result（错误属于 git 卡片语境，不进聊天流）
+            self._emit(
+                GitResult(
+                    error="repoRoot 不在 init.workspaceRoots 白名单内",
+                    hint="仅可提交工作区根（或其子目录）内的仓库",
+                )
+            )
+            return
+        outcome = gitflow.GitFlow(repo, api_key_env=self._api_key_env).commit_and_push(
+            msg.scope, msg.push, msg.message
+        )
+        self._emit(self._git_result_from(outcome))
+
+    @staticmethod
+    def _git_result_from(outcome: gitflow.CommitOutcome) -> GitResult:
+        """gitflow 结果 → 协议帧（字段一一映射；hint 供 UI 降级提示）。"""
+        return GitResult(
+            commitSha=outcome.commit_sha,
+            remoteUrl=outcome.remote_url,
+            commitUrl=outcome.commit_url,
+            prUrl=outcome.pr_url,
+            error=outcome.error,
+            hint=outcome.hint,
+        )
+
     # ------------------------------------------------------------------ emit
 
     def _emit(self, msg: CoreToShellMessage) -> None:
@@ -1954,6 +2328,7 @@ def main(
     provider_factory: Callable[[dict, str | None], Provider] | None = None,
     config_file: Path | None = None,
     sessions_dir: Path | None = None,
+    settings_file: Path | None = None,
 ) -> int:
     """stdio 服务主循环：逐行读入、逐帧分发；EOF 即退出。"""
     stream_in = stream_in if stream_in is not None else sys.stdin
@@ -1965,6 +2340,7 @@ def main(
         provider_factory=provider_factory or default_provider_factory,
         config_file=config_file,
         store=store,
+        settings_file=settings_file,
     )
     for raw in stream_in:
         line = raw.strip()

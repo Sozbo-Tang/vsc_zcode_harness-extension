@@ -142,7 +142,22 @@ export type ControlCommand =
   // permission 即时生效并持久化在核心侧 tools.json）
   | "tools_list"
   | "tool_toggle"
-  | "tool_permission";
+  | "tool_permission"
+  // R15/R20：设置页（Python settings_store.py 并行定稿）——settings_get
+  // 回 result.detail JSON {settings, homeDir, sessionsDir}；settings_set 收
+  // {settings:{...}} 整体合并或 {key, value} 单键（受管键校验在核侧）；
+  // clear_sessions 清空 sessions 目录后重建空会话（config 不动）
+  | "settings_get"
+  | "settings_set"
+  | "clear_sessions"
+  // R17/R22：一键 git 流——git_preview 预览（diff 统计 + 风格建议信息经
+  // result.detail JSON 回 UI 编辑）；git_pr 创建 PR（gh pr create，回
+  // git_result 帧）。执行帧是独立的 git_commit（非 control）
+  | "git_preview"
+  | "git_pr"
+  // M4 补完：删除会话（sessionId；核侧拒绝当前活跃会话并做 id 白名单
+  // 校验，成功回执后广播 sessions_list）
+  | "session_delete";
 export interface ControlMessage {
   type: "control";
   command: ControlCommand;
@@ -191,6 +206,25 @@ export interface ControlMessage {
   prompt?: string;
   /** M9 提案字段，command = "cron_toggle"：目标启停态 */
   enabled?: boolean;
+  /**
+   * R15/R20 提案字段，command = "settings_set"：整体/部分合并载荷（受管键
+   * 见 Python settings_store.MANAGED_KEYS；与单键 {key, value} 二选一，
+   * settings 优先）
+   */
+  settings?: Record<string, unknown>;
+  /** command = "settings_set"：单键名（key + value 成对） */
+  key?: string;
+  /** command = "settings_set"：单键值（undefined 编码时省略 → 清空请传 ""） */
+  value?: unknown;
+  /**
+   * R17/R22 git 流字段：repoRoot 须在 init.workspaceRoots 白名单内
+   * （核心 _git_repo_within_roots 校验）；scope 仅 git_preview（staged |
+   * all，缺省 staged）；title/body 仅 git_pr（缺省 --fill 用提交信息）
+   */
+  repoRoot?: string;
+  scope?: GitCommitScope;
+  title?: string;
+  body?: string;
 }
 
 /** rollback{checkpointId} */
@@ -199,13 +233,15 @@ export interface RollbackMessage {
   checkpointId: string;
 }
 
-/** git_commit{repoRoot, scope: staged|all, push: bool} */
+/** git_commit{repoRoot, scope: staged|all, push: bool, message?}（R17/R22；
+ * message = 预览卡上用户编辑过的完整提交信息，缺省时核心按仓库风格生成） */
 export type GitCommitScope = "staged" | "all";
 export interface GitCommitMessage {
   type: "git_commit";
   repoRoot: string;
   scope: GitCommitScope;
   push: boolean;
+  message?: string;
 }
 
 export type HostToCoreMessage =
@@ -309,17 +345,24 @@ export interface TelegraphStateMessage {
 }
 
 export interface PerfLastTurn {
-  ttftMs: number;
-  avgTokPerSec: number;
+  /** 无 token 回合（取消/空回合）为 null（perf.turn_end） */
+  ttftMs?: number | null;
+  avgTokPerSec?: number | null;
 }
 
-/** perf{phase: streaming|done, ttftMs?, tokPerSec?, lastTurn{...}} */
+/** perf{phase: streaming|done, ttftMs?, tokPerSec?, lastTurn{...}, model?} */
 export interface PerfMessage {
   type: "perf";
   phase: "streaming" | "done";
   ttftMs?: number;
   tokPerSec?: number;
   lastTurn?: PerfLastTurn;
+  /**
+   * R19 会话统计分组键：产生本帧的模型 id（Python protocol.Perf.model；
+   * loop 侧填充，与 usage.byModel 键同源）。旧帧/无模型场景缺省——UI
+   * 归入「未知」桶。
+   */
+  model?: string;
 }
 
 /**
@@ -405,11 +448,17 @@ export interface SessionsListMessage {
 }
 
 /** usage{tokens, byModel} */
+export interface UsageModelBucket {
+  /** 该模型累计输入 token（main._accumulate_usage） */
+  input: number;
+  /** 该模型累计输出 token */
+  output: number;
+}
 export interface UsageMessage {
   type: "usage";
   tokens: number;
-  /** 模型名 → token 数 */
-  byModel: Record<string, number>;
+  /** 模型名 → {input, output} 累计桶（R19 会话统计；旧镜像误标 number 已修正） */
+  byModel: Record<string, UsageModelBucket>;
 }
 
 /** ping_result{ok, latencyMs?, errorKind?, message?} —— 错误分类与 Python 侧 ping 一致 */
@@ -423,7 +472,10 @@ export interface PingResultMessage {
   message?: string;
 }
 
-/** git_result{commitSha?, remoteUrl?, commitUrl?, prUrl?, error?} */
+/**
+ * git_result{commitSha?, remoteUrl?, commitUrl?, prUrl?, error?, hint?}（R17/R22）。
+ * push 失败时 commitSha 已有值、error 记推送原因；prUrl 仅 git_pr 命令填。
+ */
 export interface GitResultMessage {
   type: "git_result";
   commitSha?: string;
@@ -431,6 +483,8 @@ export interface GitResultMessage {
   commitUrl?: string;
   prUrl?: string;
   error?: string;
+  /** 降级/后续动作提示（无 remote、gh 缺失…；Python 侧扩展字段） */
+  hint?: string;
 }
 
 /** image_artifact{path} */
@@ -663,9 +717,9 @@ export interface WebviewRpcRequest {
  * 消息约定（两端镜像：webview/src/protocol.ts EditorRpcMethod）：
  *  - "editor.openDiff"        DiffReviewCard「打开对比页」→ 宿主已注册
  *    （extension.ts → editorBridge.openDiffReview），vscode.diff 打开审阅页
- *  - "editor.followToolCall"  ToolCallCard 点击编辑跟随（R10，M3 编辑器桥
- *    TODO）：宿主暂未注册 → webview 收 unknown_method 应答并静默忽略（占位），
- *    M3 在 extension.ts registerRpcHandler 落地同名方法即可生效
+ *  - "editor.followToolCall"  ToolCallCard 点击编辑跟随（R10，M3 编辑器桥）：
+ *    宿主已注册（extension.ts → editorBridge.followToolCall，M3 落地；
+ *    此前占位期"宿主未注册则 webview 静默忽略"的行为已由真实实现取代）
  */
 export const RPC_EDITOR_OPEN_DIFF = "editor.openDiff";
 export interface EditorOpenDiffParams {
@@ -757,8 +811,56 @@ export interface WorkspaceImageUriParams {
   path: string;
 }
 export interface WorkspaceImageUriResult {
-  /** vscode.Webview.asWebviewUri(...).toString()（可直接作 <img src>） */
+  /** vscode.Webview.asWebviewUri(...).toString()（可直接作 <img src> 的 URI） */
   uri: string;
+}
+
+/* ──────────── R15/R20 设置页宿主 RPC（配置读写 / 打开目录） ──────────── */
+
+export const RPC_CONFIG_GET = "config.get";
+/**
+ * 读 VS Code 原生配置（设置页「内联补全」开关等）。key 为完整配置键
+ * （如 "zcode-py.inlineCompletion.enabled"），返回 {value}——读取无副作用，
+ * 不做键白名单；写侧（config.update）才有。
+ */
+export interface ConfigGetParams {
+  /** 完整配置键（section.prop 形态，宿主按第一个 . 切分 getConfiguration） */
+  key: string;
+}
+export interface ConfigGetResult {
+  /** 配置当前值（含默认值）；键不存在时 undefined */
+  value?: unknown;
+}
+
+export const RPC_CONFIG_UPDATE = "config.update";
+/**
+ * 写 VS Code 原生配置（Global 目标，即时生效——inlineCompletion 等宿主侧
+ * 消费方监听 onDidChangeConfiguration）。安全约束：**只允许 zcode-py. 前缀**
+ * 的键——webview 不得借宿主之手改写任意 VS Code / 其他扩展配置。
+ */
+export interface ConfigUpdateParams {
+  /** 完整配置键（必须以 "zcode-py." 开头） */
+  key: string;
+  /** 目标值（JSON 可表达的任意类型；undefined = 不动作） */
+  value?: unknown;
+}
+export interface ConfigUpdateResult {
+  /** 写入后的值（回显） */
+  value?: unknown;
+}
+
+export const RPC_WORKSPACE_REVEAL_PATH = "workspace.revealPath";
+/**
+ * 在操作系统文件管理器中显示路径（设置页「数据」组：打开 ~/.zcode-py
+ * 会话目录）。实现 revealFileInOS；**路径白名单**：仅 ~/.zcode_py /
+ * ~/.zcode-py（含目录本身）——webview 不应获得打开宿主任意路径的能力。
+ */
+export interface WorkspaceRevealPathParams {
+  /** 要显示的目录/文件绝对路径（须位于 ~/.zcode_py 系之下） */
+  path: string;
+}
+export interface WorkspaceRevealPathResult {
+  revealed: boolean;
 }
 
 export const RPC_SESSION_ACTIVATE = "session.activate";
@@ -766,12 +868,33 @@ export const RPC_SESSION_ACTIVATE = "session.activate";
  * 活跃会话切换（R16 并行多开）：更新宿主 activeSessionKey（此后不带
  * sessionKey 的 core 消息路由到该会话）+ 状态栏，并写入 workspaceState
  * 持久化（重启恢复）。目标会话须已存在于 processManager，否则应答错误。
+ *
+ * M4 补完：webview 侧已知目标会话的宿主键（session_started 信封学习）时
+ * 携带 sessionKey（本处理器当前只读 sessionKey）；仅带 sessionId 的载荷
+ * 为旧形态——宿主按 sessionId 解析键的能力并行定稿中，暂应答错误。
  */
 export interface SessionActivateParams {
   sessionKey: string;
+  /** Python 核心会话 id（sessions_list.sessionId；仅诊断用途，未参与路由） */
+  sessionId?: string;
 }
 export interface SessionActivateResult {
   activeSessionKey: string;
+}
+
+export const RPC_SESSION_ENSURE = "session.ensure";
+/**
+ * 冷启动自愈（修复「窗口重载后 webview 侧所有按钮无反应」）：窗口重载后
+ * activeSessionKey 从 workspaceState 恢复，但 Python 进程不随之复活——
+ * webview 的 control new_session / env_refresh / user_message 全部因
+ * 「无活跃进程」失败，且 webview 没有任何自建会话的通道。此 RPC 语义：
+ * 活跃会话进程健在 → 原样返回；否则新建会话并激活（同 zcode.newSession）。
+ * webview 在发送任何 core 消息前调用，保证进程存在。
+ */
+export interface SessionEnsureResult {
+  sessionKey: string;
+  /** false=复用既有活跃会话；true=本次新建（webview 可据此区分场景） */
+  created: boolean;
 }
 
 export type WebviewToHostMessage = WebviewReadyMessage | WebviewCoreSendMessage | WebviewRpcRequest;

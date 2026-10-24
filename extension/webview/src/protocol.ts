@@ -120,8 +120,15 @@ export interface SessionSummary {
 }
 
 export interface PerfTurn {
-  ttftMs: number;
-  avgTokPerSec: number;
+  /** 无 token 回合（取消/空回合）为 null（perf.turn_end），聚合端须判空 */
+  ttftMs?: number | null;
+  avgTokPerSec?: number | null;
+}
+
+/** usage.byModel 值形状：该模型的 {input, output} 累计桶（R19） */
+export interface UsageModelBucket {
+  input: number;
+  output: number;
 }
 
 /* ---------- 核 → 壳事件（镜像 CoreToHostMessage，webview 消费端） ---------- */
@@ -164,7 +171,13 @@ export type CoreEvent =
       ttftMs?: number;
       tokPerSec?: number;
       lastTurn?: PerfTurn;
-    }
+      /**
+       * R19 会话统计分组键：产生本帧的模型 id（Python protocol.Perf.model，
+       * loop 侧填充，与 usage.byModel 键同源）。旧帧/无模型场景缺省——
+       * store 聚合时归入「未知」桶。
+       */
+      model?: string;
+  }
   | { type: 'env_info'; hardware: HardwareInfo; workspaceLangs: WorkspaceLang[] }
   /**
    * M8（R14/§3.4）压缩报告：layer 为 "L1"–"L4" 字符串（Python 侧 str，
@@ -176,7 +189,12 @@ export type CoreEvent =
   | { type: 'checkpoint'; id: string; sha: string; atMessageId: string }
   | { type: 'rollback_result'; ok: boolean }
   | { type: 'sessions_list'; sessions: SessionSummary[] }
-  | { type: 'usage'; tokens: number; byModel?: Record<string, number> }
+  /**
+   * usage：tokens = 全模型合计；byModel = 模型 → {input, output} 累计桶
+   * （R19 会话统计；核侧按「本会话」累计——new_session 清零、resume 从
+   * 转录播种，见 main._usage_seed_from_frames）。
+   */
+  | { type: 'usage'; tokens: number; byModel?: Record<string, UsageModelBucket> }
   | {
       type: 'ping_result';
       providerId?: string; // 宿主协议未带 providerId；rpc 场景由 correlation id 关联
@@ -191,6 +209,8 @@ export type CoreEvent =
       commitUrl?: string;
       prUrl?: string;
       error?: string;
+      /** 降级/后续动作提示（无 remote、gh 缺失…；R17/R22） */
+      hint?: string;
     }
   | { type: 'image_artifact'; path: string }
   /**
@@ -237,6 +257,15 @@ export type CoreSend =
       rule?: string;
     }
   | { type: 'diff_review'; id: string; accepted: boolean }
+  /**
+   * R30「回滚到这」：checkpointId 来自 checkpoint 帧的 id（store 已把
+   * checkpoint 关联到对应 user 消息条目）。核侧 = git checkout <sha> -- .
+   * （恢复全部已跟踪文件；untracked 不动）。确认语义：本帧即用户在 UI
+   * 确认后的显式动作，核侧收到即执行（PLAN §5 无二次确认往返）。回执
+   * rollback_result{ok} + 失败时伴随 error 帧；宿主侧 RollbackMessage
+   * 早已镜像（extension/src/protocol.ts），此处补齐 webview 发送子集。
+   */
+  | { type: 'rollback'; checkpointId: string }
   | {
       type: 'control';
       command:
@@ -255,6 +284,9 @@ export type CoreSend =
         | 'fork'
         | 'pin'
         | 'export'
+        // M4 补完：删除会话（sessionId；核侧拒绝当前活跃会话 + id 白名单
+        // 校验；成功回执后广播 sessions_list）
+        | 'session_delete'
         | 'set_root'
         // M5（R7/R21）：环境面板「刷新」→ 核心重新探测并广播 env_info
         | 'env_refresh'
@@ -285,7 +317,19 @@ export type CoreSend =
         // R3：工具开关 + 默认权限（tools.json 持久化在核心侧）
         | 'tools_list'
         | 'tool_toggle'
-        | 'tool_permission';
+        | 'tool_permission'
+        // R15/R20：设置页——settings_get 回 result.detail JSON {settings,
+        // homeDir, sessionsDir}；settings_set 收 {settings} 整体合并或
+        // {key, value} 单键（受管键校验在核侧）；clear_sessions 清空
+        // sessions 目录保 config（UI 二次确认后发送）
+        | 'settings_get'
+        | 'settings_set'
+        | 'clear_sessions'
+        // R17/R22：一键 git 流——git_preview 预览（diff 统计 + 风格建议
+        // 信息经 result.detail JSON 回本组件编辑）；git_pr 创建 PR（gh pr
+        // create，回 git_result 帧）。执行帧是独立的 git_commit（见下）
+        | 'git_preview'
+        | 'git_pr';
       sessionId?: string;
       level?: string;
       providerId?: string;
@@ -332,6 +376,30 @@ export type CoreSend =
       action?: { type: 'prompt' | 'task'; text?: string; command?: string };
       /** M9 提案字段（cron_toggle）：目标启停态 */
       enabled?: boolean;
+      /** R15/R20（settings_set）：整体/部分合并载荷（与 key/value 二选一，优先） */
+      settings?: Record<string, unknown>;
+      /** R15/R20（settings_set）：单键名（与 value 成对） */
+      key?: string;
+      /** R15/R20（settings_set）：单键值（清空字符串键请传 ''） */
+      value?: unknown;
+      /**
+       * R17/R22 git 流字段：repoRoot 须在 init.workspaceRoots 白名单内
+       * （核心校验拒绝工作区外仓库）；scope 仅 git_preview（缺省 staged）；
+       * title/body 仅 git_pr（缺省 --fill 用提交信息）
+       */
+      repoRoot?: string;
+      scope?: 'staged' | 'all';
+      title?: string;
+      body?: string;
+    }
+  /** R17/R22 执行帧：scope=all 时核心先 git add -A；message 为预览卡上用户
+   *  编辑过的完整提交信息（缺省时核心按仓库风格生成）。回执 git_result */
+  | {
+      type: 'git_commit';
+      repoRoot: string;
+      scope: 'staged' | 'all';
+      push: boolean;
+      message?: string;
     };
 
 /* ---------- webview ↔ 宿主 RPC ---------- */
@@ -408,8 +476,17 @@ export interface EditorPickImageResult {
  */
 export const FORK_AT_LAST_USER_MESSAGE = '__last_user_message__';
 
-/** M4：切换宿主侧活跃会话（并行多开 R16；宿主侧并行实现，参数为提案） */
-export type SessionRpcMethod = 'session.activate';
+/** M4：切换宿主侧活跃会话（并行多开 R16；宿主侧并行实现，参数为提案）；
+ * session.ensure：冷启动自愈（窗口重载后 Python 进程不复活，webview 侧
+ * control / env_refresh / user_message 全部无处投递——发任何 core 消息前
+ * 先 ensure：进程健在原样返回，否则宿主新建会话并激活） */
+export type SessionRpcMethod = 'session.activate' | 'session.ensure';
+
+export interface SessionEnsureResult {
+  sessionKey: string;
+  /** false=复用既有活跃会话；true=本次新建 */
+  created: boolean;
+}
 
 export interface SessionActivateParams {
   /** Python 核心会话 id（sessions_list.sessionId，非宿主 sessionKey） */
@@ -424,7 +501,7 @@ export interface SessionActivateResult {
 }
 
 /** M4（R12）：会话导出 Markdown 落盘（宿主保存对话框 + 写文件） */
-export type WorkspaceRpcMethod = 'workspace.saveExport' | 'workspace.imageUri';
+export type WorkspaceRpcMethod = 'workspace.saveExport' | 'workspace.imageUri' | 'workspace.revealPath';
 
 export interface WorkspaceSaveExportParams {
   /** control export 回执 result.markdown 全文 */
@@ -508,6 +585,11 @@ export interface GetStateResult {
   activeSessionKey?: string;
   sessions: Array<{ sessionKey: string; state: string }>;
   workspaceRoots: string[];
+  /**
+   * R20 i18n：宿主显示语言（vscode.env.language，如 "zh-cn" / "en"）。
+   * 可选兼容：旧宿主未下发时 webview 回落 navigator.language。
+   */
+  language?: string;
 }
 
 /** Provider CRUD RPC：webview 侧提案方法名（宿主 M1 后续注册后即通） */
@@ -518,12 +600,70 @@ export type ProviderRpcMethod =
   | 'provider.ping'
   | 'provider.list_models';
 
+/**
+ * R15/R20 设置页：VS Code 原生配置读写（宿主已注册 extension.ts）。读
+ * {key} → {value}；写 {key, value} → Global 目标（宿主侧限 zcode-py.* 键，
+ * 内联补全开关 zcode-py.inlineCompletion.enabled 即走此通道）。
+ */
+export type ConfigRpcMethod = 'config.get' | 'config.update';
+
+export interface ConfigGetResult {
+  value?: unknown;
+}
+
+export interface ConfigUpdateResult {
+  value?: unknown;
+}
+
+export interface WorkspaceRevealPathResult {
+  revealed: boolean;
+}
+
 export type HostRpcMethod =
   | RegisteredRpcMethod
   | ProviderRpcMethod
   | EditorRpcMethod
   | SessionRpcMethod
-  | WorkspaceRpcMethod;
+  | WorkspaceRpcMethod
+  | ConfigRpcMethod;
+
+/* ---------- R15/R20：核心侧设置（settings_get 回执投影） ---------- */
+
+/** 视觉中继转述档位（vision_relay.PRESET_IDS） */
+export type VisionRelayPreset = 'ocr' | 'describe' | 'frontend' | 'custom';
+
+/**
+ * 核心受管设置（~/.zcode-py/config/settings.json，Agent/压缩/视觉中继/
+ * 隐私护栏/音效五组）。「通用」（语言/字号）是 webview 本地设置、「内联补全」
+ * 是 VS Code 原生配置，都不在此列。
+ */
+export interface CoreSettings {
+  /** Agent：系统提示词追加文本（接在基础提示词之后） */
+  systemPromptAppend: string;
+  /** Agent：单回合最大轮数（loop 上限，1..200） */
+  maxTurns: number;
+  compaction: {
+    /** L3 自动摘要触发阈值（0 < x ≤ 1，默认 0.85） */
+    summarizeThreshold: number;
+    /** 压缩专用模型（providerId/modelId 或 modelId；空 = 用主模型） */
+    compactionModel: string;
+  };
+  /** 视觉中继：转述档位（settings 覆盖 providers.json 条目级配置） */
+  visionRelayPreset: VisionRelayPreset;
+  /** 视觉中继：custom 档的自定义转述提示词 */
+  visionRelayCustomPrompt: string;
+  /** 隐私护栏：文件名通配模式列表（含 / 的模式按完整路径匹配） */
+  privacyFilePatterns: string[];
+  /** R6 收尾：车钟换挡咔哒音效开关（纯 webview 消费；缺省 true = 开） */
+  telegraphClickSound: boolean;
+}
+
+/** settings_get 回执 detail JSON 形状（宽容解析见 store.parseSettingsDetail） */
+export interface SettingsGetPayload {
+  settings: CoreSettings;
+  homeDir: string;
+  sessionsDir: string;
+}
 
 export type ProviderProtocol =
   | 'anthropic'
@@ -630,6 +770,40 @@ export interface WorkflowInfo {
   /** 工作流定义文件路径（SKILL.md 同款来源展示） */
   path?: string;
   [key: string]: unknown;
+}
+
+/* ---------- R17/R22：一键 git 流投影（git_preview 回执 result.detail JSON） ---------- */
+
+/** 单文件变更统计（agent/zcode_py/gitflow.py FileStat） */
+export interface GitFileStat {
+  path: string;
+  /** A | M | D | R | C | ??（?? = untracked，scope=all 才收） */
+  status: string;
+  insertions?: number | null;
+  deletions?: number | null;
+}
+
+/** git_preview 回执载荷（宽容解析见 store.parseGitPreview；ok=false 只填 error） */
+export interface GitPreviewPayload {
+  ok: boolean;
+  repoRoot: string;
+  scope: 'staged' | 'all';
+  files: GitFileStat[];
+  insertions: number;
+  deletions: number;
+  untracked: number;
+  /** 按仓库风格生成的建议（用户可编辑后随 git_commit 发回） */
+  subject: string;
+  body: string;
+  /** 一行风格说明（conventional 与否 / 语言 / 降级附注） */
+  styleNote: string;
+  remoteUrl?: string | null;
+  /** github | gitlab | bitbucket | other | none */
+  remoteKind: string;
+  /** gh 在 PATH 且 remote 是 github → UI 显示「创建 PR」按钮 */
+  canPr: boolean;
+  ghAvailable: boolean;
+  error?: string | null;
 }
 
 export interface TodoItem {

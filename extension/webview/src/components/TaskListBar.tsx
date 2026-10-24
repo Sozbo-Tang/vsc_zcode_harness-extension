@@ -3,6 +3,7 @@
  * 数据源：todos 切片（store 内由 todo 工具调用临时归约，M2 后由正式事件驱动）。
  */
 import { useStore } from '../store/store';
+import { useT } from '../i18n';
 
 const STATUS_ICON: Record<string, string> = {
   pending: '☐',
@@ -12,17 +13,18 @@ const STATUS_ICON: Record<string, string> = {
 
 export function TaskListBar(): React.JSX.Element | null {
   const todos = useStore((s) => s.todos);
+  const t = useT();
   if (todos.length === 0) return null;
-  const done = todos.filter((t) => t.status === 'completed').length;
+  const done = todos.filter((td) => td.status === 'completed').length;
   const pct = Math.round((done / todos.length) * 100);
   return (
     <details className="taskbar">
       <summary>
         <span className="taskbar-title">
-          任务清单 <span className="meter"><i style={{ width: `${pct}%` }} /></span>{' '}
+          {t('taskbar.title')} <span className="meter"><i style={{ width: `${pct}%` }} /></span>{' '}
           {done}/{todos.length}
         </span>
-        <span className="muted">展开 ▾</span>
+        <span className="taskbar-toggle muted">{t('taskbar.details')}<span className="chev">▸</span></span>
       </summary>
       <ul className="tasklist">
         {todos.map((t, i) => (

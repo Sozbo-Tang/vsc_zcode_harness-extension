@@ -11,6 +11,7 @@
  */
 import { useState } from 'react';
 import { useStore } from '../store/store';
+import { useT, type TranslateParams } from '../i18n';
 import type { ChatItem } from '../store/store';
 
 /** 主参数预览：常见键优先，否则第一个 string 值 */
@@ -31,15 +32,19 @@ function commandLine(tool: string, args: Record<string, unknown>): string {
   return arg ? `${tool} ${arg}` : tool;
 }
 
-/** 建议规则文本（语法 M2 随规则引擎定稿，先自由文本） */
-function suggestRule(tool: string, args: Record<string, unknown>): string {
+/** 建议规则文本（语法 M2 随规则引擎定稿，先自由文本；文案经 t() 生成） */
+function suggestRule(
+  tool: string,
+  args: Record<string, unknown>,
+  t: (key: string, params?: TranslateParams) => string,
+): string {
   const cmd = args?.command ?? args?.cmd;
   if (typeof cmd === 'string' && cmd) {
     const head = cmd.trim().split(/\s+/)[0] ?? '';
-    return head ? `允许 ${tool}: ${head} …` : `允许 ${tool}: *`;
+    return head ? t('perm.ruleSuggestCmd', { tool, head }) : t('perm.ruleSuggestAll', { tool });
   }
   const arg = mainArg(args);
-  return arg ? `允许 ${tool}: ${arg}` : `允许 ${tool}: *`;
+  return arg ? t('perm.ruleSuggestArg', { tool, arg }) : t('perm.ruleSuggestAll', { tool });
 }
 
 export function PermissionCard({
@@ -48,16 +53,26 @@ export function PermissionCard({
   item: Extract<ChatItem, { kind: 'permission' }>;
 }): React.JSX.Element {
   const respond = useStore((s) => s.respondPermission);
+  const t = useT();
   const [writingRule, setWritingRule] = useState(false);
-  const [ruleText, setRuleText] = useState(() => suggestRule(item.tool, item.args));
+  const [ruleText, setRuleText] = useState(() => suggestRule(item.tool, item.args, t));
   const decided = item.decision != null;
 
   return (
-    <div className="card permcard">
-      <div className="card-title warn">⚠ 需要确认 — Agent 想执行:</div>
+    <div className={decided ? 'card permcard decided' : 'card permcard'}>
+      <div className="card-head">
+        <div className="card-heading">
+          <span className="card-kicker">PERMISSION</span>
+          <span className="card-title">{t('perm.needConfirm')}</span>
+        </div>
+        <span className={decided ? 'card-status muted' : 'card-status warn'}>
+          {decided ? t('perm.decided') : t('perm.waiting')}
+        </span>
+      </div>
+      <div className="perm-request muted">{t('perm.requestLine')}</div>
       <pre className="card-body cmdline">{commandLine(item.tool, item.args)}</pre>
       <details className="permargs">
-        <summary className="muted small">参数 ▾</summary>
+        <summary className="muted small">{t('perm.viewArgs')}<span>▸</span></summary>
         <pre className="card-body">
           {(() => {
             try {
@@ -70,13 +85,12 @@ export function PermissionCard({
       </details>
 
       {decided ? (
-        <div className="muted">
-          已处理：
-          {item.decision === 'allow' && '✓ 允许（本次）'}
-          {item.decision === 'always' && '✓✓ 会话内总是允许'}
-          {item.decision === 'deny' && '✗ 已拒绝'}
+        <div className="card-resolution muted">
+          {item.decision === 'allow' && t('perm.allowedOnce')}
+          {item.decision === 'always' && t('perm.alwaysAllowed')}
+          {item.decision === 'deny' && t('perm.denied')}
           {item.rule != null && item.rule !== '' && (
-            <span title="M2 权限规则引擎落地后持久化（PLAN §3.2）">（规则：{item.rule}）</span>
+            <span title={t('perm.ruleTitle')}>{t('perm.ruleSuffix', { rule: item.rule })}</span>
           )}
         </div>
       ) : writingRule ? (
@@ -87,39 +101,39 @@ export function PermissionCard({
             value={ruleText}
             onChange={(e) => setRuleText(e.target.value)}
             // 权限卡不与聊天输入抢焦点：规则框聚焦由用户点击触发，非自动
-            placeholder="规则文本（语法 M2 定稿，先自由文本）"
+            placeholder={t('perm.rulePlaceholder')}
           />
           <div className="btnrow">
             <button
               className="btn"
               disabled={ruleText.trim() === ''}
-              title="保存规则并本次及会话内总是允许"
+              title={t('perm.saveRuleTitle')}
               onClick={() => respond(item.id, 'always', ruleText.trim())}
             >
-              ✓ 保存规则并允许
+              {t('perm.saveRuleBtn')}
             </button>
             <button className="btn sec" onClick={() => setWritingRule(false)}>
-              取消
+              {t('sessions.cancel')}
             </button>
           </div>
         </div>
       ) : (
-        <div className="btnrow">
+        <div className="btnrow permission-actions">
           <button className="btn" onClick={() => respond(item.id, 'allow')}>
-            ✓ 允许
+            {t('perm.allowOnce')}
           </button>
-          <button className="btn" onClick={() => respond(item.id, 'always')}>
-            ✓✓ 会话内总是
+          <button className="btn sec" onClick={() => respond(item.id, 'always')}>
+            {t('perm.alwaysBtn')}
           </button>
-          <button className="btn sec" onClick={() => respond(item.id, 'deny')}>
-            ✗ 拒绝
+          <button className="btn sec danger" onClick={() => respond(item.id, 'deny')}>
+            {t('perm.denyBtn')}
           </button>
           <button
-            className="btn sec"
-            title="写入持久权限规则（M2 规则引擎消费 rule 字段）"
+            className="btn sec rulebtn"
+            title={t('perm.writeRuleTitle')}
             onClick={() => setWritingRule(true)}
           >
-            ⚙ 写规则
+            {t('perm.writeRuleBtn')}
           </button>
         </div>
       )}

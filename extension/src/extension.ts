@@ -28,20 +28,28 @@ import { PythonProcessManager } from "./processManager";
 import { ZcodeWebviewViewProvider } from "./webviewHost";
 import { registerInlineCompletion } from "./inlineCompletion";
 import {
+  ConfigGetParams,
+  ConfigUpdateParams,
   EditorFollowToolCallParams,
   EditorListFilesParams,
   EditorOpenDiffParams,
+  RPC_CONFIG_GET,
+  RPC_CONFIG_UPDATE,
   RPC_EDITOR_FOLLOW_TOOL_CALL,
   RPC_EDITOR_GET_SELECTION,
   RPC_EDITOR_LIST_FILES,
   RPC_EDITOR_PICK_FILE,
   RPC_EDITOR_PICK_IMAGE,
   RPC_SESSION_ACTIVATE,
+  RPC_SESSION_ENSURE,
   RPC_WORKSPACE_IMAGE_URI,
+  RPC_WORKSPACE_REVEAL_PATH,
   RPC_WORKSPACE_SAVE_EXPORT,
   SessionActivateParams,
+  SessionEnsureResult,
   UserMessageContext,
   WorkspaceImageUriParams,
+  WorkspaceRevealPathParams,
   WorkspaceSaveExportParams,
 } from "./protocol";
 import {
@@ -197,6 +205,18 @@ function updateRtFromCore(rt: Runtime, msg: CoreToHostMessage): void {
   updateStatusBar(rt);
 }
 
+/** 新建会话并设为活跃（zcode.newSession 命令与 session.ensure RPC 共用，
+ * 持久化/状态栏由调用点处理——闭包在 activate 内）；createSession 失败
+ * （agentDir 缺失等）返回 undefined，错误已由 processManager 广播。 */
+async function createAndActivateSession(rt: Runtime): Promise<string | undefined> {
+  const proc = await rt.manager.createSession();
+  if (proc === undefined) {
+    return undefined;
+  }
+  rt.activeSessionKey = proc.sessionKey;
+  return proc.sessionKey;
+}
+
 function sendToActiveSession(rt: Runtime, message: HostToCoreMessage): boolean {
   const key = rt.activeSessionKey;
   if (key === undefined) {
@@ -325,6 +345,9 @@ export function activate(context: vscode.ExtensionContext): void {
       state: manager.get(key)?.state ?? "unknown",
     })),
     workspaceRoots: PythonProcessManager.workspaceRoots(),
+    // R20 i18n：宿主显示语言下发（webview 侧未显式设置界面语言时的默认依据；
+    // 形如 "zh-cn" / "en"，webview resolveLocale 按 zh* 前缀归并）
+    language: vscode.env.language,
   }));
 
   // 编辑器桥：diff 审阅页（DiffReviewCard「打开对比页」；契约 protocol.ts
@@ -439,6 +462,72 @@ export function activate(context: vscode.ExtensionContext): void {
     return { activeSessionKey: key };
   });
 
+  // 冷启动自愈：活跃会话进程不在（首次打开 / 窗口重载后进程不复活）则新建。
+  // webview 发送任何 core 消息（新会话/刷新环境/发消息）前先 ensure。
+  provider.registerRpcHandler(RPC_SESSION_ENSURE, async (): Promise<SessionEnsureResult> => {
+    const key = rt.activeSessionKey;
+    if (key !== undefined && manager.get(key) !== undefined) {
+      return { sessionKey: key, created: false };
+    }
+    const created = await createAndActivateSession(rt);
+    if (created === undefined) {
+      throw new Error("session.ensure: 会话创建失败（详见 Zcode-Py 输出通道）");
+    }
+    persistActiveSession(created);
+    updateStatusBar(rt);
+    channel.appendLine(`[host] 冷启动自愈: 新建会话 ${created}`);
+    return { sessionKey: created, created: true };
+  });
+
+  // R15/R20 设置页：VS Code 原生配置读写（内联补全开关
+  // zcode-py.inlineCompletion.enabled 等）。读不限键（无副作用）；写只放行
+  // zcode-py. 前缀——webview 不得借宿主改写任意配置（安全约束）
+  provider.registerRpcHandler(RPC_CONFIG_GET, (params) => {
+    const key = (params as Partial<ConfigGetParams> | undefined)?.key;
+    if (typeof key !== "string" || !key.includes(".")) {
+      throw new Error("config.get: 参数需为 {key: string}（完整配置键，如 zcode-py.inlineCompletion.enabled）");
+    }
+    const i = key.indexOf(".");
+    const value = vscode.workspace.getConfiguration(key.slice(0, i)).get(key.slice(i + 1));
+    return { value };
+  });
+  provider.registerRpcHandler(RPC_CONFIG_UPDATE, async (params) => {
+    const p = params as Partial<ConfigUpdateParams> | undefined;
+    if (
+      p === undefined ||
+      typeof p.key !== "string" ||
+      !p.key.startsWith("zcode-py.") ||
+      p.value === undefined
+    ) {
+      throw new Error("config.update: 参数需为 {key, value}，且 key 限 zcode-py.* 配置键");
+    }
+    const i = p.key.indexOf(".");
+    await vscode.workspace
+      .getConfiguration(p.key.slice(0, i))
+      .update(p.key.slice(i + 1), p.value, vscode.ConfigurationTarget.Global);
+    return { value: p.value };
+  });
+
+  // R15/R20 设置页「数据」组：在文件管理器中显示 ~/.zcode-py 会话目录。
+  // 路径白名单：仅 ~/.zcode_py / ~/.zcode-py 之下（含目录本身）——比
+  // isAllowedArtifactPath 宽一点（允许根目录自身），但仍不开放任意路径
+  provider.registerRpcHandler(RPC_WORKSPACE_REVEAL_PATH, async (params) => {
+    const p = params as Partial<WorkspaceRevealPathParams> | undefined;
+    if (p === undefined || typeof p.path !== "string" || p.path.length === 0) {
+      throw new Error("workspace.revealPath: 参数需为 {path: string}");
+    }
+    const homeRoots = ["/.zcode_py", "/.zcode-py"].map((dir) => path.join(os.homedir(), dir));
+    const allowed = homeRoots.some((root) => {
+      const rel = path.relative(path.resolve(root), path.resolve(p.path as string));
+      return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+    });
+    if (!allowed) {
+      throw new Error(`workspace.revealPath: 路径须位于 ~/.zcode_py 下: ${p.path}`);
+    }
+    await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(p.path));
+    return { revealed: true };
+  });
+
   // —— 视图与命令 ——
   context.subscriptions.push(
     channel,
@@ -450,12 +539,11 @@ export function activate(context: vscode.ExtensionContext): void {
       webviewOptions: { retainContextWhenHidden: false },
     }),
     vscode.commands.registerCommand("zcode.newSession", async () => {
-      const proc = await manager.createSession();
-      if (proc !== undefined) {
-        rt.activeSessionKey = proc.sessionKey;
-        persistActiveSession(proc.sessionKey);
+      const key = await createAndActivateSession(rt);
+      if (key !== undefined) {
+        persistActiveSession(key);
         updateStatusBar(rt);
-        channel.appendLine(`[host] 会话已创建: ${proc.sessionKey}（等待 session_started）`);
+        channel.appendLine(`[host] 会话已创建: ${key}（等待 session_started）`);
       }
       await vscode.commands.executeCommand("zcode.sidebar.focus");
     }),

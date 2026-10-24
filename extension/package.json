@@ -7,7 +7,7 @@
   "license": "UNLICENSED",
   "private": true,
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.104.0"
   },
   "//extensionKind": "spawn 工作区侧 Python、读工作区文件 → 必须是 workspace 扩展（远程开发跑在远程扩展宿主，见 docs/research/vscode-integration.md §6.1）",
   "extensionKind": [
@@ -28,7 +28,7 @@
   },
   "contributes": {
     "viewsContainers": {
-      "auxiliarybar": [
+      "secondarySidebar": [
         {
           "id": "zcode-py",
           "title": "Zcode-Py",

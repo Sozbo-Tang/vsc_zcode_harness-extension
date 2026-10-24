@@ -147,7 +147,15 @@ def relay_images(
         result.error = Error(kind="config", message=err)
         return result
     assert entry is not None and model_id is not None
-    preset = str((provider_entry or {}).get("visionRelayPreset") or DEFAULT_PRESET)
+    # 转述档位优先级（R15/R20 设置页接线）：settings.visionRelayPreset
+    # （~/.zcode-py/config/settings.json，设置页「视觉中继」组）→ provider
+    # 条目 visionRelayPreset（providers.json）→ describe 缺省。自定义提示词
+    # 同理经 settings.visionRelayCustomPrompt（preset_prompt 内消费）。
+    preset = str(
+        (settings or {}).get("visionRelayPreset")
+        or (provider_entry or {}).get("visionRelayPreset")
+        or DEFAULT_PRESET
+    )
     preset_id, prompt = preset_prompt(preset, settings)
     key = api_key_for(entry.get("id") or "", api_key_env)
     try:

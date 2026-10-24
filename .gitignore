@@ -15,3 +15,6 @@ __pycache__/
 .zcode/
 .mimosa/
 .DS_Store
+docs/
+.zcode/
+.mimosa/

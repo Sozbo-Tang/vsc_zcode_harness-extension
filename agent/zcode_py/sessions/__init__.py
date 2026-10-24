@@ -16,6 +16,8 @@ M4 起 meta.json 额外承载列表元信息（R16/R27/R28/R11）：
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import threading
 import time
 import uuid
@@ -27,6 +29,11 @@ from ..config import home_dir
 TITLE_MAX_CHARS = 30
 # R27：输入历史上限（↑ 键翻阅的是最近输入，更早的没必要跨会话背走）
 INPUT_HISTORY_LIMIT = 100
+
+# 会话 id 形态白名单（_new_session_id：YYYYMMDD-HHMMSS-hex8）。delete 走
+# rmtree，先过这道校验拒绝 "../" / 分隔符 / 控制字符之类的路径逃逸。
+# \Z 而非 $：$ 会放过尾部换行（"id\n" 恰是注入的常见形态）。
+SESSION_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}\Z")
 
 # 导出 Markdown 时工具卡摘要取的入参键（按常见工具选第一个命中者；
 # 结果全文不进导出——导出是给人读的对话记录，不是转录副本）
@@ -265,6 +272,19 @@ class SessionStore:
     def set_pinned(self, session_id: str, pinned: bool) -> dict:
         """R28：收藏标志落 meta（置顶渲染由 UI 按 pinned 决定）。"""
         return self.update_meta(session_id, pinned=bool(pinned))
+
+    def delete(self, session_id: str) -> dict:
+        """M4 补完：整目录删除（meta + transcript，不可恢复）。
+
+        安全：rmtree 前过 SESSION_ID_RE 白名单（防路径逃逸）；目录不存在
+        抛 SessionError（UI 回执 not_found）。当前活跃会话的拦截在 service
+        层（SessionStore 不知「活跃」概念）。
+        """
+        if SESSION_ID_RE.match(session_id) is None:
+            raise SessionError(f"invalid session id: {session_id!r}")
+        directory = self._session_dir(session_id)
+        shutil.rmtree(directory)
+        return {"sessionId": session_id}
 
     # -- 分叉（R16） ----------------------------------------------------------
 

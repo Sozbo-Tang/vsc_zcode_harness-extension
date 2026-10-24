@@ -10,18 +10,20 @@
  * 数据源：env_info 事件 → store.env（init 后台探测 / 手动刷新均走同一帧）。
  */
 import { useStore } from '../store/store';
+import { useT } from '../i18n';
 import type { HardwareInfo, WorkspaceLang } from '../protocol';
 
 function HardwareCard({ hw }: { hw: HardwareInfo }): React.JSX.Element {
+  const t = useT();
   const cpu = hw.cpuModel ?? hw.cpu;
   const ram = hw.ramTotal ?? hw.ram;
   const gpu = hw.gpuModel ?? hw.gpu;
   const os = hw.os;
   const rows: Array<[string, string]> = [
-    ['CPU', cpu ? (hw.cpuCores != null ? `${cpu} · ${hw.cpuCores} 核` : cpu) : '未知'],
-    ['RAM', ram ?? '未知'],
-    ['GPU', gpu ? (hw.gpuVram ? `${gpu} · ${hw.gpuVram}` : gpu) : '未探测到'],
-    ['OS', os ? (hw.arch ? `${os} · ${hw.arch}` : os) : hw.arch ?? '未知'],
+    ['CPU', cpu ? (hw.cpuCores != null ? t('env.cpuWithCores', { cpu, n: hw.cpuCores }) : cpu) : t('env.unknown')],
+    ['RAM', ram ?? t('env.unknown')],
+    ['GPU', gpu ? (hw.gpuVram ? t('env.gpuWithVram', { gpu, vram: hw.gpuVram }) : gpu) : t('env.gpuNone')],
+    ['OS', os ? (hw.arch ? t('env.osWithArch', { os, arch: hw.arch }) : os) : hw.arch ?? t('env.unknown')],
   ];
   return (
     <div className="card">
@@ -40,9 +42,10 @@ function kvLine(entries: Array<[string, string]>): string {
 }
 
 function LangCard({ lang }: { lang: WorkspaceLang }): React.JSX.Element {
+  const t = useT();
   // missing（M5 定稿字段）优先；早期镜像的 ok===false 兜底
   const missing = lang.missing === true || (lang.missing === undefined && lang.ok === false);
-  const title = lang.label ?? lang.language ?? '未知语言';
+  const title = lang.label ?? lang.language ?? t('env.unknownLang');
   const markers = lang.markers ?? [];
   const managers = Object.entries(lang.packageManagers ?? {});
   const extras = Object.entries(lang.extras ?? {});
@@ -54,24 +57,26 @@ function LangCard({ lang }: { lang: WorkspaceLang }): React.JSX.Element {
           {missing ? <span className="warn">⚠</span> : <span className="ok">✓</span>} {title}
         </span>
         <span className={`card-side ${missing ? 'warn' : 'muted'}`}>
-          {missing ? '缺工具链' : lang.version ?? '就绪'}
+          {missing ? t('env.missingToolchain') : lang.version ?? t('env.ready')}
         </span>
       </summary>
       <div className="lang-body">
         {markers.length > 0 && (
           <div className="muted small">
-            发现: {markers.join(' · ')}
-            {(lang.markerPaths?.length ?? 0) > 1 ? `（${lang.markerPaths?.length} 处）` : ''}
+            {t('env.foundMarkers', { markers: markers.join(' · ') })}
+            {(lang.markerPaths?.length ?? 0) > 1 ? t('env.markerCount', { n: lang.markerPaths?.length ?? 0 }) : ''}
           </div>
         )}
         {missing ? (
           <div className="warn small">
-            检测到 {markers.join(' / ') || '特征文件'}，但未装工具链
+            {t('env.missingWarn', {
+              markers: markers.join(' / ') || t('env.markerFallback'),
+            })}
           </div>
         ) : (
           <>
-            {lang.version != null && lang.version !== '' && <div>工具链: {lang.version}</div>}
-            {managers.length > 0 && <div>包管理: {kvLine(managers)}</div>}
+            {lang.version != null && lang.version !== '' && <div>{t('env.versionLine', { version: lang.version })}</div>}
+            {managers.length > 0 && <div>{t('env.pkgLine', { kv: kvLine(managers) })}</div>}
             {extras.length > 0 && <div className="muted small">{kvLine(extras)}</div>}
           </>
         )}
@@ -79,7 +84,7 @@ function LangCard({ lang }: { lang: WorkspaceLang }): React.JSX.Element {
         {!missing && lang.detail != null && <div className="muted small">{lang.detail}</div>}
         {missing && lang.installHint != null && lang.installHint !== '' && (
           <details className="lang-hint">
-            <summary>查看指引 ▾</summary>
+            <summary>{t('env.viewHint')}</summary>
             <div className="muted small lang-hint-body">{lang.installHint}</div>
           </details>
         )}
@@ -92,36 +97,32 @@ export function EnvView(): React.JSX.Element {
   const env = useStore((s) => s.env);
   const envRefreshing = useStore((s) => s.envRefreshing);
   const refreshEnv = useStore((s) => s.refreshEnv);
+  const t = useT();
 
   return (
     <div className="view">
       <div className="view-head">
-        <span>环境</span>
+        <span>{t('env.title')}</span>
         <button
           className="btn sec"
           onClick={refreshEnv}
           disabled={envRefreshing}
-          title="重新探测硬件与工作区语言（control env_refresh → env_info）"
+          title={t('env.refreshTitle')}
         >
-          {envRefreshing ? '⏳ 探测中…' : '🔄刷新'}
+          {envRefreshing ? t('env.refreshing') : t('env.refresh')}
         </button>
       </div>
       {env === null ? (
         <div className="muted empty-note">
-          {envRefreshing
-            ? '环境探测进行中（硬件 + 工作区语言并行探测）…'
-            : '等待环境探测（env_info）—— 发送消息或点击「刷新」触发。'}
+          {envRefreshing ? t('env.probing') : t('env.waiting')}
         </div>
       ) : (
         <div className="envinfo">
-          <div className="form-title">💻 硬件</div>
+          <div className="form-title">{t('env.hardwareTitle')}</div>
           <HardwareCard hw={env.hardware} />
-          <div className="form-title">📂 工作区语言检测</div>
+          <div className="form-title">{t('env.langTitle')}</div>
           {env.workspaceLangs.length === 0 ? (
-            <div className="muted small">
-              未命中语言特征文件（pyproject.toml / package.json / Cargo.toml / go.mod /
-              pom.xml / build.gradle / CMakeLists.txt）
-            </div>
+            <div className="muted small">{t('env.noLangHit')}</div>
           ) : (
             env.workspaceLangs.map((l, i) => <LangCard key={l.language ?? i} lang={l} />)
           )}

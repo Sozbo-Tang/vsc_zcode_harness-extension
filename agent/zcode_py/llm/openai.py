@@ -14,9 +14,11 @@
   （choices 内 delta 为空即无事发生）；中途错误是 chunk 顶层 ``error`` 对象，
   ``error.metadata.error_type`` 用于分类；私有参数 ``{"reasoning": {...}}``
   同样经 thinking 载荷直接合并进请求体。
-- **Ollama**：base_url ``http://localhost:11434/v1``，api_key 任意非空被忽略
-  （provider 条目配 ``"auth": "none"`` 可免配 Key）；支持
+- **Ollama（OpenAI 兼容层）**：base_url ``http://localhost:11434/v1``，api_key
+  任意非空被忽略（provider 条目配 ``"auth": "none"`` 可免配 Key）；支持
   stream/stream_options.include_usage/tools/reasoning_effort（调研 §5.1）。
+  要思考增量与 think 参数等原生能力时改用独立适配器 llm/ollama.py
+  （protocol ``ollama``，ROADMAP M1）。
 - **自定义 / DeepSeek 等其他 OpenAI 兼容端点**：只改 baseUrl + Key。
 
 max_tokens 字段：默认发 ``max_tokens``（兼容面最广，GLM/Ollama/多数兼容端点）；

@@ -17,9 +17,17 @@
  */
 import { useEffect, useState } from 'react';
 import { useStore } from '../store/store';
+import { useT } from '../i18n';
 import type { BackgroundTask, CronEntry } from '../protocol';
 
-const TABS = ['运行中任务', '定时任务', '工作流'] as const;
+/** 页签 id 稳定（与语言无关）；标签经 t() 渲染期解析（R20 i18n） */
+const TABS = ['running', 'cron', 'workflow'] as const;
+type TasksTabId = (typeof TABS)[number];
+const TAB_LABEL_KEYS: Record<TasksTabId, string> = {
+  running: 'tasks.tab.running',
+  cron: 'tasks.tab.cron',
+  workflow: 'tasks.tab.workflow',
+};
 
 /* ---------- 运行中任务页签 ---------- */
 
@@ -31,16 +39,18 @@ function fmtElapsed(from: number, to: number): string {
   return `${Math.floor(m / 60)}h${m % 60}m`;
 }
 
-const TASK_STATUS_META: Record<BackgroundTask['status'], { icon: string; cls: string; label: string }> = {
-  running: { icon: '●', cls: 'run', label: '运行中' },
-  done: { icon: '✓', cls: 'ok', label: '完成' },
-  failed: { icon: '✗', cls: 'bad', label: '失败' },
-  stopped: { icon: '⏹', cls: 'off', label: '已停止' },
+/** 状态元数据（labelKey 经 t() 渲染期解析） */
+const TASK_STATUS_META: Record<BackgroundTask['status'], { icon: string; cls: string; labelKey: string }> = {
+  running: { icon: '●', cls: 'run', labelKey: 'tasks.statusRunning' },
+  done: { icon: '✓', cls: 'ok', labelKey: 'tasks.statusDone' },
+  failed: { icon: '✗', cls: 'bad', labelKey: 'tasks.statusFailed' },
+  stopped: { icon: '⏹', cls: 'off', labelKey: 'tasks.statusStopped' },
 };
 
 function TaskCard({ task }: { task: BackgroundTask }): React.JSX.Element {
   const taskStopping = useStore((s) => s.taskStopping[task.id] ?? false);
   const stopTask = useStore((s) => s.stopTask);
+  const t = useT();
   // 运行中任务的耗时需要秒级走表：由页签统一 tick（见 RunningTasksTab），
   // 卡片只按 tick 重渲染时的 Date.now() 计算
   const tick = useStore((s) => s.taskTick);
@@ -53,16 +63,16 @@ function TaskCard({ task }: { task: BackgroundTask }): React.JSX.Element {
   return (
     <li className="taskcard">
       <div className="taskrow">
-        <span className={`taskdot ${meta.cls}`} role="img" aria-label={meta.label} title={meta.label}>
+        <span className={`taskdot ${meta.cls}`} role="img" aria-label={t(meta.labelKey)} title={t(meta.labelKey)}>
           {meta.icon}
         </span>
         <span className="taskname" title={task.command ?? task.name}>
           {task.name}
         </span>
         <span className="muted small taskmeta">
-          {elapsed !== undefined && <span title="耗时">{elapsed}</span>}
+          {elapsed !== undefined && <span title={t('tasks.elapsed')}>{elapsed}</span>}
           {task.exitCode !== undefined && (
-            <span title="退出码" className={task.exitCode === 0 ? '' : 'bad'}>
+            <span title={t('tasks.exitCode')} className={task.exitCode === 0 ? '' : 'bad'}>
               {' '}exit {task.exitCode}
             </span>
           )}
@@ -70,7 +80,7 @@ function TaskCard({ task }: { task: BackgroundTask }): React.JSX.Element {
         {task.status === 'running' && (
           <button
             className="iconbtn"
-            title="停止任务（control task_stop）"
+            title={t('tasks.stopTitle')}
             disabled={taskStopping}
             onClick={() => stopTask(task.id)}
           >
@@ -84,7 +94,7 @@ function TaskCard({ task }: { task: BackgroundTask }): React.JSX.Element {
         </div>
       )}
       {task.tail !== undefined && task.tail !== '' && (
-        <pre className="tasktail mono" title="尾部输出（滚动窗口 ≤4KB）">
+        <pre className="tasktail mono" title={t('tasks.tailTitle')}>
           {task.tail}
         </pre>
       )}
@@ -102,7 +112,8 @@ function RunningTasksTab(): React.JSX.Element {
   const refreshing = useStore((s) => s.tasksRefreshing);
   const requested = useStore((s) => s.tasksRequested);
   const refreshTasks = useStore((s) => s.refreshTasks);
-  const runningCount = tasks.filter((t) => t.status === 'running').length;
+  const t = useT();
+  const runningCount = tasks.filter((tk) => tk.status === 'running').length;
 
   // 首开自动拉取一次（幂等：tasksRequested 标记）
   useEffect(() => {
@@ -121,33 +132,29 @@ function RunningTasksTab(): React.JSX.Element {
     <div className="skillspanel">
       <div className="skillhead">
         <span>
-          运行中任务 <span className="muted small">（{runningCount}/{tasks.length}）</span>
+          {t('tasks.tab.running')} <span className="muted small">（{runningCount}/{tasks.length}）</span>
         </span>
         <button
           className="btn sec"
           onClick={refreshTasks}
           disabled={refreshing}
-          title="拉取后台任务快照（control tasks_list）"
+          title={t('tasks.refreshTitle')}
         >
-          {refreshing ? '刷新中…' : '↻ 刷新'}
+          {refreshing ? t('tools.refreshing') : t('tools.refresh')}
         </button>
       </div>
       {tasks.length === 0 ? (
         <div className="muted empty-note">
-          {refreshing
-            ? '正在获取后台任务…'
-            : '没有后台任务。Agent 的 bash 后台命令 / cron 触发 / 工作流步骤会以任务卡出现在这里（帧实时归约；核心未实现 tasks_list 时此提示常驻——后端并行落地中）。'}
+          {refreshing ? t('tasks.loading') : t('tasks.empty')}
         </div>
       ) : (
         <ul className="bgtasklist">
-          {tasks.map((t) => (
-            <TaskCard key={t.id} task={t} />
+          {tasks.map((tk) => (
+            <TaskCard key={tk.id} task={tk} />
           ))}
         </ul>
       )}
-      <div className="muted small skillhint">
-        任务卡由 task_started / task_output / task_finished 帧实时驱动；尾部输出滚动保留最新 4KB。
-      </div>
+      <div className="muted small skillhint">{t('tasks.hint')}</div>
     </div>
   );
 }
@@ -173,6 +180,7 @@ function CronTab(): React.JSX.Element {
   const addCron = useStore((s) => s.addCron);
   const removeCron = useStore((s) => s.removeCron);
   const toggleCron = useStore((s) => s.toggleCron);
+  const t = useT();
 
   const [formOpen, setFormOpen] = useState(false);
   const [schedule, setSchedule] = useState('');
@@ -189,15 +197,15 @@ function CronTab(): React.JSX.Element {
   const submitAdd = (): void => {
     const sch = schedule.trim();
     if (sch === '') {
-      setFormError('调度表达式必填（如 "30 9 * * *" = 每天 9:30，标准 5 段）');
+      setFormError(t('tasks.cronScheduleRequired'));
       return;
     }
     if (kind === 'prompt' && prompt.trim() === '') {
-      setFormError('prompt 动作文本必填');
+      setFormError(t('tasks.cronPromptRequired'));
       return;
     }
     if (kind === 'command' && command.trim() === '') {
-      setFormError('command 命令行必填');
+      setFormError(t('tasks.cronCommandRequired'));
       return;
     }
     setFormError(undefined);
@@ -216,23 +224,23 @@ function CronTab(): React.JSX.Element {
     <div className="skillspanel">
       <div className="skillhead">
         <span>
-          定时任务 <span className="muted small">（{crons.length}）</span>
+          {t('tasks.tab.cron')} <span className="muted small">（{crons.length}）</span>
         </span>
         <span className="headbtns">
           <button
             className="btn sec"
             onClick={refreshCrons}
             disabled={refreshing}
-            title="拉取定时任务列表（control cron_list）"
+            title={t('tasks.cronRefreshTitle')}
           >
-            {refreshing ? '刷新中…' : '↻ 刷新'}
+            {refreshing ? t('tools.refreshing') : t('tools.refresh')}
           </button>
           <button
             className="btn sec"
             onClick={() => setFormOpen((v) => !v)}
-            title="新建定时任务（control cron_add）"
+            title={t('tasks.cronAddTitle')}
           >
-            ＋新建
+            {t('tasks.cronNewBtn')}
           </button>
         </span>
       </div>
@@ -243,9 +251,7 @@ function CronTab(): React.JSX.Element {
 
       {crons.length === 0 ? (
         <div className="muted empty-note">
-          {refreshing
-            ? '正在获取定时任务…'
-            : '还没有定时任务。用「＋新建」添加（schedule + prompt 文本 或 command 命令行；核心未实现 cron_* 时会提示错误——后端并行落地中）。'}
+          {refreshing ? t('tasks.cronLoading') : t('tasks.cronEmpty')}
         </div>
       ) : (
         <ul className="cronlist">
@@ -254,7 +260,7 @@ function CronTab(): React.JSX.Element {
               <div className="cronrow">
                 <button
                   className={c.enabled ? 'crondot on' : 'crondot'}
-                  title={c.enabled ? '已启用（点击停用 → cron_toggle）' : '已停用（点击启用 → cron_toggle）'}
+                  title={c.enabled ? t('tasks.cronEnabledTitle') : t('tasks.cronDisabledTitle')}
                   disabled={pending !== undefined}
                   onClick={() => toggleCron(c.name, !c.enabled)}
                 >
@@ -263,12 +269,12 @@ function CronTab(): React.JSX.Element {
                 <span className="cronname" title={c.name}>
                   {c.name}
                 </span>
-                <span className="cronbadge" title="动作类型">
+                <span className="cronbadge" title={t('tasks.cronKindTitle')}>
                   {cronKindLabel(c)}
                 </span>
                 <button
                   className="iconbtn"
-                  title="删除（control cron_remove）"
+                  title={t('tasks.cronDeleteTitle')}
                   disabled={pending !== undefined}
                   onClick={() => removeCron(c.name)}
                 >
@@ -289,46 +295,46 @@ function CronTab(): React.JSX.Element {
       <div className="mcpformrow">
         {formOpen ? (
           <div className="form">
-            <div className="form-title">新建定时任务</div>
+            <div className="form-title">{t('tasks.cronFormTitle')}</div>
             <div className="form-row">
-              <label htmlFor="cron-schedule">调度</label>
+              <label htmlFor="cron-schedule">{t('tasks.cronScheduleLabel')}</label>
               <input
                 id="cron-schedule"
                 className="in grow mono"
                 value={schedule}
-                placeholder="30 9 * * *（5 段：分 时 日 月 星期）"
-                title="标准 5 段 cron 表达式（*/5 * * * *、30 9 * * 1-5 等）"
+                placeholder={t('tasks.cronSchedulePlaceholder')}
+                title={t('tasks.cronScheduleTitle')}
                 onChange={(e) => setSchedule(e.target.value)}
               />
             </div>
             <div className="form-row">
-              <label htmlFor="cron-kind">类型</label>
+              <label htmlFor="cron-kind">{t('tasks.cronKindLabel')}</label>
               <select
                 id="cron-kind"
                 className="sel"
                 value={kind}
                 onChange={(e) => setKind(e.target.value as 'prompt' | 'command')}
-                title="prompt = 到点把文本作为用户消息发给 Agent；command = 到点直接执行命令行"
+                title={t('tasks.cronKindTitle2')}
               >
-                <option value="prompt">prompt（发给 Agent）</option>
-                <option value="command">command（执行命令）</option>
+                <option value="prompt">{t('tasks.cronKindPrompt')}</option>
+                <option value="command">{t('tasks.cronKindCommand')}</option>
               </select>
             </div>
             {kind === 'prompt' ? (
               <div className="form-row top">
-                <label htmlFor="cron-prompt">动作</label>
+                <label htmlFor="cron-prompt">{t('tasks.cronActionLabel')}</label>
                 <textarea
                   id="cron-prompt"
                   className="in grow"
                   rows={2}
                   value={prompt}
-                  placeholder="到点发给 Agent 的提示词，如「拉取主干并汇总今日提交」"
+                  placeholder={t('tasks.cronPromptPlaceholder')}
                   onChange={(e) => setPrompt(e.target.value)}
                 />
               </div>
             ) : (
               <div className="form-row">
-                <label htmlFor="cron-cmd">动作</label>
+                <label htmlFor="cron-cmd">{t('tasks.cronActionLabel')}</label>
                 <input
                   id="cron-cmd"
                   className="in grow mono"
@@ -341,28 +347,23 @@ function CronTab(): React.JSX.Element {
             {formError !== undefined && <div className="bad small">{formError}</div>}
             <div className="form-row end">
               <button className="btn sec" onClick={() => setFormOpen(false)}>
-                取消
+                {t('sessions.cancel')}
               </button>
               <button
                 className="btn"
                 onClick={submitAdd}
                 disabled={pending !== undefined}
-                title="发 control cron_add（成功后自动回拉列表）"
+                title={t('tasks.cronAddBtnTitle')}
               >
-                {pending === 'add' ? '创建中…' : '创建'}
+                {pending === 'add' ? t('tasks.cronCreating') : t('tasks.cronCreateBtn')}
               </button>
             </div>
-            <div className="muted small">
-              载荷双通道（schedule/prompt/command 专用字段 + query JSON 镜像），Python 侧定稿前从任一通道取参。
-            </div>
+            <div className="muted small">{t('tasks.cronPayloadHint')}</div>
           </div>
         ) : null}
       </div>
 
-      <div className="muted small skillhint">
-        到点动作：prompt 型在活跃会话发用户消息；command 型经核心权限门——
-        新增时校验（危险命令一律拒绝；普通命令需白名单或 yolo 模式），到点不再弹卡。
-      </div>
+      <div className="muted small skillhint">{t('tasks.cronHint')}</div>
     </div>
   );
 }
@@ -388,6 +389,7 @@ function WorkflowTab(): React.JSX.Element {
   const notice = useStore((s) => s.workflowNotice);
   const refreshWorkflows = useStore((s) => s.refreshWorkflows);
   const runWorkflow = useStore((s) => s.runWorkflow);
+  const t = useT();
 
   // 首开自动拉取一次（幂等：workflowsRequested 标记）
   useEffect(() => {
@@ -398,15 +400,15 @@ function WorkflowTab(): React.JSX.Element {
     <div className="skillspanel">
       <div className="skillhead">
         <span>
-          工作流 <span className="muted small">（{workflows.length}）</span>
+          {t('tasks.tab.workflow')} <span className="muted small">（{workflows.length}）</span>
         </span>
         <button
           className="btn sec"
           onClick={refreshWorkflows}
           disabled={refreshing}
-          title="拉取工作流列表（control workflows_list）"
+          title={t('tasks.wfRefreshTitle')}
         >
-          {refreshing ? '刷新中…' : '↻ 刷新'}
+          {refreshing ? t('tools.refreshing') : t('tools.refresh')}
         </button>
       </div>
 
@@ -416,9 +418,7 @@ function WorkflowTab(): React.JSX.Element {
 
       {workflows.length === 0 ? (
         <div className="muted empty-note">
-          {refreshing
-            ? '正在获取工作流列表…'
-            : '还没有工作流。工作流由 Python 核心编排（脚本/声明式定义，核心未实现 workflows_list 时此提示常驻——后端并行落地中）。'}
+          {refreshing ? t('tasks.wfLoading') : t('tasks.wfEmpty')}
         </div>
       ) : (
         <ul className="wflist">
@@ -434,11 +434,11 @@ function WorkflowTab(): React.JSX.Element {
                   </span>
                   <button
                     className="btn sec wfrunbtn"
-                    title="运行工作流（control workflow_run；运行态沿任务帧/工具卡显示，报告到达后此处展示）"
+                    title={t('tasks.wfRunTitle')}
                     disabled={isRunning || pendingRun !== undefined}
                     onClick={() => runWorkflow(w.name)}
                   >
-                    {isRunning ? '⏳ 运行中…' : '▶ 运行'}
+                    {isRunning ? t('tasks.wfRunningBtn') : t('tasks.wfRunBtn')}
                   </button>
                 </div>
                 {w.description !== undefined && w.description !== '' && (
@@ -446,12 +446,16 @@ function WorkflowTab(): React.JSX.Element {
                 )}
                 {run !== undefined && (
                   <div className={`mcpnotice ${run.status === 'failed' ? 'bad' : 'ok'}`} title={`at ${new Date(run.at).toLocaleTimeString()}`}>
-                    {run.status === 'running' ? '运行中…' : run.status === 'done' ? '已运行' : '运行失败'}
+                    {run.status === 'running'
+                      ? t('tasks.wfRunning')
+                      : run.status === 'done'
+                        ? t('tasks.wfDone')
+                        : t('tasks.wfFailed')}
                   </div>
                 )}
                 {report !== undefined && (
                   <details className="wfreport">
-                    <summary>运行报告</summary>
+                    <summary>{t('tasks.wfReport')}</summary>
                     <pre className="mono wfreport-body">{report}</pre>
                   </details>
                 )}
@@ -460,9 +464,7 @@ function WorkflowTab(): React.JSX.Element {
           })}
         </ul>
       )}
-      <div className="muted small skillhint">
-        运行是异步的：等待期间可切回聊天视图看工具卡与任务帧进度；完成后此处展开报告（JSON 宽容渲染）。
-      </div>
+      <div className="muted small skillhint">{t('tasks.wfHint')}</div>
     </div>
   );
 }
@@ -470,27 +472,22 @@ function WorkflowTab(): React.JSX.Element {
 /* ---------- 视图 ---------- */
 
 export function TasksView(): React.JSX.Element {
-  const [tab, setTab] = useState<(typeof TABS)[number]>('运行中任务');
+  const t = useT();
+  const [tab, setTab] = useState<TasksTabId>('running');
   return (
     <div className="view">
       <div className="tabrow">
-        {TABS.map((t) => (
+        {TABS.map((tabId) => (
           <button
-            key={t}
-            className={tab === t ? 'tab active' : 'tab'}
-            onClick={() => setTab(t)}
+            key={tabId}
+            className={tab === tabId ? 'tab active' : 'tab'}
+            onClick={() => setTab(tabId)}
           >
-            {t}
+            {t(TAB_LABEL_KEYS[tabId])}
           </button>
         ))}
       </div>
-      {tab === '运行中任务' ? (
-        <RunningTasksTab />
-      ) : tab === '定时任务' ? (
-        <CronTab />
-      ) : (
-        <WorkflowTab />
-      )}
+      {tab === 'running' ? <RunningTasksTab /> : tab === 'cron' ? <CronTab /> : <WorkflowTab />}
     </div>
   );
 }

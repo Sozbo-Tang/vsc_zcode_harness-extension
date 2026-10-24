@@ -196,6 +196,8 @@ class AgentLoop:
                 final.usage.output_tokens if final and final.usage else None
             )
         )
+        # R19 会话统计：done 帧带 lastTurn（每轮 TTFT/均速），补 model 分组键
+        perf_done.model = self.model
         self.emit(perf_done)
         if final is not None and final.usage is not None and self.on_usage is not None:
             self.on_usage(self.model, final.usage)
@@ -421,6 +423,8 @@ class AgentLoop:
     def _maybe_perf(self) -> None:
         msg = self.perf.maybe_sample()
         if msg is not None:
+            # R19：streaming 采样帧同样带 model（UI 峰值速度按模型归组）
+            msg.model = self.model
             self.emit(msg)
 
     @staticmethod

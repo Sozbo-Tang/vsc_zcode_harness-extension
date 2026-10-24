@@ -5,24 +5,33 @@
  * 占用回落，lastCompaction 记录校正来源，title 中标注）。
  */
 import { useStore } from '../store/store';
+import { useT } from '../i18n';
 
 export function ContextMeter(): React.JSX.Element {
+  const t = useT();
   const pct = useStore((s) => s.contextPct);
   const tokens = useStore((s) => s.usageTokens);
   const lastCompaction = useStore((s) => s.lastCompaction);
   const compHint =
     lastCompaction !== undefined
-      ? `（${lastCompaction.layer} 压缩后校正${
-          lastCompaction.afterTokens != null ? `：${lastCompaction.afterTokens.toLocaleString()} tokens` : ''
-        }）`
+      ? t('ctx.compHint', {
+          layer: lastCompaction.layer,
+          detail:
+            lastCompaction.afterTokens != null
+              ? t('ctx.compHintDetail', { n: lastCompaction.afterTokens.toLocaleString() })
+              : '',
+        })
       : '';
   return (
     <span
       className="ctxmeter"
       title={
         pct == null
-          ? '上下文占用：等待 usage 事件 / 模型档案 contextLength'
-          : `上下文占用 ${pct}%${tokens != null ? `（${tokens.toLocaleString()} tokens）` : ''}${compHint}`
+          ? t('ctx.titleEmpty')
+          : t('ctx.title', {
+              pct,
+              tokens: tokens != null ? t('ctx.titleTokens', { n: tokens.toLocaleString() }) : '',
+            }) + compHint
       }
     >
       ◔{pct == null ? '—' : `${pct}%`}
