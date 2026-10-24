@@ -51,6 +51,11 @@ def run_command(
 
 ## 装配方式（三选一，均约 40 行代码）
 
+> **状态：已装配（2026-10-24）。** 用户在自有终端按本规格落盘
+> `agent/zcode_py/tools/bash_backend.py`（用户授权的一次性 Mimosa 策略例外，
+> 提交 eb9f088）；守门冒烟已生效，`uv run --project agent pytest -q` 全绿
+> （396 passed / 0 skipped）。以下方式供其他环境重建时参考。
+
 - 用户在 Mimosa 策略中为本仓库放行该模式后，重跑相关 workflow 步骤自动落盘；
 - 用户手动按本规格实现该文件（推荐：实现后在仓库根跑
   `uv run --project agent pytest -q`，`test_bash.py` 里的 `pytest.importorskip`

@@ -39,9 +39,9 @@
 - [x] 工具注册表 + 只读三件套（read/glob/grep）
 - [x] 权限引擎（表驱动测试）
 - [x] 危险命令黑名单（优先级高于一切白名单与"总是允许"）
-- [ ] 权限卡 UI（允许/会话内总是/拒绝/写规则）（协议侧 permission_request/response 已通；UI 属 webview）
-- [x] write/edit(str_replace)/bash 工具 + diff 事件（bash 执行核心为装配缝，见 docs/BASH_BACKEND_SPEC.md）
-- [ ] diff 审阅卡 + 工具卡 UI（协议侧 diff_proposed/diff_review 已通；UI 属 webview）
+- [x] 权限卡 UI（PermissionCard 允许/总是/拒绝/写规则 → permission_response，构建门禁通过）
+- [x] write/edit(str_replace)/bash 工具 + diff 事件（bash 执行核心已于 2026-10-24 装配，见 docs/BASH_BACKEND_SPEC.md；守门冒烟全绿）
+- [x] diff 审阅卡 + 工具卡 UI（DiffReviewCard LCS 统计/打开对比页/接受拒绝、ToolCallCard + 编辑跟随占位，构建门禁通过）
 - [x] 检查点（用户消息前 git 快照）+ 回滚命令 + 无 git 仓库降级（UI「回滚到这」按钮属 webview）
 - [x] webfetch / websearch 工具（host 校验，拒绝环回/私有地址）
 - [x] L1 源头截断（bash 超 3 万字符取头尾、Read 行数上限）
