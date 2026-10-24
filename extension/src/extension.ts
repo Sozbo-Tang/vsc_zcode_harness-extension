@@ -8,6 +8,9 @@
  *   session.activate RPC（并行多开的活跃会话切换）；
  * - M5：图片附件入口（zcode.attachImage 命令 + editor.pickImage RPC，
  *   复用 host_prompt 通道挂 chip）、workspace.saveExport RPC（导出落盘）；
+ * - M9（§6.7/R13/R32）：状态栏完整投影（🚢档位│模型│⏿运行│◔token，由
+ *   活跃会话 core 帧归约，见 updateRtFromCore）；内联补全实装接线
+ *   （registerInlineCompletion，默认关、开关即时生效）；
  * - deactivate 返回 Promise：优雅回收全部子进程（EOF→SIGTERM→SIGKILL）。
  */
 
@@ -17,12 +20,13 @@ import * as path from "node:path";
 import { ApiKeyStore } from "./secrets";
 import {
   ControlMessage,
+  CoreToHostMessage,
   HostToCoreMessage,
   looksLikeHostToCoreMessage,
 } from "./protocol";
 import { PythonProcessManager } from "./processManager";
 import { ZcodeWebviewViewProvider } from "./webviewHost";
-import { registerInlineCompletionIfEnabled } from "./inlineCompletion";
+import { registerInlineCompletion } from "./inlineCompletion";
 import {
   EditorFollowToolCallParams,
   EditorListFilesParams,
@@ -60,6 +64,22 @@ interface Runtime {
   provider: ZcodeWebviewViewProvider;
   statusBar: vscode.StatusBarItem;
   activeSessionKey: string | undefined;
+  /**
+   * M9 状态栏投影（PLAN §6.7：🚢档位 │ 模型 │ ⏿运行态 │ ◔上下文）：
+   * 由活跃会话的核 → 壳帧归约（updateRtFromCore）——telegraph_state 取
+   * 当前档 label、sessions_list/switch_model 取模型名、perf/stream_delta/
+   * message_complete 归约运行态、message_complete.inputTokens 与 compaction
+   * report.afterTokens 维护上下文 token。宿主拿不到模型档案 contextWindow，
+   * 故上下文显示 token 绝对值（◔12.3k 形态，百分比归 webview ContextMeter）。
+   */
+  status: {
+    levelLabel?: string;
+    model?: string;
+    running: boolean;
+    contextTokens?: number;
+    /** 最近一次 session_started 的核心会话 id（sessions_list 对账用） */
+    coreSessionId?: string;
+  };
 }
 
 let runtime: Runtime | undefined;
@@ -93,13 +113,88 @@ function isAllowedArtifactPath(candidate: string): boolean {
   });
 }
 
+/** token 数 → 人读短形（§6.7 状态栏：宿主无 contextWindow，显绝对值） */
+function formatTokens(n: number): string {
+  if (n < 1_000) return String(n);
+  if (n < 1_000_000) return `${(n / 1_000).toFixed(1)}k`;
+  return `${(n / 1_000_000).toFixed(2)}M`;
+}
+
 function updateStatusBar(rt: Runtime): void {
   const key = rt.activeSessionKey;
-  const proc = key !== undefined ? rt.manager.get(key) : undefined;
+  if (key === undefined) {
+    rt.statusBar.text = "🚢 Zcode-Py";
+    rt.statusBar.tooltip = "Zcode-Py：无会话（点击打开侧边栏新建）";
+    return;
+  }
+  const proc = rt.manager.get(key);
   const state = proc?.state ?? "idle";
-  const icon = state === "running" ? "$(play)" : state === "starting" ? "$(loading~spin)" : "$(circle-outline)";
-  rt.statusBar.text = `${icon} Zcode-Py · ${state}`;
-  rt.statusBar.tooltip = `会话 ${key ?? "无"} · ${state}（M1 占位，档位/模型/上下文见 PLAN §6.7）`;
+  const st = rt.status;
+  // §6.7：`🚢高 │ glm-5.3 │ ⠿运行中 │ ◔42%` —— 宿主侧上下文显 token 绝对值
+  rt.statusBar.text = [
+    `🚢${st.levelLabel ?? "—"}`,
+    st.model ?? "未配置模型",
+    st.running ? "⏿运行中" : "⏿空闲",
+    st.contextTokens !== undefined ? `◔${formatTokens(st.contextTokens)}` : "◔—",
+  ].join(" │ ");
+  rt.statusBar.tooltip = [
+    `会话 ${key} · 进程 ${state}`,
+    `模型 ${st.model ?? "未配置"} · 车钟 ${st.levelLabel ?? "未知"}`,
+    `上下文 ${st.contextTokens !== undefined ? `${st.contextTokens} tokens` : "未知（等待 message_complete）"}`,
+    "点击打开侧边栏",
+  ].join("\n");
+}
+
+/**
+ * 活跃会话的核 → 壳帧 → 状态栏投影归约（M9 §6.7）。帧字段宽容
+ * （Python 侧并行定稿）：compaction 的 afterTokens 兼容 after_tokens，
+ * telegraph 档位缺失时回退 current id 显示。
+ */
+function updateRtFromCore(rt: Runtime, msg: CoreToHostMessage): void {
+  const st = rt.status;
+  switch (msg.type) {
+    case "telegraph_state": {
+      const lv = msg.levels.find((l) => l.id === msg.current);
+      st.levelLabel = lv?.label ?? msg.current;
+      break;
+    }
+    case "session_started":
+      st.coreSessionId = msg.sessionId;
+      break;
+    case "sessions_list": {
+      // 活跃核心会话优先，其次任一带 modelId 的摘要
+      const hit =
+        msg.sessions.find((s) => st.coreSessionId !== undefined && s.sessionId === st.coreSessionId) ??
+        msg.sessions.find((s) => typeof s.modelId === "string");
+      if (typeof hit?.modelId === "string") st.model = hit.modelId;
+      break;
+    }
+    case "perf":
+      st.running = msg.phase === "streaming";
+      break;
+    case "stream_delta":
+      st.running = true;
+      break;
+    case "message_complete":
+      st.running = false;
+      if (typeof msg.inputTokens === "number") st.contextTokens = msg.inputTokens;
+      break;
+    case "compaction": {
+      // L2/L3 后按 report.afterTokens 校正（宽容 after_tokens 命名）
+      const report = msg.report as Record<string, unknown> | undefined;
+      const after =
+        typeof report?.afterTokens === "number"
+          ? report.afterTokens
+          : typeof report?.after_tokens === "number"
+            ? report.after_tokens
+            : undefined;
+      if (after !== undefined) st.contextTokens = after;
+      break;
+    }
+    default:
+      break;
+  }
+  updateStatusBar(rt);
 }
 
 function sendToActiveSession(rt: Runtime, message: HostToCoreMessage): boolean {
@@ -156,6 +251,7 @@ export function activate(context: vscode.ExtensionContext): void {
     provider,
     statusBar,
     activeSessionKey: restoredKey !== undefined && restoredKey.length > 0 ? restoredKey : undefined,
+    status: { running: false },
   };
   runtime = rt;
   updateStatusBar(rt);
@@ -168,11 +264,19 @@ export function activate(context: vscode.ExtensionContext): void {
   // —— Python 核心 → webview ——
   manager.onCoreMessage((e) => {
     provider.forwardCore(e.sessionKey, e.message);
+    // M9：活跃会话的帧同时归约状态栏投影（§6.7）
+    if (e.sessionKey === rt.activeSessionKey) {
+      updateRtFromCore(rt, e.message);
+    }
   }, undefined, context.subscriptions);
 
   manager.onProcessState((e) => {
     provider.postProcessState(e.sessionKey, e.state, e.detail);
     if (e.sessionKey === rt.activeSessionKey) {
+      // 进程退出/崩溃：运行态立即归零（不待 message_complete 兜底）
+      if (e.state === "stopped" || e.state === "crashed" || e.state === "stopping") {
+        rt.status.running = false;
+      }
       updateStatusBar(rt);
     }
   }, undefined, context.subscriptions);
@@ -188,6 +292,15 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!looksLikeHostToCoreMessage(req.message)) {
       provider.postHostError(req.sessionKey, "invalid_core_message", "消息信封不合法（缺 type 或未知类型）");
       return;
+    }
+    // M9：路过式嗅探 switch_model —— 状态栏模型名即时更新（§6.7；
+    // sessions_list 回流后 updateRtFromCore 会再对账一次）
+    if (req.message.type === "control" && req.message.command === "switch_model") {
+      const mid = req.message.modelId;
+      if (typeof mid === "string" && mid.length > 0) {
+        rt.status.model = mid;
+        updateStatusBar(rt);
+      }
     }
     if (req.sessionKey !== undefined && req.sessionKey !== rt.activeSessionKey) {
       const target = manager.get(req.sessionKey);
@@ -408,10 +521,13 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
-  const inline = registerInlineCompletionIfEnabled(context);
-  if (inline !== undefined) {
-    context.subscriptions.push(inline);
-  }
+  // M9（R13）：内联补全（默认关）——内部按「开关 && 存活会话」动态注册
+  // Provider，开关变更即时生效；请求经活跃会话 stdin control inline_complete
+  registerInlineCompletion(context, {
+    manager,
+    getActiveSessionKey: () => rt.activeSessionKey,
+    outputChannel: channel,
+  });
 }
 
 export async function deactivate(): Promise<void> {

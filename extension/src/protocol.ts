@@ -15,6 +15,11 @@
  * 及其参数（atMessageId/pinned/rootIndex/rootPath）、sessions_list 的 M4
  * 字段集（title/pinned/lastActivity/messageCount/rootPath 等）、
  * result.markdown（export 全文）。
+ * M9 增量（R13/R3，Python 侧并行定稿）：control 命令 inline_complete /
+ * tasks_list / task_stop / cron_* / workflow_run / workflows_list 及其
+ * 提案参数（prefix/suffix/path/taskId/schedule/prompt/enabled，query JSON
+ * 双通道兜底）；核 → 壳新帧 task_started / task_output / task_finished；
+ * result.detail 的 inline_complete（补全文本）与列表类命令（JSON 宽容）契约。
  *
  * 解析策略：只严格校验信封（合法 JSON + string type），载荷字段宽容、
  * 未知类型也放行转发（见 parseCoreMessage）——Python 侧 decode 对
@@ -115,7 +120,24 @@ export type ControlCommand =
   | "mcp_list"
   | "mcp_refresh"
   | "mcp_add"
-  | "mcp_remove";
+  | "mcp_remove"
+  // M9（R13/R3，Python 侧并行定稿——CONTROL_COMMANDS 落地前本侧先行；
+  // 核心未识别时回 error 帧（unknown control command / protocol 枚举拒收），
+  // 各消费端一律静默降级）：
+  // 内联补全（宿主 inlineCompletion 经活跃会话 stdin 发起，result 回执匹配）
+  | "inline_complete"
+  // 后台任务面板（tasks_list 回执走 result.detail JSON；task_stop 停指定任务）
+  | "tasks_list"
+  | "task_stop"
+  // 定时任务（cron_list → result.detail JSON；add/remove/toggle 即时生效）
+  | "cron_list"
+  | "cron_add"
+  | "cron_remove"
+  | "cron_toggle"
+  // 工作流（workflows_list → result.detail JSON；workflow_run 异步运行，
+  // 运行态沿任务帧/工具卡，最终报告走 result.detail JSON）
+  | "workflow_run"
+  | "workflows_list";
 export interface ControlMessage {
   type: "control";
   command: ControlCommand;
@@ -135,6 +157,35 @@ export interface ControlMessage {
   rootIndex?: number;
   /** command = "set_root"：按路径切根（与 rootIndex 二选一，须命中 workspaceRoots） */
   rootPath?: string;
+  /**
+   * 通用载荷通道（search_sessions 关键词 / M8 mcp_add·mcp_remove / M9 各
+   * 新命令同款约定）：把专用载荷镜像为 JSON 字符串放这里。Control.query
+   * 是 Python 侧现有协议字段，今天即可无损穿透 decode；专用字段定稿前
+   * 核心可从 query JSON 取参（M8 MCP 已按此双通道约定落地，M9 沿用）。
+   */
+  query?: string;
+  /** M8/M9 提案字段：mcp_add/mcp_remove 的服务名；cron_remove/cron_toggle
+   *  的定时任务名；workflow_run 的工作流名。Python Control 侧定稿前 decode
+   *  忽略未知字段（query 兜底）。 */
+  name?: string;
+  /**
+   * M9（R13）提案字段，command = "inline_complete"：光标前文（FIM prefix，
+   *  截尾窗口）。专用字段定稿前核心应从 query JSON 读取
+   *  （{prefix, suffix, path}）。
+   */
+  prefix?: string;
+  /** command = "inline_complete"：光标后文（FIM suffix，截头窗口） */
+  suffix?: string;
+  /** command = "inline_complete"：补全目标文件（扩展宿主侧真实路径） */
+  path?: string;
+  /** M9 提案字段，command = "task_stop"：目标任务 id */
+  taskId?: string;
+  /** M9 提案字段，command = "cron_add"：cron 调度表达式（7 段或描述文本） */
+  schedule?: string;
+  /** M9 提案字段，command = "cron_add"：prompt 型动作的文本 */
+  prompt?: string;
+  /** M9 提案字段，command = "cron_toggle"：目标启停态 */
+  enabled?: boolean;
 }
 
 /** rollback{checkpointId} */
@@ -384,6 +435,39 @@ export interface ImageArtifactMessage {
   path: string;
 }
 
+/* ──────────── M9 后台任务事件帧（R3/M9；Python 侧并行定稿，字段宽容） ──────────── */
+/**
+ * task_started{taskId, name?, command?} —— 后台任务（bash 后台/cron 触发/
+ * 工作流步骤）启动。taskId 为对账主键（宽容兼容 id/task_id 命名，归一在
+ * 消费端）；name/command 由发起方带出（缺省时 UI 显示 taskId）。
+ */
+export interface TaskStartedMessage {
+  type: "task_started";
+  taskId: string;
+  name?: string;
+  command?: string;
+  /** 启动时刻（epoch ms；缺省 = 帧到达时刻） */
+  atMs?: number;
+}
+
+/** task_output{taskId, text} —— 输出增量追加（UI 侧滚动窗口截尾） */
+export interface TaskOutputMessage {
+  type: "task_output";
+  taskId: string;
+  text: string;
+  /** 输出通道（stdout/stderr…，宽容缺省） */
+  stream?: string;
+}
+
+/** task_finished{taskId, status?} —— 终态。status 宽容：done/failed/stopped */
+export interface TaskFinishedMessage {
+  type: "task_finished";
+  taskId: string;
+  status?: string;
+  exitCode?: number;
+  detail?: string;
+}
+
 /** error{kind, message} —— kind 为稳定错误码（Python 侧定义） */
 export interface ErrorMessage {
   type: "error";
@@ -401,6 +485,14 @@ export interface ResultMessage {
   /**
    * command = "export"：导出的 Markdown 全文（R12；核侧不替用户选路径，
    * 落盘由 UI 经宿主 RPC workspace.saveExport 完成）；其余命令恒缺省。
+   *
+   * M9 detail 契约（Python 侧并行定稿，消费端宽容解析）：
+   *  - command = "inline_complete"：detail = 补全文本（裸字符串；或
+   *    JSON {text}——inlineCompletion.parseCompletionDetail 双形状兼容）
+   *  - command = "tasks_list" / "cron_list" / "workflows_list"：detail =
+   *    JSON 字符串，数组本身或 {items:[...]} 包裹均收（webview
+   *    parseTasksDetail / parseCronsDetail / parseWorkflowsDetail）
+   *  - command = "workflow_run"：detail = 运行报告 JSON（宽容渲染）
    */
   markdown?: string;
 }
@@ -431,6 +523,9 @@ export type CoreToHostMessage =
   | PingResultMessage
   | GitResultMessage
   | ImageArtifactMessage
+  | TaskStartedMessage
+  | TaskOutputMessage
+  | TaskFinishedMessage
   | ErrorMessage
   | ResultMessage
   | EchoMessage;
@@ -467,6 +562,9 @@ export const CORE_TO_HOST_TYPES: readonly string[] = [
   "ping_result",
   "git_result",
   "image_artifact",
+  "task_started",
+  "task_output",
+  "task_finished",
   "error",
   "result",
   "echo",

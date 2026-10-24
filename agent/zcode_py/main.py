@@ -20,6 +20,11 @@
 - M7（R25/R26）：run_child 子代理工具（上下文防火墙、深度=1、可指定模型）
   + SKILL.md 加载器（后台扫描注入 system prompt；用户消息 /<name> 开头展开
   并广播 result 帧注明）
+- M9（R3）：后台任务（background_start/tasks_list/task_stop，任务面板数据
+  源；帧 task_started/task_output/task_finished）+ 定时任务（cron.json +
+  30s 调度线程；prompt 动作经 _intake_lock 串行化的同一用户消息路径注入，
+  task 动作走后台任务）+ 工作流（~/.zcode-py/workflows/*.py 声明式 STEPS，
+  顺序受限子代理执行，报告经 result 帧）
 - git_commit 属后续里程碑，回 unsupported
 
 会话转录（transcript.jsonl + meta.json）由 sessions/ 落盘；resume 重放历史
@@ -40,8 +45,8 @@ import uuid
 from pathlib import Path
 from typing import Callable, TextIO
 
-from . import telegraph
-from . import vision_relay
+from . import telegraph, vision_relay
+from .background import DEFAULT_TASK_TIMEOUT_S, BackgroundTaskManager
 from .checkpoints import CheckpointManager
 from .compaction import SEARCH_HISTORY_SPEC, CompactionManager
 from .config import (
@@ -52,11 +57,14 @@ from .config import (
     get_provider_entry,
     load_config,
 )
-from .envprobe import environment_facts, probe as probe_environment
+from .cronjobs import CronManager
+from .envprobe import environment_facts
+from .envprobe import probe as probe_environment
 from .hooks import HooksConfigError, HooksRunner, load_hooks
-from .llm import Provider, ProviderError, default_provider_factory, ping as ping_provider
-from .llm.base import ImageBlock
-from .loop import AgentLoop, DEFAULT_SYSTEM_PROMPT, context_from_frames
+from .llm import Provider, ProviderError, default_provider_factory
+from .llm import ping as ping_provider
+from .llm.base import ImageBlock, LLMRequest, LLMUserMessage, TextBlock, TextDelta
+from .loop import DEFAULT_SYSTEM_PROMPT, AgentLoop, context_from_frames
 from .mcp import McpManager
 from .memory import MemoryPermissionEngine, memory_injection, register_memory_tool
 from .perf import PerfTracker
@@ -79,8 +87,8 @@ from .protocol import (
     Result,
     Rollback,
     RollbackResult,
-    SessionStarted,
     SessionsList,
+    SessionStarted,
     TelegraphState,
     Usage,
     UserMessage,
@@ -90,10 +98,15 @@ from .protocol import (
 )
 from .sessions import SessionError, SessionStore
 from .skills import SkillsManager, expand_slash, skills_injection
-from .subagents import ChildRuntime, RUN_CHILD_SPEC
+from .subagents import RUN_CHILD_SPEC, ChildRuntime
 from .tools import ToolSession, default_registry
-from .tools.browser import BROWSER_TOOL_NAMES, browser_unavailable_outcome, register_browser_tools
+from .tools.browser import (
+    BROWSER_TOOL_NAMES,
+    browser_unavailable_outcome,
+    register_browser_tools,
+)
 from .tools.notebook import register_notebook_tools
+from .workflows import WorkflowError, WorkflowManager
 
 DEFAULT_PERMISSION_TIMEOUT_S = 300.0
 
@@ -270,6 +283,23 @@ class ZcodeService:
         self._env_probe_lock = threading.Lock()
         self._env_probe_thread: threading.Thread | None = None
         self._env_facts: str | None = None
+        # M9（R3）：后台任务（任务面板数据源；工作线程走 bash_backend）
+        self._background = BackgroundTaskManager(
+            emit=self._emit,
+            cwd_supplier=lambda: self._workspace_cwd,
+        )
+        # M9（R3）：定时任务（配置在构造时加载；调度线程 init 时启动）
+        self._cron = CronManager(
+            on_prompt=self._cron_inject_prompt,
+            on_task=self._cron_start_task,
+        )
+        # M9（R3）：工作流（~/.zcode-py/workflows/*.py 声明式 STEPS）
+        self._workflows = WorkflowManager()
+        self._workflow_thread: threading.Thread | None = None
+        # M9 线程安全：用户消息入口串行化锁——cron 线程注入 prompt 与读线程
+        # 的 user_message 并发到达时，_turn_alive 检查+落盘+起回合线程必须是
+        # 原子段（否则两条消息同时通过 busy 闸门，转录与回合线程都会交错）
+        self._intake_lock = threading.Lock()
 
     # ------------------------------------------------------------------ 帧入口
 
@@ -310,6 +340,10 @@ class ZcodeService:
                 self._cancel.set()
                 thread.join(timeout=join_timeout)
         self._mcp.shutdown()
+        # M9（R3）：停 cron 调度线程 + 后台输出监测线程（后台命令线程是
+        # daemon，随进程退场；语义见 background.py docstring）
+        self._cron.stop()
+        self._background.shutdown()
 
     # ------------------------------------------------------------------ init
 
@@ -370,6 +404,13 @@ class ZcodeService:
         # _on_user_message 里按需同步加载，不受扫描时机影响）
         self._skills = SkillsManager(self._workspace_cwd)
         self._spawn_skills_scan()
+        # M9（R3）：cron 调度器——enabled 条目才触发（tick 内跳过 disabled）；
+        # 配置损坏（load_error，构造时加载）广播降级后按空表继续
+        if self._cron.load_error:
+            self._emit(
+                Error(kind="config", message=self._cron.load_error + " (cron jobs disabled)")
+            )
+        self._cron.start()
 
     # ------------------------------------------------------------------ M7 skills
 
@@ -627,67 +668,81 @@ class ZcodeService:
     # ------------------------------------------------------------------ 用户消息
 
     def _on_user_message(self, msg: UserMessage) -> None:
-        if self._turn_alive():
-            self._emit(Error(kind="busy", message="a turn is already running; cancel it first"))
-            return
-        if self._loop is None or self._store is None or self._emitter.session_id is None:
-            self._emit(Error(kind="protocol", message="init required before user_message"))
-            return
-        if self._provider is None:
-            self._emit(
-                Error(
-                    kind="config",
-                    message=self._provider_error or "no provider configured",
-                )
-            )
-            return
-        session_id = self._emitter.session_id
-        # messageId 先于一切落盘动作生成：转录入站帧、checkpoint.atMessageId、
-        # fork 分叉点共用同一标识（R16/R30 对齐）
-        message_id = "um_" + uuid.uuid4().hex[:10]
-        inbound = encode_message(msg)
-        inbound["messageId"] = message_id
-        self._store.append(session_id, inbound, direction="in")
-        try:
-            # R16/R27：首条用户消息定 title（前 30 字符）+ 输入历史 + 轮次计数
-            self._store.record_user_input(session_id, msg.text or "")
-        except SessionError:
-            pass
-        # 检查点：每条 user_message 处理前做 git 快照（R30；不动工作区）。
-        # sha 与消息 id 随 checkpoint 事件入转录，rollback 凭转录找回 sha。
-        if self._checkpoints is not None:
-            snap = self._checkpoints.snapshot(message_id)
-            if snap.ok:
+        # M9：入口串行化——本方法同时被读线程（shell user_message 帧）与 cron
+        # 调度线程（prompt 动作注入）调用；busy 闸门 + 落盘 + 起回合线程必须
+        # 原子（_intake_lock），否则并发消息会双双通过闸门交错落转录。
+        # 锁内含 git 检查点快照（子进程调用，百毫秒级）：串行化正确性优先于
+        # 注入延迟。读线程与 cron 线程共用同一条路径——checkpoint / 输入历史 /
+        # 斜杠展开 / 权限通道全部复用，cron 注入对用户可见可审计。
+        with self._intake_lock:
+            if self._turn_alive():
+                self._emit(Error(kind="busy", message="a turn is already running; cancel it first"))
+                return
+            if self._workflow_alive():
+                # 工作流运行中不接受新消息：_cancel 事件为二者共享，新回合的
+                # cancel.clear() 会剥夺工作流的取消能力
                 self._emit(
-                    Checkpoint(id=snap.checkpoint_id, sha=snap.sha, atMessageId=message_id)
+                    Error(kind="busy", message="a workflow is running; cancel it first")
                 )
-        # M7（R26）斜杠命令：/<name> 开头且命中已加载 skill → SKILL.md 正文拼进
-        # 该轮消息前缀（斜杠 token 被展开体替换），广播 result 帧注明展开；
-        # 未命中原样透传
-        skill_prefix, rest, skill = expand_slash(msg.text or "", self._skills.ensure_loaded())
-        if skill is not None:
-            tail = _decorate_user_message(UserMessage(text=rest, context=msg.context))
-            text = skill_prefix + (("\n\n" + tail) if tail else "")
-            self._emit(
-                Result(
-                    ok=True,
-                    command="skill",
-                    detail=f"expanded skill {skill.name!r} from {skill.path}",
+                return
+            if self._loop is None or self._store is None or self._emitter.session_id is None:
+                self._emit(Error(kind="protocol", message="init required before user_message"))
+                return
+            if self._provider is None:
+                self._emit(
+                    Error(
+                        kind="config",
+                        message=self._provider_error or "no provider configured",
+                    )
                 )
+                return
+            session_id = self._emitter.session_id
+            # messageId 先于一切落盘动作生成：转录入站帧、checkpoint.atMessageId、
+            # fork 分叉点共用同一标识（R16/R30 对齐）
+            message_id = "um_" + uuid.uuid4().hex[:10]
+            inbound = encode_message(msg)
+            inbound["messageId"] = message_id
+            self._store.append(session_id, inbound, direction="in")
+            try:
+                # R16/R27：首条用户消息定 title（前 30 字符）+ 输入历史 + 轮次计数
+                self._store.record_user_input(session_id, msg.text or "")
+            except SessionError:
+                pass
+            # 检查点：每条 user_message 处理前做 git 快照（R30；不动工作区）。
+            # sha 与消息 id 随 checkpoint 事件入转录，rollback 凭转录找回 sha。
+            if self._checkpoints is not None:
+                snap = self._checkpoints.snapshot(message_id)
+                if snap.ok:
+                    self._emit(
+                        Checkpoint(id=snap.checkpoint_id, sha=snap.sha, atMessageId=message_id)
+                    )
+            # M7（R26）斜杠命令：/<name> 开头且命中已加载 skill → SKILL.md 正文拼进
+            # 该轮消息前缀（斜杠 token 被展开体替换），广播 result 帧注明展开；
+            # 未命中原样透传
+            skill_prefix, rest, skill = expand_slash(msg.text or "", self._skills.ensure_loaded())
+            if skill is not None:
+                tail = _decorate_user_message(UserMessage(text=rest, context=msg.context))
+                text = skill_prefix + (("\n\n" + tail) if tail else "")
+                self._emit(
+                    Result(
+                        ok=True,
+                        command="skill",
+                        detail=f"expanded skill {skill.name!r} from {skill.path}",
+                    )
+                )
+            else:
+                text = _decorate_user_message(msg)
+            images = [
+                str(p)
+                for p in ((msg.context.images if msg.context is not None else None) or [])
+                if str(p).strip()
+            ]
+            self._cancel.clear()  # 上一回合的 cancel 不应泄漏到新回合
+            thread = threading.Thread(
+                target=self._run_turn, args=(session_id, text, images), daemon=True, name="zcode-turn"
             )
-        else:
-            text = _decorate_user_message(msg)
-        images = [
-            str(p)
-            for p in ((msg.context.images if msg.context is not None else None) or [])
-            if str(p).strip()
-        ]
-        self._cancel.clear()  # 上一回合的 cancel 不应泄漏到新回合
-        thread = threading.Thread(
-            target=self._run_turn, args=(session_id, text, images), daemon=True, name="zcode-turn"
-        )
-        self._turn_thread = thread
-        thread.start()
+            self._turn_thread = thread
+            thread.start()
 
     def _run_turn(self, session_id: str, text: str, images: list[str] | None = None) -> None:
         assert self._loop is not None
@@ -777,6 +832,17 @@ class ZcodeService:
             "mcp_refresh": self._control_mcp_refresh,
             "mcp_add": self._control_mcp_add,
             "mcp_remove": self._control_mcp_remove,
+            # M9（R3）：后台任务 / 定时任务 / 工作流
+            "background_start": self._control_background_start,
+            "tasks_list": self._control_tasks_list,
+            "task_stop": self._control_task_stop,
+            "cron_list": self._control_cron_list,
+            "cron_add": self._control_cron_add,
+            "cron_remove": self._control_cron_remove,
+            "cron_toggle": self._control_cron_toggle,
+            "workflow_run": self._control_workflow_run,
+            "workflows_list": self._control_workflows_list,
+            "inline_complete": self._control_inline_complete,
         }.get(msg.command)
         if handler is None:
             self._emit(Error(kind="protocol", message=f"unknown control command: {msg.command!r}"))
@@ -784,16 +850,16 @@ class ZcodeService:
         handler(msg)
 
     def _control_new_session(self, msg: Control) -> None:
-        if self._turn_alive():
-            self._emit(Error(kind="busy", message="cannot start a new session while a turn is running"))
+        if self._turn_alive() or self._workflow_alive():
+            self._emit(Error(kind="busy", message="cannot start a new session while a turn or workflow is running"))
             return
         self._ensure_config()
         self._start_session()
         self._emit(Result(ok=True, command="new_session"))
 
     def _control_resume(self, msg: Control) -> None:
-        if self._turn_alive():
-            self._emit(Error(kind="busy", message="cannot resume while a turn is running"))
+        if self._turn_alive() or self._workflow_alive():
+            self._emit(Error(kind="busy", message="cannot resume while a turn or workflow is running"))
             return
         session_id = msg.sessionId
         if not session_id:
@@ -940,8 +1006,8 @@ class ZcodeService:
         回合进行中拒绝（压缩要重建 loop.messages，与流式/工具执行竞态）；
         摘要模型失败时 manager 内部降级 L2，报告带 error+fallback 字段。
         """
-        if self._turn_alive():
-            self._emit(Error(kind="busy", message="cannot compact while a turn is running"))
+        if self._turn_alive() or self._workflow_alive():
+            self._emit(Error(kind="busy", message="cannot compact while a turn or workflow is running"))
             return
         loop = self._loop
         if loop is None:
@@ -1238,6 +1304,280 @@ class ZcodeService:
             self._workspace_cwd = Path(recorded).expanduser()
             self._checkpoints = CheckpointManager(self._workspace_cwd)
 
+    # ------------------------------------------------------------------ M9：后台任务 / 定时任务 / 工作流
+
+    def _workflow_alive(self) -> bool:
+        thread = self._workflow_thread
+        return thread is not None and thread.is_alive()
+
+    def _control_background_start(self, msg: Control) -> None:
+        """M9（R3）后台任务启动：daemon 线程跑 bash_backend.run_command
+        （timeout 透传默认 3600s；停止只能标记取消，见 background.py）。"""
+        command = msg.taskCommand
+        if not isinstance(command, str) or not command.strip():
+            self._emit(
+                Error(
+                    kind="protocol",
+                    message="background_start requires a non-empty 'taskCommand' "
+                    "(the control frame's own 'command' field names the control)",
+                )
+            )
+            return
+        timeout = DEFAULT_TASK_TIMEOUT_S
+        if msg.timeoutSec is not None:
+            if msg.timeoutSec <= 0:
+                self._emit(
+                    Error(kind="protocol", message="timeoutSec must be a positive number")
+                )
+                return
+            timeout = float(msg.timeoutSec)
+        record = self._background.start(
+            command, name=msg.name, timeout=timeout, cwd=self._workspace_cwd
+        )
+        self._emit(Result(ok=True, command="background_start", detail=record["taskId"]))
+
+    def _control_tasks_list(self, msg: Control) -> None:
+        """任务面板数据源：Result.detail JSON（state: running|finished|failed|
+        cancelled；outputTail 尾部 8KB）。"""
+        self._emit(
+            Result(
+                ok=True,
+                command="tasks_list",
+                detail=json.dumps(self._background.list_tasks(), ensure_ascii=False),
+            )
+        )
+
+    def _control_task_stop(self, msg: Control) -> None:
+        """停止标记（不强杀）：cancelRequested 置位，run_command 返回后置
+        cancelled；SIGKILL 级强杀待 bash_backend 可取消接口。"""
+        task_id = msg.taskId
+        if not task_id:
+            self._emit(Error(kind="protocol", message="task_stop requires taskId"))
+            return
+        ok, message = self._background.stop(task_id)
+        self._emit(Result(ok=ok, command="task_stop", detail=message))
+
+    def _control_cron_list(self, msg: Control) -> None:
+        self._emit(
+            Result(
+                ok=True,
+                command="cron_list",
+                detail=json.dumps(self._cron.list_jobs(), ensure_ascii=False),
+            )
+        )
+
+    def _control_cron_add(self, msg: Control) -> None:
+        """新增定时任务：schedule（标准 5 段）+ action（prompt|task）+ name? +
+        enabled（缺省 true）；校验失败回 config error（不落盘）。"""
+        if not msg.schedule or not msg.schedule.strip():
+            self._emit(Error(kind="protocol", message="cron_add requires 'schedule'"))
+            return
+        if msg.action is None:
+            self._emit(
+                Error(
+                    kind="protocol",
+                    message="cron_add requires 'action' {type:'prompt'|'task', text|command}",
+                )
+            )
+            return
+        job, error = self._cron.add(
+            schedule=msg.schedule,
+            action=msg.action,
+            name=msg.name,
+            enabled=True if msg.enabled is None else bool(msg.enabled),
+        )
+        if error is not None:
+            self._emit(Error(kind="config", message=error))
+            return
+        self._emit(Result(ok=True, command="cron_add", detail=job["id"]))
+
+    def _control_cron_remove(self, msg: Control) -> None:
+        if not msg.cronId:
+            self._emit(Error(kind="protocol", message="cron_remove requires cronId"))
+            return
+        ok, message = self._cron.remove(msg.cronId)
+        self._emit(Result(ok=ok, command="cron_remove", detail=message))
+
+    def _control_cron_toggle(self, msg: Control) -> None:
+        """启停切换：enabled 缺省 = 取反。"""
+        if not msg.cronId:
+            self._emit(Error(kind="protocol", message="cron_toggle requires cronId"))
+            return
+        job, error = self._cron.toggle(msg.cronId, msg.enabled)
+        if error is not None:
+            self._emit(Result(ok=False, command="cron_toggle", detail=error))
+            return
+        self._emit(
+            Result(
+                ok=True,
+                command="cron_toggle",
+                detail=json.dumps(job, ensure_ascii=False),
+            )
+        )
+
+    def _control_workflows_list(self, msg: Control) -> None:
+        """扫描 ~/.zcode-py/workflows/*.py（坏文件降级 error 条目）。"""
+        self._emit(
+            Result(
+                ok=True,
+                command="workflows_list",
+                detail=json.dumps(
+                    self._workflows.list_workflows(), ensure_ascii=False
+                ),
+            )
+        )
+
+    def _control_inline_complete(self, msg: Control) -> None:
+        """R13 内联补全（chat 模型模拟 FIM）：宿主 inlineCompletion 触发。
+
+        provider 调用在 daemon 线程（读线程不阻塞）；一切失败以
+        Result.ok=False 静默降级（宿主超时 5s 自弃，不弹 UI 噪音）。
+        prefix/suffix 缺省时尝试 query JSON 双通道（宿主侧提案形态）。
+        """
+        prefix, suffix, path = msg.prefix, msg.suffix, msg.path
+        if prefix is None and msg.query:
+            try:
+                data = json.loads(msg.query)
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict):
+                prefix = data.get("prefix") if prefix is None else prefix
+                suffix = data.get("suffix") if suffix is None else suffix
+                path = data.get("path") if path is None else path
+        if prefix is None:
+            self._emit(
+                Result(ok=False, command="inline_complete", detail="missing prefix")
+            )
+            return
+
+        def run() -> None:
+            try:
+                entry = self._provider_entry or {}
+                provider = self._factory(entry, api_key_for(entry.get("id") or "", self._api_key_env))
+                request = LLMRequest(
+                    model=self.model_id,
+                    messages=[
+                        LLMUserMessage(
+                            [
+                                TextBlock(
+                                    "You are a code completion engine. Given the "
+                                    "code before and after the cursor, output ONLY "
+                                    "the text to insert at the cursor (no fences, "
+                                    "no explanations, at most ~5 lines).\n\n"
+                                    f"File: {path or 'untitled'}\n"
+                                    "=== BEFORE CURSOR ===\n"
+                                    f"{prefix[-4000:]}\n"
+                                    "=== AFTER CURSOR ===\n"
+                                    f"{(suffix or '')[:1500]}\n"
+                                    "=== INSERT TEXT ==="
+                                )
+                            ]
+                        )
+                    ],
+                    system=None,
+                    tools=None,
+                    thinking=None,
+                    max_tokens=160,
+                )
+                chunks: list[str] = []
+                for event in provider.stream(request):
+                    if isinstance(event, TextDelta) and event.text:
+                        chunks.append(event.text)
+                self._emit(Result(ok=True, command="inline_complete", detail="".join(chunks)))
+            except Exception as exc:  # noqa: BLE001 —— 补全失败静默降级
+                self._emit(
+                    Result(ok=False, command="inline_complete", detail=f"{type(exc).__name__}: {exc}")
+                )
+
+        threading.Thread(target=run, daemon=True, name="zcode-inline").start()
+
+    def _control_workflow_run(self, msg: Control) -> None:
+        """执行工作流：校验 + 起工作流线程（报告经 result 帧异步返回——逐步
+        是真实 LLM 子回合，不能占读线程，否则权限卡应答会被饿死）。"""
+        if self._turn_alive() or self._workflow_alive():
+            self._emit(
+                Error(kind="busy", message="cannot start a workflow while a turn or workflow is running")
+            )
+            return
+        name = (msg.name or "").strip()
+        if not name:
+            self._emit(Error(kind="protocol", message="workflow_run requires a non-empty 'name'"))
+            return
+        try:
+            self._workflows.load(name)  # 仅校验可加载（报告由工作流线程产出）
+        except WorkflowError as exc:
+            self._emit(Error(kind="not_found", message=str(exc)))
+            return
+        if self._provider is None:
+            self._emit(
+                Error(
+                    kind="config",
+                    message=self._provider_error or "no provider configured",
+                )
+            )
+            return
+        self._cancel.clear()  # 陈旧 cancel 不应秒杀工作流（与 user_message 同口径）
+        thread = threading.Thread(
+            target=self._run_workflow, args=(name,), daemon=True, name="zcode-workflow"
+        )
+        self._workflow_thread = thread
+        thread.start()
+
+    def _run_workflow(self, name: str) -> None:
+        """工作流线程：逐步受限子代理（前步结果作下步上下文前缀），完成广播
+        报告（result.detail JSON）。ChildRuntime 每次运行即时构造——cwd 跟随
+        set_root，不复用主会话 ctx 里绑定了旧 cwd 的实例。"""
+        runtime = ChildRuntime(
+            registry=self._registry,
+            permissions=self._permissions_engine
+            or MemoryPermissionEngine(allow_rules=[]),
+            cwd=self._workspace_cwd,
+            emit=self._emit,
+            ask_permission=self._ask_permission,
+            review_diff=self._review_diff,
+            provider_supplier=lambda: (
+                self._provider, self.model_id, self._provider_entry
+            ),
+            factory=self._factory,
+            config_supplier=lambda: self._config or {},
+            api_key_env=self._api_key_env,
+            main_cancel=self._cancel,
+        )
+        try:
+            report = self._workflows.run(
+                name,
+                step_runner=lambda prompt, model: runtime.run(
+                    {"prompt": prompt, "model": model}
+                ),
+                cancel_event=self._cancel,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 报告帧必须发出，否则 UI 永等
+            report = {
+                "workflow": name,
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "total": 0,
+                "completed": 0,
+                "steps": [],
+            }
+        self._emit(
+            Result(
+                ok=bool(report.get("ok")),
+                command="workflow_run",
+                detail=json.dumps(report, ensure_ascii=False),
+            )
+        )
+
+    def _cron_inject_prompt(self, text: str) -> None:
+        """cron prompt 动作：走与读线程同一条用户消息路径（busy 闸门 / 检查点 /
+        转录 / 回合线程全复用）；并发安全由 _on_user_message 的 _intake_lock
+        保证（M9 注释见彼处）。"""
+        self._on_user_message(UserMessage(text=text))
+
+    def _cron_start_task(self, command: str, name: str | None):
+        """cron task 动作：经后台任务执行（bash_backend 唯一执行点）。"""
+        return self._background.start(command, name=name, cwd=self._workspace_cwd)
+
     # ------------------------------------------------------------------ M2：权限 / diff 审阅 / 回滚
 
     def _ask_permission(self, tool: str, args: dict) -> str:
@@ -1293,8 +1633,8 @@ class ZcodeService:
         确认语义：rollback 帧本身即用户显式动作（UI「回滚到这」按钮带确认），
         核侧收到即执行——协议 v1 无二次确认往返（PLAN §5）。
         """
-        if self._turn_alive():
-            self._emit(Error(kind="busy", message="cannot roll back while a turn is running"))
+        if self._turn_alive() or self._workflow_alive():
+            self._emit(Error(kind="busy", message="cannot roll back while a turn or workflow is running"))
             return
         if self._checkpoints is None or not self._checkpoints.available:
             self._emit(RollbackResult(ok=False))

@@ -53,6 +53,21 @@ CONTROL_COMMANDS = (
     "mcp_refresh",
     "mcp_add",
     "mcp_remove",
+    # M9（R3）：后台任务面板——启动 / 列表（Result.detail JSON）/ 停止标记
+    "background_start",
+    "tasks_list",
+    "task_stop",
+    # M9（R3）：定时任务面板——列表 / 新增 / 删除 / 启停
+    "cron_list",
+    "cron_add",
+    "cron_remove",
+    "cron_toggle",
+    # M9（R3）：工作流编排——执行（报告经 Result）与列表
+    "workflow_run",
+    "workflows_list",
+    # M9（R13）：内联补全（chat 模型模拟 FIM；宿主 inlineCompletion 发起，
+    # detail = 插入文本，超时/失败一律 Result.ok=False 静默降级）
+    "inline_complete",
 )
 PERMISSION_DECISIONS = ("allow", "deny", "always")
 TOOL_CALL_STATES = ("started", "update", "finished")
@@ -144,8 +159,21 @@ class Control:
     query: str | None = None  # search_sessions：搜索关键词
     # M8 扩展参数（同上约定：各命令只取自己所需，其余忽略）
     mode: str | None = None  # set_permission_mode：build | plan | yolo
-    name: str | None = None  # mcp_add / mcp_remove：server 名
+    name: str | None = None  # mcp_add / mcp_remove：server 名；background_start：任务名；workflow_run：工作流名
     server: dict | None = None  # mcp_add：{command: [argv], env?, cwd?}（与 name 配套）
+    # M9 扩展参数（同上约定）
+    # background_start：要后台执行的 shell 命令串（协议层的 control.command 已被
+    # 控制命令名占用，载荷里的「command」依此命名承载）
+    taskCommand: str | None = None
+    timeoutSec: float | None = None  # background_start：run_command 超时（缺省 3600）
+    taskId: str | None = None  # task_stop：后台任务 id
+    schedule: str | None = None  # cron_add：标准 5 段 cron 表达式（*/5 * * * *）
+    action: dict | None = None  # cron_add：{type:"prompt",text} | {type:"task",command}
+    cronId: str | None = None  # cron_remove / cron_toggle：条目 id
+    enabled: bool | None = None  # cron_add 缺省 true；cron_toggle 缺省取反
+    prefix: str | None = None  # inline_complete：光标前文
+    suffix: str | None = None  # inline_complete：光标后文
+    path: str | None = None  # inline_complete：文件路径（提示词语境用）
 
 
 @dataclass
@@ -304,6 +332,34 @@ class ImageArtifact:
 
 
 @dataclass
+class TaskStarted:
+    """M9（R3）后台任务启动。name 缺省取命令首词（任务面板显示名）。"""
+
+    taskId: str
+    name: str
+    command: str
+
+
+@dataclass
+class TaskOutput:
+    """后台任务输出尾部（≤8KB 环形）。监测线程在尾部变化时至多每 2s 广播
+    一次；命令结束时（run_command 返回）必发一次最终尾部——当前 bash_backend
+    是整段阻塞返回，实际中间帧在有流式后端前不会出现，机制先行。"""
+
+    taskId: str
+    tail: str
+
+
+@dataclass
+class TaskFinished:
+    """后台任务收尾（终态 finished | failed | cancelled 须经 tasks_list 查询；
+    cancelled = task_stop 已标记且命令已返回，见 background.py docstring）。"""
+
+    taskId: str
+    exitCode: int
+
+
+@dataclass
 class Error:
     kind: str
     message: str
@@ -370,6 +426,9 @@ _register("usage")(Usage)
 _register("ping_result")(PingResult)
 _register("git_result")(GitResult)
 _register("image_artifact")(ImageArtifact)
+_register("task_started")(TaskStarted)
+_register("task_output")(TaskOutput)
+_register("task_finished")(TaskFinished)
 _register("error")(Error)
 _register("result")(Result)
 
@@ -409,6 +468,9 @@ CoreToShellMessage = Union[  # noqa: UP007
     PingResult,
     GitResult,
     ImageArtifact,
+    TaskStarted,
+    TaskOutput,
+    TaskFinished,
     Error,
     Result,
 ]

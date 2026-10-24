@@ -22,6 +22,10 @@
  *    permission_mode / mcp_list / mcp_refresh / mcp_add / mcp_remove 为
  *    Python 侧并行定稿项（约定见 docs/MCP_BACKEND_SPEC.md），宿主镜像
  *    枚举暂缺（宽容转发不影响，核心未识别时回 error 帧由 UI 宽容消化）
+ *  - M9（R3/R13）：新帧 task_started/task_output/task_finished 与新命令
+ *    tasks_list/task_stop/cron_list/cron_add/cron_remove/cron_toggle/
+ *    workflow_run/workflows_list 已双侧镜像（宿主 protocol.ts 同步落地；
+ *    Python 侧并行定稿中——未识别命令回 error 帧，UI 静默降级）
  */
 
 /* ---------- 基础类型（镜像 extension/src/protocol.ts） ---------- */
@@ -189,6 +193,14 @@ export type CoreEvent =
       error?: string;
     }
   | { type: 'image_artifact'; path: string }
+  /**
+   * M9（R3）：后台任务事件帧（Python 侧并行定稿，字段宽容——归一在 store
+   * 归约器：taskId 兼容 id/task_id 命名；status 宽容 done/failed/stopped）。
+   * task_output 为增量追加，UI 侧滚动窗口截尾（≤4KB，store TASK_TAIL_LIMIT）。
+   */
+  | { type: 'task_started'; taskId: string; name?: string; command?: string; atMs?: number }
+  | { type: 'task_output'; taskId: string; text: string; stream?: string }
+  | { type: 'task_finished'; taskId: string; status?: string; exitCode?: number; detail?: string }
   | { type: 'error'; kind: string; message: string }
   /**
    * control 命令通用回执（protocol.py Result）。export 命令经 markdown 携带
@@ -256,7 +268,20 @@ export type CoreSend =
         | 'mcp_list'
         | 'mcp_refresh'
         | 'mcp_add'
-        | 'mcp_remove';
+        | 'mcp_remove'
+        // M9（R3/R13，Python 侧并行定稿）：后台任务 / 定时任务 / 工作流 /
+        // 内联补全（inline_complete 由宿主侧发起，webview 不发）。列表类
+        // 命令（tasks_list / cron_list / workflows_list）回执走
+        // result.detail JSON（数组或 {items:[...]} 均收，宽容解析见 store）；
+        // 增删启停即时生效；核心未识别命令时回 error 帧由 UI 宽容消化。
+        | 'tasks_list'
+        | 'task_stop'
+        | 'cron_list'
+        | 'cron_add'
+        | 'cron_remove'
+        | 'cron_toggle'
+        | 'workflow_run'
+        | 'workflows_list';
       sessionId?: string;
       level?: string;
       providerId?: string;
@@ -287,6 +312,15 @@ export type CoreSend =
       args?: string;
       /** M8 提案字段（mcp_add）：子进程环境变量键值 */
       env?: Record<string, string>;
+      /** M9 提案字段：task_stop 的目标任务 id；cron_remove/cron_toggle 的
+       *  定时任务名；workflow_run 的工作流名（与 name 通道二选一，双发） */
+      taskId?: string;
+      /** M9 提案字段（cron_add）：cron 调度表达式（7 段或描述文本） */
+      schedule?: string;
+      /** M9 提案字段（cron_add）：prompt 型动作文本（command 型用 args） */
+      prompt?: string;
+      /** M9 提案字段（cron_toggle）：目标启停态 */
+      enabled?: boolean;
     };
 
 /* ---------- webview ↔ 宿主 RPC ---------- */
@@ -521,12 +555,58 @@ export interface RpcErrorInfo {
   message: string;
 }
 
-/** 后台任务（M9 完整落地，tasks 切片先建） */
+/**
+ * 后台任务投影（M9 完整落地）。数据源双轨：
+ *  - 事件帧 task_started / task_output / task_finished 增量归约（store.applyEvent）
+ *  - control tasks_list 回执 result.detail JSON 全量覆盖（宽容解析
+ *    parseTasksDetail：数组或 {items:[...]}；id 兼容 taskId/task_id，
+ *    status 宽容 done/failed/stopped/cancelled…）
+ */
 export interface BackgroundTask {
   id: string;
   name: string;
-  status: 'running' | 'done' | 'failed';
+  status: 'running' | 'done' | 'failed' | 'stopped';
+  /** 发起命令行（bash 后台/工作流步骤带出；缺省显示 id） */
+  command?: string;
+  /** 启动时刻（epoch ms；帧缺省时为帧到达时刻） */
+  startedAt?: number;
+  /** 终态时刻（epoch ms） */
+  endedAt?: number;
+  /** 尾部输出滚动窗口（≤4KB，task_output 增量追加、超限丢头） */
+  tail?: string;
+  exitCode?: number;
+  /** 终态附注（失败原因等） */
   detail?: string;
+}
+
+/**
+ * 定时任务条目（M9；cron_list 回执 result.detail JSON 宽容解析产物）。
+ * Python 侧并行定稿：name 必有（兼容 id），schedule/action/enabled 宽容
+ * （action 兼容 prompt/command 命名，kind 缺省按内容推断）。
+ */
+export interface CronEntry {
+  name: string;
+  /** cron 调度（7 段表达式或描述文本，原样展示） */
+  schedule: string;
+  /** 动作：prompt 文本或 command 命令行 */
+  action?: string;
+  /** 动作类型（宽容缺省：action 以字母开头且含空格→按内容猜，展示端兜底 '—'） */
+  kind?: 'prompt' | 'command' | string;
+  enabled: boolean;
+  [key: string]: unknown;
+}
+
+/**
+ * 工作流条目（M9；workflows_list 回执 result.detail JSON 宽容解析产物）。
+ * name 必有（兼容 id）；description/path 可选。运行态不落列表——由
+ * workflowRuns（store 切片，按 name 记 running/done/failed + 报告）承载。
+ */
+export interface WorkflowInfo {
+  name: string;
+  description?: string;
+  /** 工作流定义文件路径（SKILL.md 同款来源展示） */
+  path?: string;
+  [key: string]: unknown;
 }
 
 export interface TodoItem {

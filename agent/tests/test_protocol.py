@@ -29,6 +29,18 @@ def _samples() -> list:
         P.Control(command="export", sessionId="s1"),
         P.Control(command="set_root", rootIndex=1),
         P.Control(command="set_root", rootPath="/w/b"),
+        # M9：后台任务 / 定时任务 / 工作流载荷（taskCommand 承载 shell 命令串）
+        P.Control(command="background_start", taskCommand="python train.py", name="train"),
+        P.Control(command="background_start", taskCommand="sleep 5", timeoutSec=60.5),
+        P.Control(command="task_stop", taskId="bg_ab12"),
+        P.Control(command="cron_add", schedule="*/5 * * * *",
+                  action={"type": "prompt", "text": "总结进展"}),
+        P.Control(command="cron_add", schedule="0 9 * * 1-5",
+                  action={"type": "task", "command": "make report"}, enabled=False),
+        P.Control(command="cron_remove", cronId="cron_ab12"),
+        P.Control(command="cron_toggle", cronId="cron_ab12", enabled=True),
+        P.Control(command="workflow_run", name="daily-report"),
+        P.Control(command="workflows_list"),
         P.Rollback(checkpointId="ck1"),
         P.GitCommit(repoRoot="/r", scope="staged", push=False),
         P.SessionStarted(sessionId="s1"),
@@ -54,6 +66,11 @@ def _samples() -> list:
         P.PingResult(ok=False, errorKind="auth", message="bad key"),
         P.GitResult(commitSha="a1", remoteUrl="https://x", commitUrl="https://y", prUrl=None, error=None),
         P.ImageArtifact(path="/tmp/a.png"),
+        # M9（R3）：后台任务帧
+        P.TaskStarted(taskId="bg_1", name="train", command="python train.py"),
+        P.TaskOutput(taskId="bg_1", tail="epoch 34/100"),
+        P.TaskFinished(taskId="bg_1", exitCode=0),
+        P.TaskFinished(taskId="bg_2", exitCode=-1),
         P.Error(kind="auth", message="x"),
         P.Result(ok=True, command="telegraph", detail="downshifted"),
         # M4：export 回执携带 Markdown 全文（保存落盘由 UI 决定）
@@ -147,6 +164,7 @@ def test_registry_covers_plan_section5():
         "message_complete", "tool_call", "permission_request", "diff_proposed",
         "vision_relay", "telegraph_state", "perf", "env_info", "compaction",
         "checkpoint", "rollback_result", "sessions_list", "usage", "ping_result",
-        "git_result", "image_artifact", "error", "result",
+        "git_result", "image_artifact", "task_started", "task_output",
+        "task_finished", "error", "result",
     }
     assert set(P._REGISTRY) == expected

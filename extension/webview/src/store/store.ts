@@ -13,6 +13,7 @@ import { RpcTimeoutError, getVsCodeApi, hostRequest, hostSendCore } from '../hos
 import type {
   BackgroundTask,
   CoreEvent,
+  CronEntry,
   GetStateResult,
   HardwareInfo,
   McpServerInfo,
@@ -25,6 +26,7 @@ import type {
   TelegraphLevel,
   TodoItem,
   UserMessageContext,
+  WorkflowInfo,
   WorkspaceLang,
 } from '../protocol';
 import { FORK_AT_LAST_USER_MESSAGE } from '../protocol';
@@ -261,8 +263,56 @@ export interface WebviewStore {
   /** 删除服务：control mcp_remove */
   removeMcpServer(name: string): void;
 
-  /* ---- 切片：tasks ---- */
+  /* ---- 切片：tasks（M9，R3/§6.5） ---- */
+  /** 后台任务投影：task_started/output/finished 帧增量归约 + tasks_list 回执全量 */
   tasks: BackgroundTask[];
+  tasksRefreshing: boolean;
+  /** 是否已请求过一次（运行中页签首开自动拉取的幂等标记） */
+  tasksRequested: boolean;
+  /** ⏹停止（task_stop）进行中的任务 id → 按钮禁用 */
+  taskStopping: Record<string, boolean>;
+  /** 任务耗时走表 tick（TasksView 存在运行中任务时秒级更新，驱动重渲染） */
+  taskTick?: number;
+  /** 发 control tasks_list（首开/手动刷新；回执 result.detail JSON 宽容解析） */
+  refreshTasks(): void;
+  /** 发 control task_stop{taskId}（终态以 task_finished 帧为准） */
+  stopTask(taskId: string): void;
+
+  /* ---- 切片：crons（M9，§6.5 定时任务） ---- */
+  crons: CronEntry[];
+  cronsRefreshing: boolean;
+  /** 是否已请求过一次（定时任务页签首开自动拉取的幂等标记） */
+  cronsRequested: boolean;
+  /** 新建/删除/启停进行中（单飞：表单与行按钮禁用；15s 兜底） */
+  cronPendingAction?: 'add' | 'remove' | 'toggle';
+  cronNotice?: { kind: 'info' | 'error'; text: string };
+  /** 发 control cron_list */
+  refreshCrons(): void;
+  /**
+   * 发 control cron_add —— prompt 型（schedule + prompt 文本）或 command 型
+   * （schedule + 命令行）；双通道载荷（schedule/prompt/args 专用字段 +
+   * query JSON 镜像），成功自动回拉列表。
+   */
+  addCron(input: { schedule: string; prompt?: string; command?: string }): void;
+  /** 发 control cron_remove{name} */
+  removeCron(name: string): void;
+  /** 发 control cron_toggle{name, enabled}（乐观翻转，!ok 回执由回拉纠正） */
+  toggleCron(name: string, enabled: boolean): void;
+
+  /* ---- 切片：workflows（M9，§6.5 工作流） ---- */
+  workflows: WorkflowInfo[];
+  workflowsRefreshing: boolean;
+  /** 是否已请求过一次（工作流页签首开自动拉取的幂等标记） */
+  workflowsRequested: boolean;
+  /** 按工作流名的最近一次运行态（运行中标记 / 报告宽容渲染） */
+  workflowRuns: Record<string, { status: 'running' | 'done' | 'failed'; report?: string; at: number }>;
+  /** workflow_run 在途的工作流名（result 回执不带目标，单飞对账锚） */
+  pendingWorkflowRun?: string;
+  workflowNotice?: { kind: 'info' | 'error'; text: string };
+  /** 发 control workflows_list */
+  refreshWorkflows(): void;
+  /** 发 control workflow_run{name}（运行态沿 workflowRuns + 工具卡显示） */
+  runWorkflow(name: string): void;
 
   /* ---- 输入态 ---- */
   inputDraft: string;
@@ -487,6 +537,123 @@ export function parseMcpDetail(detail?: string): McpServerInfo[] {
   return out;
 }
 
+/* ---------- M9：后台任务 / 定时任务 / 工作流宽容解析 ---------- */
+
+/** task_output 尾部输出滚动窗口上限（§6.5 任务卡「尾部输出 ≤4KB」） */
+export const TASK_TAIL_LIMIT = 4_096;
+
+/** 追加并截尾：超限丢头保留最新 4KB */
+function clampTail(text: string): string {
+  return text.length <= TASK_TAIL_LIMIT ? text : text.slice(text.length - TASK_TAIL_LIMIT);
+}
+
+/** result.detail（JSON 字符串）→ 条目数组：数组本身，或 {items:[...]} /
+ *  {<pluralKey>:[...]} 包裹均收（Python 侧并行定稿，形状宽容） */
+function parseDetailItems(detail: string | undefined, pluralKey?: string): unknown[] {
+  if (typeof detail !== 'string' || detail === '') return [];
+  let data: unknown;
+  try {
+    data = JSON.parse(detail);
+  } catch {
+    return [];
+  }
+  if (Array.isArray(data)) return data;
+  if (data !== null && typeof data === 'object') {
+    const o = data as Record<string, unknown>;
+    for (const k of [pluralKey, 'items', 'list', 'entries']) {
+      if (k !== undefined && Array.isArray(o[k])) return o[k] as unknown[];
+    }
+  }
+  return [];
+}
+
+function asStr(v: unknown): string | undefined {
+  return typeof v === 'string' && v !== '' ? v : undefined;
+}
+
+function asNum(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+}
+
+/** 终态字符串归一（宽容：done/ok/success…→done；fail/error…→failed；stop/cancel…→stopped） */
+function normTaskStatus(v: unknown): BackgroundTask['status'] {
+  const s = typeof v === 'string' ? v.toLowerCase() : '';
+  if (['fail', 'failed', 'error', 'crashed'].includes(s)) return 'failed';
+  if (['stop', 'stopped', 'cancel', 'cancelled', 'canceled', 'killed'].includes(s)) return 'stopped';
+  return 'done'; // done/ok/success/缺省
+}
+
+/** tasks_list 回执 → BackgroundTask[]（id 兼容 taskId/task_id；tail/时间戳宽容） */
+export function parseTasksDetail(detail?: string): BackgroundTask[] {
+  const out: BackgroundTask[] = [];
+  for (const x of parseDetailItems(detail, 'tasks')) {
+    if (x === null || typeof x !== 'object') continue;
+    const o = x as Record<string, unknown>;
+    const id = asStr(o.taskId) ?? asStr(o.task_id) ?? asStr(o.id);
+    if (id === undefined) continue;
+    const status = asStr(o.status);
+    out.push({
+      id,
+      name: asStr(o.name) ?? asStr(o.title) ?? asStr(o.command) ?? id,
+      command: asStr(o.command) ?? asStr(o.cmd),
+      status: status === 'running' ? 'running' : normTaskStatus(status),
+      startedAt: asNum(o.startedAt) ?? asNum(o.started_at) ?? asNum(o.at),
+      endedAt: asNum(o.endedAt) ?? asNum(o.ended_at),
+      tail: asStr(o.tail) ?? asStr(o.output),
+      exitCode: asNum(o.exitCode) ?? asNum(o.exit_code),
+      detail: asStr(o.detail) ?? asStr(o.error),
+    });
+  }
+  return out;
+}
+
+/** cron_list 回执 → CronEntry[]（name 兼容 id；schedule 兼容 cron/expr；
+ *  action 兼容 prompt/command；enabled 宽容缺省 true） */
+export function parseCronsDetail(detail?: string): CronEntry[] {
+  const out: CronEntry[] = [];
+  for (const x of parseDetailItems(detail, 'crons')) {
+    if (x === null || typeof x !== 'object') continue;
+    const o = x as Record<string, unknown>;
+    const name = asStr(o.name) ?? asStr(o.id);
+    if (name === undefined) continue;
+    out.push({
+      name,
+      schedule: asStr(o.schedule) ?? asStr(o.cron) ?? asStr(o.expr) ?? '—',
+      action: asStr(o.action) ?? asStr(o.prompt) ?? asStr(o.command),
+      kind: asStr(o.kind) ?? asStr(o.type),
+      enabled: typeof o.enabled === 'boolean' ? o.enabled : typeof o.active === 'boolean' ? o.active : true,
+    });
+  }
+  return out;
+}
+
+/** workflows_list 回执 → WorkflowInfo[]（name 兼容 id；description/path 宽容） */
+export function parseWorkflowsDetail(detail?: string): WorkflowInfo[] {
+  const out: WorkflowInfo[] = [];
+  for (const x of parseDetailItems(detail, 'workflows')) {
+    if (x === null || typeof x !== 'object') continue;
+    const o = x as Record<string, unknown>;
+    const name = asStr(o.name) ?? asStr(o.id);
+    if (name === undefined) continue;
+    out.push({
+      name,
+      description: asStr(o.description) ?? asStr(o.summary) ?? asStr(o.doc),
+      path: asStr(o.path) ?? asStr(o.source) ?? asStr(o.file),
+    });
+  }
+  return out;
+}
+
+/** tasks_list 全量快照合并：以回执为准，保留既有任务的尾部输出（帧归约的
+ *  增量信息不丢） */
+function mergeTasks(prev: BackgroundTask[], next: BackgroundTask[]): BackgroundTask[] {
+  return next.map((t) => {
+    const old = prev.find((x) => x.id === t.id);
+    if (old === undefined) return t;
+    return t.tail === undefined && old.tail !== undefined ? { ...t, tail: old.tail } : t;
+  });
+}
+
 /* ---------- M8：compaction.report 宽容提取 ---------- */
 
 function asCount(v: unknown): number | undefined {
@@ -548,6 +715,83 @@ function extractCompaction(
 }
 
 /**
+ * M9 result 回执归约（自描述命令，无需 pendingControl）：
+ *  - tasks_list / cron_list / workflows_list：detail JSON 宽容解析覆盖切片，
+ *    解锁刷新 busy；!ok 时保留旧表并带错误提示
+ *  - task_stop：解锁停止按钮（终态以 task_finished 帧为准）
+ *  - cron_add / cron_remove / cron_toggle：提示 + 成功自动回拉列表
+ *  - workflow_run：消费 pendingWorkflowRun 对账锚 → 运行态落定 + 报告
+ * 返回 true = 已消费（旧闸门跳过）。
+ */
+function reduceM9Result(
+  e: Extract<CoreEvent, { type: 'result' }>,
+  get: StoreGet,
+  set: StoreSet,
+): boolean {
+  switch (e.command) {
+    case 'tasks_list': {
+      set((s) => ({
+        tasksRefreshing: false,
+        tasks: e.ok ? mergeTasks(s.tasks, parseTasksDetail(e.detail)) : s.tasks,
+      }));
+      return true;
+    }
+    case 'task_stop': {
+      set((s) => {
+        if (Object.keys(s.taskStopping).length === 0) return {};
+        return { taskStopping: {} };
+      });
+      return true;
+    }
+    case 'cron_list': {
+      set((s) => ({
+        cronsRefreshing: false,
+        crons: e.ok ? parseCronsDetail(e.detail) : s.crons,
+        cronNotice: e.ok ? s.cronNotice : { kind: 'error' as const, text: e.detail ?? '定时任务列表获取失败' },
+      }));
+      return true;
+    }
+    case 'cron_add':
+    case 'cron_remove':
+    case 'cron_toggle': {
+      set({
+        cronPendingAction: undefined,
+        cronNotice: {
+          kind: e.ok ? 'info' : 'error',
+          text: e.detail ?? (e.ok ? '操作成功' : '操作失败'),
+        },
+      });
+      if (e.ok) useStore.getState().refreshCrons();
+      return true;
+    }
+    case 'workflows_list': {
+      set((s) => ({
+        workflowsRefreshing: false,
+        workflows: e.ok ? parseWorkflowsDetail(e.detail) : s.workflows,
+        workflowNotice: e.ok ? s.workflowNotice : { kind: 'error' as const, text: e.detail ?? '工作流列表获取失败' },
+      }));
+      return true;
+    }
+    case 'workflow_run': {
+      const name = get().pendingWorkflowRun;
+      set((s) => ({
+        pendingWorkflowRun: undefined,
+        workflowRuns:
+          name !== undefined
+            ? {
+                ...s.workflowRuns,
+                [name]: { status: e.ok ? 'done' : 'failed', report: e.detail, at: Date.now() },
+              }
+            : s.workflowRuns,
+      }));
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+/**
  * result 回执归约（M4）：按 pendingControl 对账（result 帧不带 sessionId，
  * command 匹配才消费），处理 export 落盘 / fork / pin / resume 的 busy 与提示。
  * export 的 markdown 经宿主 workspace.saveExport RPC 落盘（R12：核心只产文本）。
@@ -557,6 +801,9 @@ function reduceResult(
   get: StoreGet,
   set: StoreSet,
 ): void {
+  // M9：任务/定时任务/工作流命令的回执自描述（result.command 携带完整
+  // 语义）——不依赖 pendingControl 单槽对账，先于旧闸门处理
+  if (reduceM9Result(e, get, set)) return;
   const pend = get().pendingControl;
   if (pend === undefined || e.command !== pend.command) return;
   const sessionId = pend.sessionId;
@@ -686,6 +933,20 @@ export const useStore = create<WebviewStore>()((set, get) => ({
   mcpPendingAction: undefined,
   mcpNotice: undefined,
   tasks: [],
+  tasksRefreshing: false,
+  tasksRequested: false,
+  taskStopping: {},
+  crons: [],
+  cronsRefreshing: false,
+  cronsRequested: false,
+  cronPendingAction: undefined,
+  cronNotice: undefined,
+  workflows: [],
+  workflowsRefreshing: false,
+  workflowsRequested: false,
+  workflowRuns: {},
+  pendingWorkflowRun: undefined,
+  workflowNotice: undefined,
   inputDraft: '',
 
   setInputDraft: (text) => {
@@ -1004,11 +1265,116 @@ export const useStore = create<WebviewStore>()((set, get) => ({
         }));
         break;
       }
+      case 'task_started': {
+        // M9（R3/§6.5）：后台任务卡 upsert（tasks_list 已见过的任务保留尾部输出）
+        set((s) => {
+          const idx = s.tasks.findIndex((t) => t.id === e.taskId);
+          const tasks = s.tasks.slice();
+          if (idx >= 0) {
+            const prev = tasks[idx];
+            tasks[idx] = {
+              ...prev,
+              name: e.name ?? prev.name,
+              command: e.command ?? prev.command,
+              status: 'running',
+              startedAt: e.atMs ?? prev.startedAt ?? Date.now(),
+              endedAt: undefined,
+              exitCode: undefined,
+              detail: undefined,
+            };
+          } else {
+            tasks.push({
+              id: e.taskId,
+              name: e.name ?? e.command ?? e.taskId,
+              command: e.command,
+              status: 'running',
+              startedAt: e.atMs ?? Date.now(),
+            });
+          }
+          return { tasks };
+        });
+        break;
+      }
+      case 'task_output': {
+        // 增量追加 + 4KB 滚动窗口截尾；未见 task_started 的迟到输出 upsert 占位卡
+        set((s) => {
+          const exists = s.tasks.some((t) => t.id === e.taskId);
+          if (exists) {
+            return {
+              tasks: s.tasks.map((t) =>
+                t.id === e.taskId ? { ...t, tail: clampTail(`${t.tail ?? ''}${e.text}`) } : t,
+              ),
+            };
+          }
+          return {
+            tasks: [
+              ...s.tasks,
+              {
+                id: e.taskId,
+                name: e.taskId,
+                status: 'running' as const,
+                startedAt: Date.now(),
+                tail: clampTail(e.text),
+              },
+            ],
+          };
+        });
+        break;
+      }
+      case 'task_finished': {
+        set((s) => ({
+          tasks: s.tasks.map((t) =>
+            t.id === e.taskId
+              ? {
+                  ...t,
+                  status: normTaskStatus(e.status),
+                  endedAt: Date.now(),
+                  exitCode: e.exitCode ?? t.exitCode,
+                  detail: e.detail ?? t.detail,
+                }
+              : t,
+          ),
+        }));
+        break;
+      }
       case 'error': {
         // M8 宽容：permission_mode 未被核心识别时回 error 帧 —— 本地 UI 态
         // 已先行生效（setPermissionMode 乐观切换），此类错误不入聊天流
         // （不打断交互；Python 侧并行实现落地后帧自然消失）
         if (e.message.includes('permission_mode')) break;
+        // M9 宽容同款：任务/定时任务/工作流/补全命令未被核心识别（Python
+        // 并行定稿期常态）——解锁对应页签 busy 并把提示带过去，不入聊天流
+        // （页签首开即发列表命令，进聊天流会被 unknown control 噪音淹没）
+        if (
+          e.message.includes('tasks_list') ||
+          e.message.includes('task_stop') ||
+          e.message.includes('cron_') ||
+          e.message.includes('workflow') ||
+          e.message.includes('inline_complete')
+        ) {
+          const patch: Partial<WebviewStore> = {};
+          if (e.message.includes('tasks_list')) patch.tasksRefreshing = false;
+          if (e.message.includes('task_stop')) patch.taskStopping = {};
+          if (e.message.includes('cron_')) {
+            patch.cronsRefreshing = false;
+            patch.cronPendingAction = undefined;
+            patch.cronNotice = { kind: 'error', text: e.message };
+          }
+          if (e.message.includes('workflow')) {
+            patch.workflowsRefreshing = false;
+            patch.workflowNotice = { kind: 'error', text: e.message };
+            const name = get().pendingWorkflowRun;
+            if (name !== undefined) {
+              patch.pendingWorkflowRun = undefined;
+              patch.workflowRuns = {
+                ...get().workflowRuns,
+                [name]: { status: 'failed', report: e.message, at: Date.now() },
+              };
+            }
+          }
+          set(patch);
+          break;
+        }
         set((s) => ({
           chat: {
             ...s.chat,
@@ -1292,6 +1658,164 @@ export const useStore = create<WebviewStore>()((set, get) => ({
         useStore.setState({ mcpPendingAction: undefined });
       }
     }, 15_000);
+  },
+
+  /* ---------- M9：任务 / 定时任务 / 工作流（回执自描述，reduceM9Result 消费） ---------- */
+
+  refreshTasks: () => {
+    if (get().tasksRefreshing) return;
+    // control tasks_list → result{command:'tasks_list', detail:JSON}（宽容
+    // 解析 mergeTasks）。核心未实现时回 error 帧（上方 error 归约立即解锁）
+    // + 15s 兜底，沿 skills/mcp 同款模式。
+    set({ tasksRefreshing: true, tasksRequested: true });
+    hostSendCore({ type: 'control', command: 'tasks_list' });
+    window.setTimeout(() => {
+      if (useStore.getState().tasksRefreshing) {
+        useStore.setState({ tasksRefreshing: false });
+      }
+    }, 15_000);
+  },
+
+  stopTask: (taskId) => {
+    if (get().taskStopping[taskId]) return;
+    // control task_stop —— 双通道载荷（taskId/name 专用字段 + query JSON）；
+    // 终态以 task_finished 帧为准，result/error/15s 兜底只解锁按钮
+    set((s) => ({ taskStopping: { ...s.taskStopping, [taskId]: true } }));
+    hostSendCore({
+      type: 'control',
+      command: 'task_stop',
+      taskId,
+      name: taskId,
+      query: JSON.stringify({ taskId }),
+    });
+    window.setTimeout(() => {
+      if (useStore.getState().taskStopping[taskId]) {
+        const next = { ...useStore.getState().taskStopping };
+        delete next[taskId];
+        useStore.setState({ taskStopping: next });
+      }
+    }, 15_000);
+  },
+
+  refreshCrons: () => {
+    if (get().cronsRefreshing) return;
+    // control cron_list → result.detail JSON（parseCronsDetail 宽容解析）
+    set({ cronsRefreshing: true, cronsRequested: true });
+    hostSendCore({ type: 'control', command: 'cron_list' });
+    window.setTimeout(() => {
+      if (useStore.getState().cronsRefreshing) {
+        useStore.setState({ cronsRefreshing: false });
+      }
+    }, 15_000);
+  },
+
+  addCron: ({ schedule, prompt, command }) => {
+    if (get().cronPendingAction !== undefined) return;
+    const kind: 'prompt' | 'command' =
+      command !== undefined && command !== '' ? 'command' : 'prompt';
+    // control cron_add —— 双通道载荷：schedule/prompt/args 专用字段 +
+    // query JSON 镜像（{schedule, kind, prompt?, command?}）；成功自动回拉
+    set({ cronPendingAction: 'add', cronNotice: undefined });
+    hostSendCore({
+      type: 'control',
+      command: 'cron_add',
+      schedule,
+      prompt: kind === 'prompt' ? prompt : undefined,
+      args: kind === 'command' ? command : undefined,
+      query: JSON.stringify({
+        schedule,
+        kind,
+        prompt: kind === 'prompt' ? prompt : undefined,
+        command: kind === 'command' ? command : undefined,
+      }),
+    });
+    window.setTimeout(() => {
+      if (useStore.getState().cronPendingAction === 'add') {
+        useStore.setState({ cronPendingAction: undefined });
+      }
+    }, 15_000);
+  },
+
+  removeCron: (name) => {
+    if (get().cronPendingAction !== undefined) return;
+    set({ cronPendingAction: 'remove', cronNotice: undefined });
+    hostSendCore({
+      type: 'control',
+      command: 'cron_remove',
+      name,
+      query: JSON.stringify({ name }),
+    });
+    window.setTimeout(() => {
+      if (useStore.getState().cronPendingAction === 'remove') {
+        useStore.setState({ cronPendingAction: undefined });
+      }
+    }, 15_000);
+  },
+
+  toggleCron: (name, enabled) => {
+    if (get().cronPendingAction !== undefined) return;
+    // 乐观翻转 + control cron_toggle；!ok / error 由成功后的回拉纠正
+    set((s) => ({
+      crons: s.crons.map((c) => (c.name === name ? { ...c, enabled } : c)),
+      cronPendingAction: 'toggle',
+      cronNotice: undefined,
+    }));
+    hostSendCore({
+      type: 'control',
+      command: 'cron_toggle',
+      name,
+      enabled,
+      query: JSON.stringify({ name, enabled }),
+    });
+    window.setTimeout(() => {
+      if (useStore.getState().cronPendingAction === 'toggle') {
+        useStore.setState({ cronPendingAction: undefined });
+      }
+    }, 15_000);
+  },
+
+  refreshWorkflows: () => {
+    if (get().workflowsRefreshing) return;
+    // control workflows_list → result.detail JSON（parseWorkflowsDetail 宽容解析）
+    set({ workflowsRefreshing: true, workflowsRequested: true });
+    hostSendCore({ type: 'control', command: 'workflows_list' });
+    window.setTimeout(() => {
+      if (useStore.getState().workflowsRefreshing) {
+        useStore.setState({ workflowsRefreshing: false });
+      }
+    }, 15_000);
+  },
+
+  runWorkflow: (name) => {
+    if (get().pendingWorkflowRun !== undefined) return; // 单飞
+    // control workflow_run —— 异步运行：立即标 running（运行态沿本切片 +
+    // 工具卡），result.detail JSON 报告到达（reduceM9Result 消费对账锚）
+    // 或 error 帧 / 60s 兜底落定
+    set((s) => ({
+      pendingWorkflowRun: name,
+      workflowRuns: { ...s.workflowRuns, [name]: { status: 'running', at: Date.now() } },
+    }));
+    hostSendCore({
+      type: 'control',
+      command: 'workflow_run',
+      name,
+      query: JSON.stringify({ name }),
+    });
+    window.setTimeout(() => {
+      if (useStore.getState().pendingWorkflowRun === name) {
+        useStore.setState((s) => ({
+          pendingWorkflowRun: undefined,
+          workflowRuns: {
+            ...s.workflowRuns,
+            [name]: {
+              status: 'failed',
+              report: '运行回执超时（核心未实现 workflow_run 或无活跃会话）',
+              at: Date.now(),
+            },
+          },
+        }));
+      }
+    }, 60_000);
   },
 
   respondPermission: (id, decision, rule) => {
