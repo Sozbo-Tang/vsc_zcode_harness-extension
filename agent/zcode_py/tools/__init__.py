@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from ..permissions import ASK, PermissionEngine
+from ..permissions import ASK, DENY, PermissionEngine
 from ..protocol import PermissionRequest
 
 # L1 源头治理常量（PLAN §3.4：bash 超 3 万字符取头尾截断）
@@ -101,6 +101,10 @@ class ToolRegistry:
 
     def register(self, spec: ToolSpec) -> None:
         self._tools[spec.name] = spec
+
+    def unregister(self, name: str) -> bool:
+        """摘除一个工具（M8：MCP server 移除时回收 mcp__* 工具）。"""
+        return self._tools.pop(name, None) is not None
 
     def get(self, name: str) -> ToolSpec | None:
         return self._tools.get(name)
@@ -193,9 +197,17 @@ class ToolSession:
                 result={"error": "cancelled", "detail": "turn cancelled before execution"},
                 is_error=True,
             )
-        # edit：无条件 diff 审阅闸门（任务书），不走权限卡
+        # 权限判定：DENY=引擎侧直接拒绝（M8 计划模式只读档，不弹卡）；
+        # edit 的 diff 审阅闸门照旧（权限引擎对 edit 的 allow/ask 不放行也不
+        # 拦截——edit 只走审阅卡），但计划模式的 DENY 对 edit 同样生效
+        check = self.permissions.check(name, args)
+        if check.outcome == DENY:
+            return ToolOutcome(
+                result={"error": "permission_denied", "detail": check.reason,
+                        "ruleId": check.ruleId},
+                is_error=True,
+            )
         if name != "edit":
-            check = self.permissions.check(name, args)
             if check.outcome == ASK:
                 decision = self._ask(name, args)
                 if decision not in ("allow", "always"):
@@ -212,14 +224,33 @@ class ToolSession:
                 if decision == "always":
                     pattern = self.permissions.remember_always(name, args)
                     self._emit_permission_note(name, pattern)
+        # M8 hooks：pre_tool 非零退出 = 阻断（stdout 作为原因进 is_error 结果）
+        hooks = self.ctx.state.get("hooks")
+        if hooks is not None:
+            blocked, reason = hooks.pre(name, args)
+            if blocked:
+                return ToolOutcome(
+                    result={"error": "hook_blocked",
+                            "detail": reason or "blocked by pre_tool hook"},
+                    is_error=True,
+                )
         try:
-            return spec.handler(args, self.ctx)
+            outcome = spec.handler(args, self.ctx)
         except Exception as exc:  # noqa: BLE001 —— 工具异常结构化回灌，不炸回合
             return ToolOutcome(
                 result={"error": "tool_failed",
                         "detail": f"{type(exc).__name__}: {exc}"},
                 is_error=True,
             )
+        # M8 hooks：post_tool stdout 附加到结果（tool_call finished 事件可审计）
+        if hooks is not None:
+            appended = hooks.post(name, args)
+            if appended:
+                if isinstance(outcome.result, dict):
+                    outcome.result["postHook"] = appended
+                else:  # 防御：结果不是 dict 时并进 warning 通道
+                    outcome.warning = appended
+        return outcome
 
     # -- 内部 ------------------------------------------------------------------
 

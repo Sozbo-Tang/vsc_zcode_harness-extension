@@ -99,13 +99,23 @@ export type ControlCommand =
   | "telegraph"
   | "switch_model"
   | "ping"
-  // M4：分叉 / 收藏固定 / 导出 Markdown / multi-root 切根
+  // M4：分叉 / 收藏固定 / 导出 Markdown / multi-root 切根 / 全文搜索
   | "fork"
   | "pin"
   | "export"
   | "set_root"
+  | "search_sessions"
   // M5：环境面板「刷新」——重新探测并广播 env_info
-  | "env_refresh";
+  | "env_refresh"
+  // M7：Skills 面板列表
+  | "skills_list"
+  // M8：计划模式（两个名字同义，Python 均收）与 MCP 管理面板
+  | "set_permission_mode"
+  | "permission_mode"
+  | "mcp_list"
+  | "mcp_refresh"
+  | "mcp_add"
+  | "mcp_remove";
 export interface ControlMessage {
   type: "control";
   command: ControlCommand;

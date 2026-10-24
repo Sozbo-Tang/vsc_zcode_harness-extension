@@ -71,6 +71,59 @@ function parseTimeline(result: unknown): string[] | null {
   return steps.length > 0 ? steps : null;
 }
 
+/**
+ * M8（R31）notebook 工具（notebook_run 等）结果 outputs → 输出摘要列表，
+ * 沿 timeline 的多形状渲染模式。宽容：result 可为对象或 JSON 字符串；
+ * outputs 条目可为字符串或 {text, ename[, evalue]} 对象（ename 采到即
+ * 标红）。无 outputs（失败/旧核心）→ null，按普通结果渲染（照旧）。
+ */
+interface NotebookOutput {
+  text: string;
+  error: boolean;
+}
+
+function parseNotebookOutputs(result: unknown): NotebookOutput[] | null {
+  let r: unknown = result;
+  if (typeof r === 'string') {
+    try {
+      r = JSON.parse(r);
+    } catch {
+      return null;
+    }
+  }
+  if (r === null || typeof r !== 'object') return null;
+  const outputs = (r as Record<string, unknown>).outputs;
+  if (!Array.isArray(outputs)) return null;
+  const out: NotebookOutput[] = [];
+  for (const o of outputs) {
+    if (typeof o === 'string') {
+      if (o !== '') out.push({ text: o, error: false });
+      continue;
+    }
+    if (o === null || typeof o !== 'object') continue;
+    const oo = o as Record<string, unknown>;
+    const ename = typeof oo.ename === 'string' && oo.ename !== '' ? oo.ename : undefined;
+    const parts: string[] = [];
+    if (ename !== undefined) parts.push(ename);
+    if (typeof oo.evalue === 'string' && oo.evalue !== '') parts.push(oo.evalue);
+    for (const k of ['text', 'output', 'data', 'value']) {
+      const v = oo[k];
+      if (typeof v === 'string' && v !== '') {
+        parts.push(v);
+      } else if (v !== null && typeof v === 'object') {
+        try {
+          const s = JSON.stringify(v);
+          if (s !== undefined && s !== '{}' && s !== '[]') parts.push(s);
+        } catch {
+          /* 忽略不可序列化字段 */
+        }
+      }
+    }
+    if (parts.length > 0) out.push({ text: parts.join(': '), error: ename !== undefined });
+  }
+  return out.length > 0 ? out : null;
+}
+
 export function ToolCallCard({ item }: { item: Extract<ChatItem, { kind: 'tool' }> }): React.JSX.Element {
   const rpc = useHostRpc();
   const arg = mainArg(item.args);
@@ -78,6 +131,12 @@ export function ToolCallCard({ item }: { item: Extract<ChatItem, { kind: 'tool' 
   const timeline =
     item.state === 'finished' && item.name.toLowerCase().startsWith('browser_')
       ? parseTimeline(item.result)
+      : null;
+  // M8（R31）：notebook 工具完成帧带 outputs → 输出摘要（ename 标红）；
+  // 无 outputs 照旧。工具名宽容匹配 notebook 前缀/包含（notebook_run 等）
+  const notebookOutputs =
+    item.state === 'finished' && item.name.toLowerCase().includes('notebook')
+      ? parseNotebookOutputs(item.result)
       : null;
 
   // 编辑跟随：点击即上报宿主（M3 已注册：按工具类型跳转文件行；
@@ -118,6 +177,15 @@ export function ToolCallCard({ item }: { item: Extract<ChatItem, { kind: 'tool' 
         <ol className="timeline">
           {timeline.map((step, i) => (
             <li key={`${i}-${step.slice(0, 24)}`}>{step}</li>
+          ))}
+        </ol>
+      ) : notebookOutputs !== null ? (
+        <ol className="timeline">
+          {notebookOutputs.map((o, i) => (
+            <li key={`${i}-${o.text.slice(0, 24)}`} className={o.error ? 'bad' : undefined}>
+              {o.error ? '⛔ ' : ''}
+              {o.text}
+            </li>
           ))}
         </ol>
       ) : (

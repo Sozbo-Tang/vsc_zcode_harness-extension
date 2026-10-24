@@ -7,6 +7,9 @@ dependencies = [
     "anthropic",
     "openai",
     "httpx",
+    # M8（R31）：notebook 元数据读写（read/write 工具必装，轻量）；
+    # 执行用的 nbclient 在下方 [notebook] 可选组
+    "nbformat",
 ]
 
 [dependency-groups]
@@ -20,6 +23,12 @@ dev = [
 #   运行/测试（带浏览器）：uv run --project agent --group browser pytest -q
 browser = [
     "browser-use",
+]
+# M8（R31）Notebook 执行可选组：nbclient 未安装时 notebook_run 返回结构化
+# 安装指引（tools/notebook.py 的 NBCLIENT_GUIDE）。uv 用法：
+#   安装：uv sync --project agent --group notebook
+notebook = [
+    "nbclient",
 ]
 
 [build-system]

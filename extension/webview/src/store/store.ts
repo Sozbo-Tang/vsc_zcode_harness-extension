@@ -15,6 +15,8 @@ import type {
   CoreEvent,
   GetStateResult,
   HardwareInfo,
+  McpServerInfo,
+  McpToolInfo,
   PermissionMode,
   PingResult,
   ProviderConfig,
@@ -78,6 +80,28 @@ export type ChatItem =
    * <img> 显示（失败回退路径文本）。
    */
   | { kind: 'image'; id: string; at: number; path: string }
+  /**
+   * M8（R14/§3.4）：compaction{layer, report} 帧归约的压缩报告卡。
+   * 仅 L2（机械淘汰）/ L3（自动摘要）产卡；L4 冷存无卡。字段从 report
+   * 宽容提取（extractCompaction），raw 保留原始 report 供卡内兜底展示。
+   */
+  | {
+      kind: 'compaction';
+      id: string;
+      at: number;
+      /** 归一化层级（"L2" | "L3"） */
+      layer: string;
+      /** L2：淘过的工具输出条数（evicted 数字或列表长度） */
+      evicted?: number;
+      savedTokens?: number;
+      /** L3：摘要前后 token 对比 */
+      beforeTokens?: number;
+      afterTokens?: number;
+      /** L3：七要素摘要全文（任务目标/关键决策/文件及状态/错误与解法/环境事实/待办/下一步） */
+      summary?: string;
+      /** 原始 report（宽容兜底展示） */
+      raw?: Record<string, unknown>;
+    }
   | { kind: 'error'; id: string; at: number; errorKind: string; message: string };
 
 export interface PerfState {
@@ -192,6 +216,11 @@ export interface WebviewStore {
   perf: PerfState;
   contextPct?: number;
   usageTokens?: number;
+  /**
+   * M8：最近一次压缩校正锚（L2/L3 compaction 帧到达时按 report.afterTokens
+   * 校正 usageTokens/contextPct；ContextMeter title 提示校正来源）。
+   */
+  lastCompaction?: { layer: string; afterTokens?: number; at: number };
   permissionMode: PermissionMode;
   telegraph: TelegraphState;
 
@@ -213,6 +242,24 @@ export interface WebviewStore {
   skillsRequested: boolean;
   /** 发 control skills_list（核心扫描 SKILL.md → result.detail JSON 回执） */
   refreshSkills(): void;
+
+  /* ---- 切片：mcp（M8，R3/M8） ---- */
+  /** mcp_list / mcp_refresh 回执投影（ToolsView MCP 页签数据源） */
+  mcpServers: McpServerInfo[];
+  /** mcp_list/mcp_refresh 已发出、等待 result 回执（刷新按钮禁用；15s 兜底） */
+  mcpRefreshing: boolean;
+  /** 是否已请求过一次（MCP 页签首开自动拉取一次的幂等标记） */
+  mcpRequested: boolean;
+  /** mcp_add / mcp_remove 进行中（单飞：表单提交/删除按钮禁用；15s 兜底） */
+  mcpPendingAction?: 'add' | 'remove';
+  /** MCP 页签操作回执提示（添加/删除/列表失败） */
+  mcpNotice?: { kind: 'info' | 'error'; text: string };
+  /** 发 control mcp_list（缺省）或 mcp_refresh（重连重扫） */
+  refreshMcp(command?: 'mcp_list' | 'mcp_refresh'): void;
+  /** 添加服务：control mcp_add（name + 空格分隔 argv + env；载荷兼容通道见 protocol.ts） */
+  addMcpServer(input: { name: string; command: string; env: Record<string, string> }): void;
+  /** 删除服务：control mcp_remove */
+  removeMcpServer(name: string): void;
 
   /* ---- 切片：tasks ---- */
   tasks: BackgroundTask[];
@@ -364,6 +411,143 @@ function parseSkillsDetail(detail?: string): SkillInfo[] {
 }
 
 /**
+ * M8：mcp_list / mcp_refresh 回执 result.detail（JSON 字符串）→
+ * McpServerInfo[]。Python 侧（mcp_client.py）载荷形状并行定稿——宽容解析
+ * （约定：数组或 {servers:[...]}；服务 name 必有、status 兼容 state 命名、
+ * detail 兼容 error 命名；tools 条目可为 {name,description} 或纯字符串；
+ * 仅有计数时取 toolCount/toolsCount）。解析失败回空数组（UI 空态）。
+ */
+export function parseMcpDetail(detail?: string): McpServerInfo[] {
+  if (typeof detail !== 'string' || detail === '') return [];
+  let data: unknown;
+  try {
+    data = JSON.parse(detail);
+  } catch {
+    return [];
+  }
+  const arr = Array.isArray(data)
+    ? data
+    : data !== null &&
+        typeof data === 'object' &&
+        Array.isArray((data as { servers?: unknown }).servers)
+      ? ((data as { servers: unknown[] }).servers)
+      : [];
+  const out: McpServerInfo[] = [];
+  for (const x of arr) {
+    if (x === null || typeof x !== 'object') continue;
+    const o = x as Record<string, unknown>;
+    const name =
+      typeof o.name === 'string' && o.name !== ''
+        ? o.name
+        : typeof o.id === 'string' && o.id !== ''
+          ? o.id
+          : undefined;
+    if (name === undefined) continue;
+    const tools: McpToolInfo[] = [];
+    if (Array.isArray(o.tools)) {
+      for (const t of o.tools) {
+        if (typeof t === 'string') {
+          if (t !== '') tools.push({ name: t });
+          continue;
+        }
+        if (t === null || typeof t !== 'object') continue;
+        const to = t as Record<string, unknown>;
+        if (typeof to.name === 'string' && to.name !== '') {
+          tools.push({
+            name: to.name,
+            description: typeof to.description === 'string' ? to.description : undefined,
+          });
+        }
+      }
+    }
+    const toolsCount =
+      typeof o.toolCount === 'number'
+        ? o.toolCount
+        : typeof o.toolsCount === 'number'
+          ? o.toolsCount
+          : undefined;
+    out.push({
+      name,
+      status:
+        typeof o.status === 'string'
+          ? o.status
+          : typeof o.state === 'string'
+            ? o.state
+            : 'unknown',
+      detail:
+        typeof o.detail === 'string'
+          ? o.detail
+          : typeof o.error === 'string'
+            ? o.error
+            : undefined,
+      tools,
+      toolsCount,
+    });
+  }
+  return out;
+}
+
+/* ---------- M8：compaction.report 宽容提取 ---------- */
+
+function asCount(v: unknown): number | undefined {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string' && v !== '' && Number.isFinite(Number(v))) return Number(v);
+  return undefined;
+}
+
+function pickCount(o: Record<string, unknown>, keys: string[]): number | undefined {
+  for (const k of keys) {
+    const v = asCount(o[k]);
+    if (v !== undefined) return v;
+  }
+  return undefined;
+}
+
+function pickText(o: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const k of keys) {
+    const v = o[k];
+    if (typeof v === 'string' && v !== '') return v;
+  }
+  return undefined;
+}
+
+/**
+ * compaction{layer, report} → 卡片字段（宽容：多命名兼容 evicted 数字或
+ * 列表长度 / savedTokens / beforeTokens / afterTokens / summary；七要素
+ * 摘要若为对象则整体 JSON 化保真展示）。
+ */
+function extractCompaction(
+  layer: string,
+  report: Record<string, unknown>,
+): {
+  evicted?: number;
+  savedTokens?: number;
+  beforeTokens?: number;
+  afterTokens?: number;
+  summary?: string;
+  raw: Record<string, unknown>;
+} {
+  const o = report ?? {};
+  const evictedList = Array.isArray(o.evicted) ? (o.evicted as unknown[]).length : undefined;
+  let summary = pickText(o, ['summary', 'summaryText', 'summary_text']);
+  if (summary === undefined && o.summary !== null && typeof o.summary === 'object') {
+    try {
+      summary = JSON.stringify(o.summary, null, 2);
+    } catch {
+      summary = undefined;
+    }
+  }
+  return {
+    evicted: pickCount(o, ['evicted', 'evictedCount', 'evicted_count', 'count']) ?? evictedList,
+    savedTokens: pickCount(o, ['savedTokens', 'saved_tokens', 'saved']),
+    beforeTokens: pickCount(o, ['beforeTokens', 'before_tokens', 'before']),
+    afterTokens: pickCount(o, ['afterTokens', 'after_tokens', 'after']),
+    summary,
+    raw: o,
+  };
+}
+
+/**
  * result 回执归约（M4）：按 pendingControl 对账（result 帧不带 sessionId，
  * command 匹配才消费），处理 export 落盘 / fork / pin / resume 的 busy 与提示。
  * export 的 markdown 经宿主 workspace.saveExport RPC 落盘（R12：核心只产文本）。
@@ -380,6 +564,31 @@ function reduceResult(
   if (e.command === 'skills_list') {
     // M7：回执即解锁刷新按钮；ok 时以 detail JSON 覆盖 skills 切片（失败保留旧表）
     set((s) => ({ skillsRefreshing: false, skills: e.ok ? parseSkillsDetail(e.detail) : s.skills }));
+    return;
+  }
+  if (e.command === 'mcp_list' || e.command === 'mcp_refresh') {
+    // M8：回执即解锁刷新按钮；ok 时以 detail JSON 覆盖 mcpServers（失败保留旧表 + 提示）
+    set((s) => ({
+      mcpRefreshing: false,
+      mcpServers: e.ok ? parseMcpDetail(e.detail) : s.mcpServers,
+      mcpNotice: e.ok ? s.mcpNotice : { kind: 'error', text: e.detail ?? 'MCP 列表获取失败' },
+    }));
+    return;
+  }
+  if (e.command === 'mcp_add' || e.command === 'mcp_remove') {
+    set({
+      mcpPendingAction: undefined,
+      mcpNotice: {
+        kind: e.ok ? 'info' : 'error',
+        text:
+          e.detail ??
+          (e.ok ? (e.command === 'mcp_add' ? '已添加，装配中…' : '已移除') : '操作失败'),
+      },
+    });
+    if (e.ok) {
+      // 成功后重拉列表（新服务装配 → 状态灯/工具数同步）
+      useStore.getState().refreshMcp('mcp_list');
+    }
     return;
   }
   if (e.command === 'export') {
@@ -471,6 +680,11 @@ export const useStore = create<WebviewStore>()((set, get) => ({
   skills: [],
   skillsRefreshing: false,
   skillsRequested: false,
+  mcpServers: [],
+  mcpRefreshing: false,
+  mcpRequested: false,
+  mcpPendingAction: undefined,
+  mcpNotice: undefined,
   tasks: [],
   inputDraft: '',
 
@@ -791,6 +1005,10 @@ export const useStore = create<WebviewStore>()((set, get) => ({
         break;
       }
       case 'error': {
+        // M8 宽容：permission_mode 未被核心识别时回 error 帧 —— 本地 UI 态
+        // 已先行生效（setPermissionMode 乐观切换），此类错误不入聊天流
+        // （不打断交互；Python 侧并行实现落地后帧自然消失）
+        if (e.message.includes('permission_mode')) break;
         set((s) => ({
           chat: {
             ...s.chat,
@@ -805,6 +1023,14 @@ export const useStore = create<WebviewStore>()((set, get) => ({
         if (get().skillsRefreshing && e.message.includes('skills_list')) {
           set({ skillsRefreshing: false });
         }
+        // M8：mcp_* 同款——错误帧立即解锁 busy 并把提示带进 MCP 页签
+        if (e.message.includes('mcp_')) {
+          set((s) => ({
+            mcpRefreshing: false,
+            mcpPendingAction: undefined,
+            mcpNotice: { kind: 'error', text: e.message },
+          }));
+        }
         break;
       }
       case 'checkpoint': {
@@ -818,11 +1044,44 @@ export const useStore = create<WebviewStore>()((set, get) => ({
         reduceResult(e, get, set);
         break;
       }
+      case 'compaction': {
+        // M8（R14/§3.4）：L2 机械淘汰 / L3 自动摘要 → 压缩报告卡入聊天流；
+        // L1 源头治理随工具系统无独立帧、L4 冷存（转录在盘）无卡。
+        const norm = e.layer.toUpperCase().startsWith('L') ? e.layer.toUpperCase() : `L${e.layer}`;
+        if (norm !== 'L2' && norm !== 'L3') break;
+        const f = extractCompaction(norm, e.report ?? {});
+        // ContextMeter 校正：L2/L3 后按 report.afterTokens（缺省时
+        // before-saved 推导）；无任何 token 字段则仅记校正锚不改动数值
+        const after =
+          f.afterTokens !== undefined
+            ? f.afterTokens
+            : f.beforeTokens !== undefined && f.savedTokens !== undefined
+              ? Math.max(0, Math.round(f.beforeTokens - f.savedTokens))
+              : undefined;
+        const ctx = currentModelContextLength(get().providers);
+        const patch: Partial<WebviewStore> = {
+          lastCompaction: { layer: norm, afterTokens: after, at: Date.now() },
+        };
+        if (after !== undefined) {
+          patch.usageTokens = after;
+          patch.contextPct = ctx ? Math.min(100, Math.round((after / ctx) * 100)) : undefined;
+        }
+        set((s) => ({
+          ...patch,
+          chat: {
+            ...s.chat,
+            items: [
+              ...s.chat.items,
+              { kind: 'compaction', id: nid('compact'), at: Date.now(), layer: norm, ...f },
+            ],
+          },
+        }));
+        break;
+      }
       case 'rollback_result':
-      case 'compaction':
       case 'git_result':
       case 'echo':
-        // 尚不消费：压缩报告=M8、git=M4 宿主侧、echo=M0 遗留帧。
+        // 尚不消费：git=M4 宿主侧、echo=M0 遗留帧。
         // 事件到达即忽略（不报错）。
         break;
     }
@@ -964,6 +1223,77 @@ export const useStore = create<WebviewStore>()((set, get) => ({
     }, 15_000);
   },
 
+  refreshMcp: (command = 'mcp_list') => {
+    if (get().mcpRefreshing) return;
+    // M8：control mcp_list（首开/添加后回拉）或 mcp_refresh（「↻ 刷新」重连
+    // 重扫）→ result.detail JSON（reduceResult 对账 → mcpServers 切片）。
+    // 核心未实现/命令非法时回 error 帧（error 归约按 mcp_ 字样立即解锁）
+    // + 15s 兜底（沿 skills 同款模式）。
+    set({
+      mcpRefreshing: true,
+      mcpRequested: true,
+      pendingControl: { command, sessionId: get().coreSessionId ?? '', at: Date.now() },
+    });
+    hostSendCore({ type: 'control', command });
+    window.setTimeout(() => {
+      if (useStore.getState().mcpRefreshing) {
+        useStore.setState({ mcpRefreshing: false });
+      }
+    }, 15_000);
+  },
+
+  addMcpServer: ({ name, command, env }) => {
+    if (get().mcpPendingAction !== undefined) return;
+    // M8：control mcp_add —— 提案载荷顶层 name/args/env + query JSON 兼容
+    // 通道双发（protocol.ts CoreSend 注释：Control.query 为现有协议字段，
+    // 今天即可无损穿透 Python decode；专用字段定稿前核心从 query 取参）。
+    // 回执经 reduceResult：成功自动 mcp_list 回拉；15s 兜底解锁。
+    set({
+      mcpPendingAction: 'add',
+      mcpNotice: undefined,
+      pendingControl: { command: 'mcp_add', sessionId: get().coreSessionId ?? '', at: Date.now() },
+    });
+    hostSendCore({
+      type: 'control',
+      command: 'mcp_add',
+      name,
+      args: command,
+      env,
+      query: JSON.stringify({
+        name,
+        command,
+        argv: command.split(/\s+/).filter(Boolean),
+        env,
+      }),
+    });
+    window.setTimeout(() => {
+      if (useStore.getState().mcpPendingAction === 'add') {
+        useStore.setState({ mcpPendingAction: undefined });
+      }
+    }, 15_000);
+  },
+
+  removeMcpServer: (name) => {
+    if (get().mcpPendingAction !== undefined) return;
+    // M8：control mcp_remove —— 同 add 的双通道载荷约定
+    set({
+      mcpPendingAction: 'remove',
+      mcpNotice: undefined,
+      pendingControl: { command: 'mcp_remove', sessionId: get().coreSessionId ?? '', at: Date.now() },
+    });
+    hostSendCore({
+      type: 'control',
+      command: 'mcp_remove',
+      name,
+      query: JSON.stringify({ name }),
+    });
+    window.setTimeout(() => {
+      if (useStore.getState().mcpPendingAction === 'remove') {
+        useStore.setState({ mcpPendingAction: undefined });
+      }
+    }, 15_000);
+  },
+
   respondPermission: (id, decision, rule) => {
     // 投影记录决策（+规则文本），权限卡据此切换为「已处理」态。
     // 不变量（PLAN §6.3 接线要求）：权限卡的出现与应答都不触碰
@@ -1014,10 +1344,13 @@ export const useStore = create<WebviewStore>()((set, get) => ({
   },
 
   setPermissionMode: (mode) => {
+    // M8：本地乐观生效 + 同步核心（control permission_mode{mode}，Python 侧
+    // 并行实现；宿主 ControlCommand 枚举暂缺但转发宽容）。核心未识别时回
+    // error 帧 —— error 归约按宽容约定静默（不入聊天流），UI 即刻生效的
+    // 本地态不被打断。
     set({ permissionMode: mode });
     persistUi(get);
-    // 宿主 ControlCommand 枚举暂缺 set_permission_mode（见 protocol.ts 注释）
-    hostSendCore({ type: 'control', command: 'set_permission_mode', mode });
+    hostSendCore({ type: 'control', command: 'permission_mode', mode });
   },
 
   saveProvider: async (p, newApiKey) => {

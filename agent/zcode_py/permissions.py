@@ -21,16 +21,25 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
-from typing import Any
+from typing import Any, Callable
 
-# 决策取值：allow=放行；ask=需要用户确认（广播 permission_request）
+# 决策取值：allow=放行；ask=需要用户确认（广播 permission_request）；
+# deny=引擎侧直接拒绝（M8 计划模式只读档——不弹卡，结构化拒绝回灌）
 ALLOW = "allow"
 ASK = "ask"
+DENY = "deny"
+
+# 计划模式三档（M8，PLAN §6.1 控制条「只读计划」档）
+# build=默认（写/命令询问）；plan=只读（写档工具一律结构化拒绝，不弹卡）；
+# yolo=写档免询问，但 DANGER 黑名单仍强制逐次确认（PLAN §9.3 不变量）
+PERMISSION_MODES = ("build", "plan", "yolo")
 
 # 只读工具集合（免批）。webfetch/websearch 属只读出网：SSRF host 校验 +
 # 隐私护栏在工具层生效，出网本身不视为副作用（与 PLAN §9.5 一致）。
+# M8：search_history（L4 检索本会话转录）与 notebook_read（读 .ipynb 元数据）
+# 同属免批只读。
 READONLY_TOOLS = frozenset(
-    {"read", "glob", "grep", "todo", "webfetch", "websearch"}
+    {"read", "glob", "grep", "todo", "webfetch", "websearch", "search_history", "notebook_read"}
 )
 
 # 各工具规则匹配的入参字段（zcode 语义：匹配主体按工具取具体入参）
@@ -455,16 +464,107 @@ class PermissionEngine:
         return sorted(f"{tool}: {pattern}" for tool, pattern in self._session_always)
 
 
+# ---------------------------------------------------------------------------
+# M8 计划模式（PLAN §6.1 / §9.3）：build | plan | yolo 三档包装引擎
+# ---------------------------------------------------------------------------
+
+PLAN_MODE_DENY_REASON = (
+    "计划模式只读——先退出计划模式（permission mode 切回 build/yolo）再执行写操作"
+)
+
+
+def mode_aware_engine(
+    inner: PermissionEngine,
+    *,
+    tier_lookup: Callable[[str], str | None],
+    mode_getter: Callable[[], str],
+) -> "ModeAwarePermissionEngine":
+    """便捷构造：包一层三档模式语义的引擎（不改变 inner 的规则与记忆）。"""
+    return ModeAwarePermissionEngine(
+        inner=inner, tier_lookup=tier_lookup, mode_getter=mode_getter
+    )
+
+
+class ModeAwarePermissionEngine(PermissionEngine):
+    """三档权限模式（M8）：
+
+    - ``build``：完全委托 inner（默认行为，规则引擎原语义）；
+    - ``plan``：tier=write 的工具一律 :data:`DENY`（结构化拒绝，**不弹卡**）；
+      readonly 工具照常放行——计划模式是「只读调研」档；
+    - ``yolo``：tier=write 的工具免询问放行（ruleId=yolo）；**DANGER 黑名单
+      仍强制 ask**（PLAN §9.3：黑名单优先级高于一切白名单与"总是允许"，
+      yolo 也不例外）——先算 inner 判定，danger 命中原样返回。
+
+    tier_lookup 返回 None（注册表里没有的工具名）按 write 处理（宁拒/问
+    不漏放）；模式值非法时按 build 委托。
+    """
+
+    def __init__(
+        self,
+        *,
+        inner: PermissionEngine,
+        tier_lookup: Callable[[str], str | None],
+        mode_getter: Callable[[], str],
+    ):
+        # 不经 dataclass 默认构造（allow_rules 由 inner 持有；本类只转发）
+        self.inner = inner
+        self.tier_lookup = tier_lookup
+        self.mode_getter = mode_getter
+
+    def check(self, tool: str, args: dict[str, Any]) -> PermissionCheck:
+        mode = self.mode_getter()
+        if mode not in PERMISSION_MODES:
+            mode = "build"
+        if mode == "build":
+            return self.inner.check(tool, args)
+        inner_check = self.inner.check(tool, args)
+        tier = self.tier_lookup(tool)
+        is_write = tier != "readonly"  # 未知工具按写档（保守）
+        if mode == "plan":
+            if is_write:
+                return PermissionCheck(
+                    outcome=DENY,
+                    ruleId="plan_mode",
+                    reason=PLAN_MODE_DENY_REASON,
+                    subject=inner_check.subject,
+                )
+            return inner_check
+        # yolo：危险命中（inner 判 danger=ask）优先保留；已放行的照旧；其余写档放行
+        if inner_check.danger:
+            return inner_check
+        if inner_check.outcome == ALLOW:
+            return inner_check
+        if is_write:
+            return PermissionCheck(
+                outcome=ALLOW,
+                ruleId="yolo",
+                reason="yolo mode: write-tier tools allowed without asking",
+                subject=inner_check.subject,
+            )
+        return inner_check
+
+    def remember_always(self, tool: str, args: dict[str, Any]) -> str:
+        return self.inner.remember_always(tool, args)
+
+    def session_rules(self) -> list[str]:
+        return self.inner.session_rules()
+
+
 __all__ = [
     "ALLOW",
     "ASK",
+    "DENY",
     "DANGER_PATTERNS",
     "DangerHit",
+    "PERMISSION_MODES",
+    "PLAN_MODE_DENY_REASON",
+    "ModeAwarePermissionEngine",
     "PermissionCheck",
     "PermissionEngine",
     "READONLY_TOOLS",
     "always_rule_for",
     "match_danger",
+    "mode_aware_engine",
     "parse_rule",
     "rule_matches",
     "subject_for",

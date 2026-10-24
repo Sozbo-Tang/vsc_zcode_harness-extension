@@ -100,6 +100,13 @@ class SessionStore:
             raise SessionError(f"session not found: {session_id}")
         return directory
 
+    def transcript_path(self, session_id: str) -> Path | None:
+        """转录文件路径（会话不存在返回 None——search_history 的 L4 供应）。"""
+        try:
+            return self._session_dir(session_id) / "transcript.jsonl"
+        except SessionError:
+            return None
+
     def _append_line(self, session_id: str, envelope: dict) -> None:
         """追加一行信封帧。
 

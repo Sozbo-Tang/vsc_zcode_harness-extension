@@ -299,8 +299,14 @@ def test_unsupported_and_pre_init_guards(tmp_home):
     rollback = harness.frames_of_type("rollback_result")
     assert rollback and rollback[0]["ok"] is False
     assert kinds[3] == "checkpoint"
-    assert kinds[4] == "unsupported"  # compact 属 M8
-    assert kinds[5] == "unsupported"  # git_commit 属后续里程碑
+    # M8 起 compact 已实装（compaction/）：空上下文 → result{ok:false}，
+    # 不再发 unsupported error 帧
+    compact_results = [
+        f for f in harness.frames()
+        if f["type"] == "result" and f.get("command") == "compact"
+    ]
+    assert compact_results and compact_results[0]["ok"] is False
+    assert kinds[4] == "unsupported"  # git_commit 属后续里程碑
 
 
 def test_broken_config_falls_back_to_defaults(tmp_home):

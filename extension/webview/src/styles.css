@@ -881,6 +881,11 @@ body {
   justify-content: flex-end;
 }
 
+/* M8：env 多行输入与标签顶对齐（ToolsView MCP 添加表单） */
+.form-row.top {
+  align-items: flex-start;
+}
+
 /* ---------- 会话/任务列表 ---------- */
 
 .sessionlist {
@@ -1164,4 +1169,162 @@ body {
   margin-left: 8px;
   color: var(--vscode-descriptionForeground);
   font-size: 11px;
+}
+
+/* ---------- M8：MCP 页签（ToolsView） ---------- */
+
+.mcplist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mcpitem {
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+.mcprow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 状态灯：●绿=connected ●红=error ○灰=未连（背景留空即空心圆） */
+.mcpdot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 1px solid var(--vscode-descriptionForeground);
+  background: transparent;
+  flex: none;
+  display: inline-block;
+}
+
+.mcpdot.on {
+  background: var(--vscode-charts-green);
+  border-color: var(--vscode-charts-green);
+}
+
+.mcpdot.bad {
+  background: var(--vscode-errorForeground);
+  border-color: var(--vscode-errorForeground);
+}
+
+.mcpname {
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-family: monospace;
+  font-size: 12px;
+  color: var(--vscode-foreground);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.mcpname:hover {
+  text-decoration: underline;
+}
+
+.mcptoolslabel {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.mcpdetail {
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+/* 装配缝缺失指引（M8）：指向 docs/MCP_BACKEND_SPEC.md */
+.mcpgap {
+  margin-top: 4px;
+  padding: 2px 6px;
+  border-left: 2px solid var(--vscode-editorWarning-foreground);
+  color: var(--vscode-editorWarning-foreground, var(--vscode-charts-yellow));
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
+.mcpdoc {
+  font-family: monospace;
+  user-select: text;
+}
+
+.mcptools {
+  list-style: none;
+  margin: 5px 0 1px;
+  padding: 0 0 0 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.mcptool {
+  font-size: 11.5px;
+}
+
+.mcptoolname {
+  font-family: monospace;
+  overflow-wrap: anywhere;
+}
+
+.mcptooldesc {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.mcpnotools {
+  margin-top: 4px;
+}
+
+.mcpnotice {
+  font-size: 11.5px;
+  border-radius: 4px;
+  padding: 3px 7px;
+  border: 1px solid var(--vscode-panel-border);
+  overflow-wrap: anywhere;
+}
+
+.mcpnotice.ok {
+  color: var(--vscode-charts-green);
+}
+
+.mcpnotice.bad {
+  color: var(--vscode-errorForeground);
+  border-color: var(--vscode-errorForeground);
+}
+
+.mcpformrow {
+  margin-top: 2px;
+}
+
+/* ---------- M8：压缩报告卡（CompactionCard） ---------- */
+
+.compcard summary {
+  cursor: pointer;
+}
+
+.compsummary,
+.compraw {
+  margin-top: 4px;
+}
+
+.compsummary summary,
+.compraw summary {
+  cursor: pointer;
+  user-select: none;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.compsummary summary::-webkit-details-marker,
+.compraw summary::-webkit-details-marker {
+  display: none;
 }

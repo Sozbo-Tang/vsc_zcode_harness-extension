@@ -11,11 +11,17 @@
  *  - providers.* / provider.* RPC 方法：宿主 rpcHandlers 目前仅注册了
  *    echo / getState（extension/src/extension.ts L120-128），Provider CRUD
  *    的方法名是 webview 侧提案，宿主实现后如有出入以宿主为准
- *  - control command 'set_permission_mode'：宿主 ControlCommand 枚举暂缺
+ *  - control command 'permission_mode'（M8，旧名 set_permission_mode 已废弃）：
+ *    宿主 ControlCommand 枚举暂缺；Python 侧并行实现（见 M8 条目）
  *  - M4/M5：editor.pickImage / workspace.saveExport / session.activate RPC
  *    为 webview 侧按方法名先行调用（宿主侧并行实现中，参数提案见下方接口）
  *  - control 新命令 fork/pin/export/set_root/env_refresh 已在 Python 侧
  *    CONTROL_COMMANDS 定稿；宿主镜像枚举暂缺（宽容转发不影响）
+ *  - M8：compaction{layer:string, report:dict} 对齐宿主镜像（Python 侧
+ *    layer 为 "L2"/"L3"… 字符串，report 为 dict 直通）；control 命令
+ *    permission_mode / mcp_list / mcp_refresh / mcp_add / mcp_remove 为
+ *    Python 侧并行定稿项（约定见 docs/MCP_BACKEND_SPEC.md），宿主镜像
+ *    枚举暂缺（宽容转发不影响，核心未识别时回 error 帧由 UI 宽容消化）
  */
 
 /* ---------- 基础类型（镜像 extension/src/protocol.ts） ---------- */
@@ -31,7 +37,7 @@ export interface TelegraphLevel {
   ok: boolean;
 }
 
-/** 权限模式（ZCode CollaborationMode 子集；宿主 ControlCommand 暂缺 set_permission_mode） */
+/** 权限模式（ZCode CollaborationMode 子集；M8 起经 control permission_mode{mode} 下发，Python 侧并行实现） */
 export type PermissionMode = 'build' | 'plan' | 'yolo';
 
 /**
@@ -156,7 +162,13 @@ export type CoreEvent =
       lastTurn?: PerfTurn;
     }
   | { type: 'env_info'; hardware: HardwareInfo; workspaceLangs: WorkspaceLang[] }
-  | { type: 'compaction'; layer: 1 | 2 | 3 | 4; report: string }
+  /**
+   * M8（R14/§3.4）压缩报告：layer 为 "L1"–"L4" 字符串（Python 侧 str，
+   * 如 "L2"），report 为 dict 直通——字段宽容提取（evicted / savedTokens /
+   * beforeTokens / afterTokens / summary 等，见 store extractCompaction）。
+   * UI 侧仅 L2/L3 产生压缩卡，L4 冷存无卡。
+   */
+  | { type: 'compaction'; layer: string; report: Record<string, unknown> }
   | { type: 'checkpoint'; id: string; sha: string; atMessageId: string }
   | { type: 'rollback_result'; ok: boolean }
   | { type: 'sessions_list'; sessions: SessionSummary[] }
@@ -222,7 +234,10 @@ export type CoreSend =
         | 'compact'
         | 'telegraph'
         | 'switch_model'
-        | 'set_permission_mode' // 宿主 ControlCommand 枚举暂缺，提案项
+        // M8：权限模式下发（Python 侧并行实现；{mode} 见下）。旧名
+        // set_permission_mode 已废弃 —— 核心未识别时回 error 帧，UI 本地
+        // 态已先行生效（宽容，不被打断）
+        | 'permission_mode'
         | 'ping' // 测试连接（CONTROL_COMMANDS；宿主镜像枚举暂缺）
         // M4（protocol.py CONTROL_COMMANDS：R16/R28/R12/R11）
         | 'fork'
@@ -233,11 +248,20 @@ export type CoreSend =
         | 'env_refresh'
         // M7（R3）：Skills 列表——核心扫描 SKILL.md 后经 result 帧回执
         // （Python 侧 CONTROL_COMMANDS 定稿为准；宿主镜像枚举暂缺，宽容转发）
-        | 'skills_list';
+        | 'skills_list'
+        // M8（R3/M8）：MCP 管理页——mcp_list/mcp_refresh 经 result.detail
+        // JSON 回执（宽容解析见 store parseMcpDetail）；mcp_add/mcp_remove
+        // 提案载荷见下方 name/args/env 注释。Python 侧并行定稿
+        // （docs/MCP_BACKEND_SPEC.md），未识别时回 error 帧由 UI 宽容消化
+        | 'mcp_list'
+        | 'mcp_refresh'
+        | 'mcp_add'
+        | 'mcp_remove';
       sessionId?: string;
       level?: string;
       providerId?: string;
       modelId?: string;
+      /** permission_mode：目标模式（build | plan | yolo） */
       mode?: PermissionMode;
       /** fork：分叉点（转录内入站 user_message 的 messageId） */
       atMessageId?: string;
@@ -247,6 +271,22 @@ export type CoreSend =
       rootIndex?: number;
       /** set_root：按路径切根 */
       rootPath?: string;
+      /**
+       * 通用载荷通道（search_sessions 关键词 / M8 兼容）：mcp_add /
+       * mcp_remove 把载荷镜像为 JSON 字符串放这里 —— Control.query 是
+       * Python 侧现有协议字段，今天即可无损穿透 decode；专用字段
+       * （name/args/env）定稿前核心可从 query JSON 取参。
+       */
+      query?: string;
+      /**
+       * M8 提案字段（mcp_add：服务名；mcp_remove：目标服务名）。
+       * Python Control 侧并行定稿；未定义时被 decode 忽略（query 兜底）。
+       */
+      name?: string;
+      /** M8 提案字段（mcp_add）：启动命令，空格分隔 argv（如 "npx -y @mcp/server ."） */
+      args?: string;
+      /** M8 提案字段（mcp_add）：子进程环境变量键值 */
+      env?: Record<string, string>;
     };
 
 /* ---------- webview ↔ 宿主 RPC ---------- */
@@ -380,6 +420,30 @@ export interface SkillInfo {
   description?: string;
   /** SKILL.md 来源路径（列表 title 属性展示） */
   path?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * M8：MCP 服务/工具条目（control mcp_list / mcp_refresh 回执
+ * result.detail JSON 宽容解析产物，见 store parseMcpDetail）。
+ * Python 侧（mcp_client.py 并行实现中）字段宽容：name 必有；status
+ * 宽容（connected=绿 / error=红 / 其余=灰未连）；tools[{name,description}]
+ * 条目亦可为纯字符串；toolCount 是仅有计数时的降级。
+ */
+export interface McpToolInfo {
+  name: string;
+  description?: string;
+}
+
+export interface McpServerInfo {
+  name: string;
+  /** 原样状态字符串（connected / error / disconnected / 未装配缝…） */
+  status: string;
+  /** 状态附注/错误说明（装配缝缺失判定用） */
+  detail?: string;
+  tools: McpToolInfo[];
+  /** 仅有工具计数、无清单时的降级展示 */
+  toolsCount?: number;
   [key: string]: unknown;
 }
 

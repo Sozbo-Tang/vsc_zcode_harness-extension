@@ -43,6 +43,7 @@ from typing import Callable, TextIO
 from . import telegraph
 from . import vision_relay
 from .checkpoints import CheckpointManager
+from .compaction import SEARCH_HISTORY_SPEC, CompactionManager
 from .config import (
     DEFAULT_CONFIG,
     ConfigError,
@@ -52,11 +53,14 @@ from .config import (
     load_config,
 )
 from .envprobe import environment_facts, probe as probe_environment
+from .hooks import HooksConfigError, HooksRunner, load_hooks
 from .llm import Provider, ProviderError, default_provider_factory, ping as ping_provider
 from .llm.base import ImageBlock
 from .loop import AgentLoop, DEFAULT_SYSTEM_PROMPT, context_from_frames
+from .mcp import McpManager
 from .memory import MemoryPermissionEngine, memory_injection, register_memory_tool
 from .perf import PerfTracker
+from .permissions import PERMISSION_MODES, mode_aware_engine
 from .protocol import (
     Checkpoint,
     Control,
@@ -89,6 +93,7 @@ from .skills import SkillsManager, expand_slash, skills_injection
 from .subagents import ChildRuntime, RUN_CHILD_SPEC
 from .tools import ToolSession, default_registry
 from .tools.browser import BROWSER_TOOL_NAMES, browser_unavailable_outcome, register_browser_tools
+from .tools.notebook import register_notebook_tools
 
 DEFAULT_PERMISSION_TIMEOUT_S = 300.0
 
@@ -227,12 +232,33 @@ class ZcodeService:
         self._usage_by_model: dict[str, dict[str, int]] = {}
         # M2：工具/权限/检查点；M4：memory 工具（R24）挂进注册表；
         # M6（R8）：browser-use 可选组——未安装不注册（False），幻觉调用由
-        # _BrowserHintSession 返回结构化安装指引；M7（R25）：run_child 子代理
+        # _BrowserHintSession 返回结构化安装指引；M7（R25）：run_child 子代理；
+        # M8（R31）：notebook 三件套 + search_history（L4 冷存检索）
         self._router = ResponseRouter()
         self._registry = default_registry()
         register_memory_tool(self._registry)
         self._browser_registered = register_browser_tools(self._registry)
         self._registry.register(RUN_CHILD_SPEC)
+        self._registry.register(SEARCH_HISTORY_SPEC)
+        register_notebook_tools(self._registry)
+        # M8（R3）：MCP client——server 连接在 init 后台进行（失败不阻塞会话）
+        self._mcp = McpManager(registry=self._registry)
+        # M8 hooks：init 时按 ~/.zcode-py/hooks.json 装配（缺位/损坏降级见 _on_init）
+        self._hooks: HooksRunner | None = None
+        # M8 计划模式：build | plan | yolo（init.settings.permissionMode 可预置）
+        self._permission_mode = "build"
+        # M8（R14）：上下文压缩管理器（阈值在 init 按 settings 调整）
+        self._compaction = CompactionManager(
+            emit=self._emit,
+            loop_supplier=lambda: self._loop,
+            provider_supplier=lambda: (
+                self._provider, self.model_id, self._provider_entry, self._model_entry
+            ),
+            config_supplier=lambda: self._config or {},
+            settings_supplier=lambda: self._settings,
+            provider_factory=self._factory,
+            api_key_env=self._api_key_env,
+        )
         self._checkpoints: CheckpointManager | None = None
         self._workspace_cwd = Path.cwd()
         self._permission_timeout_s = DEFAULT_PERMISSION_TIMEOUT_S
@@ -271,7 +297,8 @@ class ZcodeService:
             self._emit(Error(kind="protocol", message=f"unexpected inbound frame: {type(msg).__name__}"))
 
     def shutdown(self, join_timeout: float = 2.0) -> None:
-        """EOF 收尾：先给进行中的回合机会跑完，超时才取消（再等一次）。
+        """EOF 收尾：先给进行中的回合机会跑完，超时才取消（再等一次）；
+        最后关停 MCP server 子进程。
 
         直接 set 取消会与「回合线程尚未调度」竞态，把本来能正常完成的回合
         误标为 cancelled。
@@ -282,30 +309,59 @@ class ZcodeService:
             if thread.is_alive():
                 self._cancel.set()
                 thread.join(timeout=join_timeout)
+        self._mcp.shutdown()
 
     # ------------------------------------------------------------------ init
 
     def _on_init(self, msg: Init) -> None:
         self._workspace_roots = list(msg.workspaceRoots or [])
         self._settings = dict(msg.settings or {})
-        self._api_key_env = dict(msg.apiKeyEnv or {})
+        # apiKeyEnv 原位更新：compaction manager 等持有同一 dict 的组件不落旧值
+        self._api_key_env.clear()
+        self._api_key_env.update(msg.apiKeyEnv or {})
         self._workspace_cwd = (
             Path(self._workspace_roots[0]).expanduser()
             if self._workspace_roots
             else Path.cwd()
         )
+        # M8 计划模式：settings.permissionMode 预置（control set_permission_mode
+        # 可随切；非法值回 build）
+        mode = str(self._settings.get("permissionMode") or "build")
+        self._permission_mode = mode if mode in PERMISSION_MODES else "build"
+        # M8（R14）：压缩阈值（settings.compaction.evictThreshold / summarizeThreshold）
+        compaction_cfg = self._settings.get("compaction")
+        if isinstance(compaction_cfg, dict):
+            for key, attr in (
+                ("evictThreshold", "evict_threshold"),
+                ("summarizeThreshold", "summarize_threshold"),
+            ):
+                value = compaction_cfg.get(key)
+                if isinstance(value, (int, float)) and 0 < value <= 1:
+                    setattr(self._compaction, attr, float(value))
         try:
             self._permission_timeout_s = max(
                 1.0, float(self._settings.get("permissionTimeoutSec") or DEFAULT_PERMISSION_TIMEOUT_S)
             )
         except (TypeError, ValueError):
             self._permission_timeout_s = DEFAULT_PERMISSION_TIMEOUT_S
+        # M8 hooks：装配 ~/.zcode-py/hooks.json（损坏广播 config error 后按无
+        # hooks 继续；缝缺位由 HooksRunner.startup_check 广播一次并禁用）
+        try:
+            rules = load_hooks()
+        except HooksConfigError as exc:
+            rules = []
+            self._emit(Error(kind="config", message=str(exc) + " (hooks disabled)"))
+        self._hooks = HooksRunner(rules, emit=self._emit) if rules else None
+        if self._hooks is not None:
+            self._hooks.startup_check()
         self._checkpoints = CheckpointManager(self._workspace_cwd)
         self._ensure_config()
         entry = get_provider_entry(self._config or {})
         model = get_model_entry(entry) if entry else None
         self._apply_model(entry, model, keep_level=None)
         self._start_session()
+        # M8（R3）：MCP server 后台连接（连接失败只标状态，不阻塞会话）
+        self._mcp.connect_all(background=True)
         # M5（R7/R21）：init 后台线程探测硬件+工作区语言 → 广播 env_info；
         # 不阻塞读线程与首条消息（环境注入规则见 _system_prompt_with_env）
         self._spawn_env_probe()
@@ -491,7 +547,15 @@ class ZcodeService:
         allow_rules = [
             str(r) for r in (self._settings.get("permissionAllow") or []) if isinstance(r, str)
         ]
-        engine = MemoryPermissionEngine(allow_rules=allow_rules)
+        # M8 计划模式：三档语义包在规则引擎外层（build 委托原语义；plan 只读
+        # DENY；yolo 免询问但 DANGER 黑名单仍强制，PLAN §9.3）
+        engine = mode_aware_engine(
+            MemoryPermissionEngine(allow_rules=allow_rules),
+            tier_lookup=lambda name: (
+                spec.tier if (spec := self._registry.get(name)) is not None else None
+            ),
+            mode_getter=lambda: self._permission_mode,
+        )
         # 子代理与主会话共享同一个权限引擎（会话内 always 记忆互通，M7/R25）
         self._permissions_engine = engine
         session_cls = ToolSession if self._browser_registered else _BrowserHintSession
@@ -507,6 +571,12 @@ class ZcodeService:
         # 工具 ctx 注入（browser 截图帧广播 / headless 配置 / 子代理运行时）
         session.ctx.state["emit"] = self._emit
         session.ctx.state["browserHeadless"] = self._browser_headless()
+        # M8 hooks：pre_tool 阻断 / post_tool stdout 附加（装配缝缺位时 runner
+        # 自身已禁用，直通）
+        if self._hooks is not None:
+            session.ctx.state["hooks"] = self._hooks
+        # M8（R14）L4：search_history 的转录路径供应（会话切换自动跟随）
+        session.ctx.state["history_reader"] = self._history_reader
         session.ctx.state["child_runtime"] = ChildRuntime(
             registry=self._registry,
             permissions=engine,
@@ -534,7 +604,15 @@ class ZcodeService:
             tool_session=session,
             cancel_event=self._cancel,
             on_usage=self._accumulate_usage,
+            on_model_usage=self._compaction.on_model_usage,
         )
+
+    def _history_reader(self):
+        """search_history（L4）的转录路径：当前绑定会话的 transcript.jsonl。"""
+        session_id = self._emitter.session_id
+        if session_id is None:
+            return None
+        return self._store.transcript_path(session_id)
 
     def _accumulate_usage(self, model: str, usage) -> None:
         bucket = self._usage_by_model.setdefault(model, {"input": 0, "output": 0})
@@ -693,6 +771,12 @@ class ZcodeService:
             "search_sessions": self._control_search_sessions,
             "env_refresh": self._control_env_refresh,
             "skills_list": self._control_skills_list,
+            "set_permission_mode": self._control_set_permission_mode,
+            "permission_mode": self._control_set_permission_mode,
+            "mcp_list": self._control_mcp_list,
+            "mcp_refresh": self._control_mcp_refresh,
+            "mcp_add": self._control_mcp_add,
+            "mcp_remove": self._control_mcp_remove,
         }.get(msg.command)
         if handler is None:
             self._emit(Error(kind="protocol", message=f"unknown control command: {msg.command!r}"))
@@ -851,7 +935,139 @@ class ZcodeService:
         )
 
     def _control_compact(self, msg: Control) -> None:
-        self._emit(Error(kind="unsupported", message="compaction lands in M8 (PLAN §3.4)"))
+        """M8（R14）L3 手动压缩：control compact（PLAN §5）。
+
+        回合进行中拒绝（压缩要重建 loop.messages，与流式/工具执行竞态）；
+        摘要模型失败时 manager 内部降级 L2，报告带 error+fallback 字段。
+        """
+        if self._turn_alive():
+            self._emit(Error(kind="busy", message="cannot compact while a turn is running"))
+            return
+        loop = self._loop
+        if loop is None:
+            self._emit(Error(kind="protocol", message="init required before compact"))
+            return
+        report = self._compaction.compact_now(loop, reason="manual")
+        ok = not report.get("error")
+        self._emit(
+            Result(ok=ok, command="compact", detail=json.dumps(report, ensure_ascii=False))
+        )
+
+    # ------------------------------------------------------------------ M8：计划模式 / MCP 管理
+
+    def _control_set_permission_mode(self, msg: Control) -> None:
+        """M8 计划模式：build | plan | yolo（webview store.setPermissionMode 已按
+        此命令名下发；宿主 protocol.ts 枚举镜像暂缺——宽容转发）。
+
+        plan=只读（写档工具结构化拒绝，不弹卡）；yolo=写档免询问但 DANGER
+        黑名单仍强制（PLAN §9.3）。生效于下一次工具调用（无状态迁移）。
+        """
+        mode = msg.mode
+        if mode not in PERMISSION_MODES:
+            self._emit(
+                Error(
+                    kind="protocol",
+                    message=f"invalid permission mode {mode!r}; expected one of {list(PERMISSION_MODES)}",
+                )
+            )
+            return
+        self._permission_mode = mode
+        self._emit(Result(ok=True, command="set_permission_mode", detail=mode))
+
+    def _control_mcp_list(self, msg: Control) -> None:
+        """M8（R3）MCP 面板：server 状态列表（Result.detail JSON）。
+
+        后台连接进行中会看到 status=connecting；连接失败 status=error + 原因
+        （含装配缝缺位指引）。
+        """
+        self._emit(
+            Result(
+                ok=True,
+                command="mcp_list",
+                detail=json.dumps(self._mcp.status_list(), ensure_ascii=False),
+            )
+        )
+
+    def _control_mcp_refresh(self, msg: Control) -> None:
+        """M8：关停全部 server + 重读 mcp.json + 重连（后台）。"""
+        if self._turn_alive():
+            self._emit(Error(kind="busy", message="cannot refresh MCP servers while a turn is running"))
+            return
+        self._mcp.refresh(background=True)
+        self._emit(Result(ok=True, command="mcp_refresh", detail="reconnecting; poll mcp_list"))
+
+    def _control_mcp_add(self, msg: Control) -> None:
+        """M8：写入 mcp.json 并连接（server 字段 = {command:[argv], env?, cwd?}）。
+
+        宽容载荷：webview 提案形态（query JSON 全量 {"command": "空格分隔
+        argv" 或 [argv], "env": {...}, "cwd"?}）也收——两侧以 Result 回执对账。
+        """
+        name = (msg.name or "").strip()
+        if not name:
+            self._emit(Error(kind="protocol", message="mcp_add requires a non-empty 'name'"))
+            return
+        server = msg.server if isinstance(msg.server, dict) and msg.server else None
+        if server is None:
+            server = self._mcp_server_from_query(msg)
+        if not server:
+            self._emit(
+                Error(
+                    kind="protocol",
+                    message="mcp_add requires 'server' {command:[argv], env?, cwd?} "
+                    "或 query JSON {command, env?}",
+                )
+            )
+            return
+        error = self._mcp.add_and_connect({"name": name, **server})
+        if error:
+            self._emit(Error(kind="config", message=error))
+            return
+        self._emit(Result(ok=True, command="mcp_add", detail=name))
+
+    @staticmethod
+    def _mcp_server_from_query(msg: Control) -> dict | None:
+        """webview 提案载荷：query JSON 里的 {command, env?, cwd?} → server 条目。"""
+        import shlex
+
+        raw = (msg.query or "").strip()
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        command = data.get("command")
+        if command is None and isinstance(data.get("args"), list):
+            command = data["args"]
+        if isinstance(command, str):
+            try:
+                command = shlex.split(command)
+            except ValueError:
+                return None
+        if not isinstance(command, list) or not command:
+            return None
+        server: dict = {"command": [str(c) for c in command]}
+        env = data.get("env")
+        if isinstance(env, dict) and env:
+            server["env"] = {str(k): str(v) for k, v in env.items()}
+        cwd = data.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            server["cwd"] = cwd
+        return server
+
+    def _control_mcp_remove(self, msg: Control) -> None:
+        """M8：从 mcp.json 摘除 + 关停 + 注销 mcp__<server>__* 工具。"""
+        name = (msg.name or "").strip()
+        if not name:
+            self._emit(Error(kind="protocol", message="mcp_remove requires a non-empty 'name'"))
+            return
+        error = self._mcp.remove(name)
+        if error:
+            self._emit(Error(kind="config", message=error))
+            return
+        self._emit(Result(ok=True, command="mcp_remove", detail=name))
 
     # ------------------------------------------------------------------ M4：fork / pin / export / set_root
 

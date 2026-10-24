@@ -116,6 +116,7 @@ class AgentLoop:
         tool_session=None,
         cancel_event: threading.Event | None = None,
         on_usage: Callable[[str, UsageUpdate], None] | None = None,
+        on_model_usage: Callable[[UsageUpdate], None] | None = None,
     ):
         self.provider = provider
         self.model = model
@@ -129,6 +130,9 @@ class AgentLoop:
         self.tool_session = tool_session
         self.cancel_event = cancel_event or threading.Event()
         self.on_usage = on_usage
+        # M8 压缩钩子：每个模型回合结束（工具批次执行前）收到累计 usage，
+        # CompactionManager 据此在两次模型调用之间做 L2/L3（不打断流）
+        self.on_model_usage = on_model_usage
         self.messages: list = []
         self._last_outcome: TurnOutcome | None = None
         self._last_stop: str = STOP_END_TURN
@@ -205,6 +209,18 @@ class AgentLoop:
                 stop = STOP_CANCELLED
                 break
             outcome = self._model_turn()
+            # M8：两次模型调用之间给压缩管理器看一次累计用量（L2/L3 时机）；
+            # 回调内重建 self.messages 是安全窗口——本轮 outcome 的 tool_calls
+            # 尚未执行，重建保留的尾部必然包含刚产出的 assistant 消息
+            if (
+                outcome.usage is not None
+                and self.on_model_usage is not None
+                and not self._cancelled()
+            ):
+                try:
+                    self.on_model_usage(outcome.usage)
+                except Exception:  # noqa: BLE001 —— 压缩失败不炸回合
+                    pass
             stop = outcome.stop_reason
             if self._cancelled():
                 stop = STOP_CANCELLED

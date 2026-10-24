@@ -30,6 +30,7 @@ import { DiffReviewCard } from '../components/DiffReviewCard';
 import { VisionRelayCard } from '../components/VisionRelayCard';
 import { SubagentCard } from '../components/SubagentCard';
 import { ImageArtifactCard } from '../components/ImageArtifactCard';
+import { CompactionCard } from '../components/CompactionCard';
 import { TaskListBar } from '../components/TaskListBar';
 import { WelcomePage } from '../components/WelcomePage';
 
@@ -117,6 +118,9 @@ function ItemView({ item }: { item: ChatItem }): React.JSX.Element {
     case 'image':
       // M6（R8）：image_artifact 帧投影 → 截图卡（宿主 RPC 换 webview URI）
       return <ImageArtifactCard item={item} />;
+    case 'compaction':
+      // M8（R14）：compaction{layer, report} 帧投影 → 压缩报告卡（仅 L2/L3）
+      return <CompactionCard item={item} />;
     case 'error':
       return (
         <div className="syserr" title={`kind: ${item.errorKind}`}>
@@ -126,10 +130,10 @@ function ItemView({ item }: { item: ChatItem }): React.JSX.Element {
   }
 }
 
-const PERMISSION_OPTIONS: Array<{ value: PermissionMode; label: string }> = [
-  { value: 'build', label: '🛡 普通' },
-  { value: 'plan', label: '🛡 只读计划' },
-  { value: 'yolo', label: '🛡 YOLO' },
+const PERMISSION_OPTIONS: Array<{ value: PermissionMode; label: string; hint: string }> = [
+  { value: 'build', label: '🛡 普通', hint: '写/删/命令默认询问' },
+  { value: 'plan', label: '🛡 只读计划', hint: '写操作只读拒绝（计划模式）' },
+  { value: 'yolo', label: '🛡 YOLO', hint: '免询问，但危险命令黑名单仍拦截（优先级最高）' },
 ];
 
 export function ChatView(): React.JSX.Element {
@@ -456,10 +460,10 @@ export function ChatView(): React.JSX.Element {
           className="sel"
           value={permissionMode}
           onChange={(e) => setPermissionMode(e.target.value as PermissionMode)}
-          title="权限模式（写/删/命令默认询问；YOLO 需显式切换 — PLAN §9）"
+          title="权限模式：普通=写/删/命令默认询问；只读计划=写操作只读拒绝；YOLO=免询问但危险命令黑名单仍拦截（R29 优先级最高 — PLAN §9）。切换即同步核心（control permission_mode，M8）"
         >
           {PERMISSION_OPTIONS.map((o) => (
-            <option key={o.value} value={o.value}>
+            <option key={o.value} value={o.value} title={o.hint}>
               {o.label}
             </option>
           ))}

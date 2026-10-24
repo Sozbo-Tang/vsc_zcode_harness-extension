@@ -43,6 +43,16 @@ CONTROL_COMMANDS = (
     "env_refresh",
     # M7（R26）：Skills 面板——已加载 SKILL.md 列表（经 Result.detail JSON 返回）
     "skills_list",
+    # M8：计划模式（webview store.setPermissionMode 已按此命令名下发，
+    # 宿主 protocol.ts 枚举镜像暂缺——宽容转发，见 store.ts 注释）
+    "set_permission_mode",
+    # 同一处理器的 webview 侧短名（store.setPermissionMode 下发）；两个名字都收
+    "permission_mode",
+    # M8（R3）：MCP 管理面板——server 列表/重连/增删
+    "mcp_list",
+    "mcp_refresh",
+    "mcp_add",
+    "mcp_remove",
 )
 PERMISSION_DECISIONS = ("allow", "deny", "always")
 TOOL_CALL_STATES = ("started", "update", "finished")
@@ -132,6 +142,10 @@ class Control:
     rootIndex: int | None = None  # set_root：init.workspaceRoots 下标
     rootPath: str | None = None  # set_root：按路径切根（与 rootIndex 二选一）
     query: str | None = None  # search_sessions：搜索关键词
+    # M8 扩展参数（同上约定：各命令只取自己所需，其余忽略）
+    mode: str | None = None  # set_permission_mode：build | plan | yolo
+    name: str | None = None  # mcp_add / mcp_remove：server 名
+    server: dict | None = None  # mcp_add：{command: [argv], env?, cwd?}（与 name 配套）
 
 
 @dataclass
