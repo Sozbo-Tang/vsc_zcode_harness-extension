@@ -31,6 +31,7 @@ from typing import Iterable, Iterator
 
 from ..config import env_var_for
 from .base import (
+    ImageBlock,
     InternalEvent,
     LLMRequest,
     Provider,
@@ -80,6 +81,7 @@ def encode_openai_messages(messages: Iterable, system: str | None = None) -> lis
     for msg in messages:
         if isinstance(msg, LLMUserMessage):
             text_parts = [b.text for b in msg.blocks if isinstance(b, TextBlock)]
+            image_blocks = [b for b in msg.blocks if isinstance(b, ImageBlock)]
             tool_msgs = [
                 {
                     "role": "tool",
@@ -90,8 +92,18 @@ def encode_openai_messages(messages: Iterable, system: str | None = None) -> lis
                 if isinstance(b, ToolResultBlock)
             ]
             out.extend(tool_msgs)
-            if text_parts:
+            if text_parts and not image_blocks:
                 out.append({"role": "user", "content": "\n\n".join(text_parts)})
+            elif text_parts or image_blocks:
+                # M5 视觉：多模态 content 数组（text + image_url data URL）
+                content: list = [{"type": "text", "text": t} for t in text_parts]
+                for blk in image_blocks:
+                    if blk.source_type == "base64":
+                        url = f"data:{blk.media_type};base64,{blk.data}"
+                    else:  # source_type 为 URL 的形态（当前生成路径未用，直通）
+                        url = blk.data
+                    content.append({"type": "image_url", "image_url": {"url": url}})
+                out.append({"role": "user", "content": content})
         elif isinstance(msg, LLMAssistantMessage):
             entry: dict = {"role": "assistant"}
             text = "\n\n".join(b.text for b in msg.blocks if isinstance(b, TextBlock))

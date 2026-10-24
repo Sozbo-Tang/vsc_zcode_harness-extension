@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
 from .llm.base import (
+    ImageBlock,
     LLMRequest,
     ProviderError,
     RedactedThinkingBlock,
@@ -142,8 +143,12 @@ class AgentLoop:
 
     # -- 主入口 --------------------------------------------------------------
 
-    def run_user_text(self, text: str) -> None:
+    def run_user_text(self, text: str, images: list[ImageBlock] | None = None) -> None:
         """一轮用户输入 →（可能有多次模型-工具往返）→ message_complete。
+
+        ``images``（M5 视觉）：主模型支持视觉时传 ImageBlock 列表，随本轮
+        user 消息进入 LLM 请求；主模型无视觉时服务层已把中继转述段落并入
+        ``text``，此处不传图（原图不进主请求，R9）。
 
         Provider 异常向上传播（由服务层捕获并广播 ``error{kind}``）；传播前
         回退本轮 user 文本，保持 user/assistant 交替——与取消路径同一语义，
@@ -153,23 +158,27 @@ class AgentLoop:
         ``_close_dangling_tool_uses``）收尾时，新文本**并入**那条 user 消息
         而不是再追加一条——连续 user 消息同样破坏交替。
         """
+        image_blocks = [b for b in (images or [])]
         base_len = len(self.messages)
         merged: LLMUserMessage | None = None
+        appended = 0  # 并入路径下本轮追加的块数（文本 + 图片），回退凭此摘除
         if self.messages and isinstance(self.messages[-1], LLMUserMessage):
             merged = self.messages[-1]
             merged.blocks.append(TextBlock(text))
+            merged.blocks.extend(image_blocks)
+            appended = 1 + len(image_blocks)
         else:
-            self.messages.append(LLMUserMessage([TextBlock(text)]))
+            self.messages.append(LLMUserMessage([TextBlock(text), *image_blocks]))
         self.perf.turn_start()
         try:
             self._run_bounded_turns()
         except BaseException:
-            self._rollback_user_text(base_len, merged)
+            self._rollback_user_text(base_len, merged, appended)
             raise
         final = self._last_outcome
         # 本回合没有产生任何 assistant 消息（首事件前取消 / 空回合）：回退
         # 本轮 user 文本（与 context_from_frames 丢弃空回合的语义一致）
-        self._rollback_user_text(base_len, merged)
+        self._rollback_user_text(base_len, merged, appended)
         self.emit(
             MessageComplete(
                 stopReason=self._last_stop,
@@ -350,19 +359,19 @@ class AgentLoop:
 
     # -- 小工具 --------------------------------------------------------------
 
-    def _rollback_user_text(self, base_len: int, merged: LLMUserMessage | None) -> None:
+    def _rollback_user_text(
+        self, base_len: int, merged: LLMUserMessage | None, appended: int = 1
+    ) -> None:
         """回退本轮 user 文本——仅当回合没有产生任何 assistant 消息时。
 
-        merged 非空表示本轮文本并入了上一回合的 tool_result user 消息：
-        回退就是摘掉追加的那个 TextBlock；否则 pop 本轮追加的整条消息。
+        merged 非空表示本轮文本（及图片块）并入了上一回合的 tool_result
+        user 消息：回退就是摘掉追加的 ``appended`` 个块；否则 pop 本轮追加
+        的整条消息。
         """
         if merged is not None:
-            if (
-                len(self.messages) == base_len
-                and merged.blocks
-                and isinstance(merged.blocks[-1], TextBlock)
-            ):
-                merged.blocks.pop()
+            n = appended if appended > 0 else 1
+            if len(self.messages) == base_len and len(merged.blocks) >= n:
+                del merged.blocks[-n:]
         elif len(self.messages) == base_len + 1:
             self.messages.pop()
 

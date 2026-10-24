@@ -130,6 +130,8 @@ export interface UserMessageContext {
   fileRefs?: string[];
   terminalSel?: string;
   problems?: string;
+  /** 图片附件路径（M5 视觉中继入口） */
+  images?: string[];
 }
 
 export type PermissionDecision = 'allow' | 'deny' | 'always';

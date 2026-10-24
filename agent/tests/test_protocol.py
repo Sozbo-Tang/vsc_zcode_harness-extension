@@ -22,6 +22,13 @@ def _samples() -> list:
         P.Control(command="resume", sessionId="s1"),
         P.Control(command="telegraph", level="high"),
         P.Control(command="switch_model", providerId="openai", modelId="gpt-5.2"),
+        # M4：fork/pin/export/set_root 及其扩展参数（None 省略 / False 保留）
+        P.Control(command="fork", sessionId="s1", atMessageId="um_1"),
+        P.Control(command="pin", sessionId="s1", pinned=True),
+        P.Control(command="pin", sessionId="s1", pinned=False),
+        P.Control(command="export", sessionId="s1"),
+        P.Control(command="set_root", rootIndex=1),
+        P.Control(command="set_root", rootPath="/w/b"),
         P.Rollback(checkpointId="ck1"),
         P.GitCommit(repoRoot="/r", scope="staged", push=False),
         P.SessionStarted(sessionId="s1"),
@@ -49,6 +56,8 @@ def _samples() -> list:
         P.ImageArtifact(path="/tmp/a.png"),
         P.Error(kind="auth", message="x"),
         P.Result(ok=True, command="telegraph", detail="downshifted"),
+        # M4：export 回执携带 Markdown 全文（保存落盘由 UI 决定）
+        P.Result(ok=True, command="export", markdown="# 会话\n\n## 用户\n"),
         # M2：隐私护栏 warning 标记（None 编码省略 / 非 None 往返保留）
         P.ToolCall(callId="t3", name="read", state="finished",
                    result={"content": "..."}, warning="privacy: '*.pem' matches sensitive file pattern"),

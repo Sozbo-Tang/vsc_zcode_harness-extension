@@ -23,6 +23,7 @@ from typing import Iterable, Iterator
 
 from ..config import env_var_for
 from .base import (
+    ImageBlock,
     InternalEvent,
     LLMRequest,
     Provider,
@@ -115,6 +116,18 @@ def encode_anthropic_messages(messages: Iterable) -> list[dict]:
                     if blk.is_error:
                         entry["is_error"] = True
                     content.append(entry)
+                elif isinstance(blk, ImageBlock):
+                    # M5 视觉：base64 图片 → anthropic image block（调研 §1.4）
+                    content.append(
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": blk.source_type or "base64",
+                                "media_type": blk.media_type,
+                                "data": blk.data,
+                            },
+                        }
+                    )
             if content:
                 out.append({"role": "user", "content": content})
         elif isinstance(msg, LLMAssistantMessage):

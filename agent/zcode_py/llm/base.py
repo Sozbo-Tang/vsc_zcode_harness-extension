@@ -15,9 +15,11 @@ llm/sse.py），不依赖各厂商 SDK 的流实现。
 
 from __future__ import annotations
 
+import base64
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterator, Literal
 
 import httpx
@@ -71,6 +73,38 @@ class ToolResultBlock:
     tool_use_id: str
     content: Any = None
     is_error: bool = False
+
+
+_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
+@dataclass
+class ImageBlock:
+    """图片内容块（M5 视觉，R9）：``source_type`` 目前仅 ``"base64"``（读文件
+    编码），``path`` 保留审计/显示用途。主模型支持视觉时随用户消息进入
+    LLM 请求；不支持时由 vision_relay 转述成文字、原图不进主请求。"""
+
+    source_type: str = "base64"
+    data: str = ""
+    media_type: str = "image/png"
+    path: str | None = None
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "ImageBlock":
+        p = Path(path).expanduser()
+        raw = p.read_bytes()
+        return cls(
+            source_type="base64",
+            data=base64.b64encode(raw).decode("ascii"),
+            media_type=_MEDIA_TYPES.get(p.suffix.lower(), "image/png"),
+            path=str(p),
+        )
 
 
 @dataclass

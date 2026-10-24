@@ -21,6 +21,7 @@ from typing import Iterable, Iterator
 
 from ..config import env_var_for
 from .base import (
+    ImageBlock,
     InternalEvent,
     LLMRequest,
     Provider,
@@ -110,6 +111,27 @@ def encode_gemini_contents(messages: Iterable) -> list[dict]:
                             }
                         }
                     )
+                elif isinstance(blk, ImageBlock):
+                    # M5 视觉：base64 → inlineData（REST camelCase，调研 §6）
+                    if blk.source_type == "base64":
+                        parts.append(
+                            {
+                                "inlineData": {
+                                    "mimeType": blk.media_type,
+                                    "data": blk.data,
+                                }
+                            }
+                        )
+                    else:
+                        # URL/file API 引用形态：当前生成路径未用，fileData 直通
+                        parts.append(
+                            {
+                                "fileData": {
+                                    "mimeType": blk.media_type,
+                                    "fileUri": blk.data,
+                                }
+                            }
+                        )
             if parts:
                 contents.append({"role": "user", "parts": parts})
         elif isinstance(msg, LLMAssistantMessage):

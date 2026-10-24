@@ -382,3 +382,174 @@ def test_main_entrypoint_end_to_end(tmp_home):
     assert types[0] == "session_started"
     assert "message_complete" in types
     assert "ping_result" in types
+
+
+# ---------------------------------------------------------------------------
+# M4：fork / pin / export / set_root 控制命令往返 + sessions_list 新字段
+# ---------------------------------------------------------------------------
+
+
+def _inbound_events(tmp_home, session_id: str) -> list:
+    transcript = (tmp_home / "sessions" / session_id / "transcript.jsonl").read_text()
+    return [
+        json.loads(line)["event"]
+        for line in transcript.splitlines()
+        if json.loads(line)["dir"] == "in"
+    ]
+
+
+def test_sessions_list_carries_m4_fields(tmp_home):
+    ws = tmp_home / "ws"
+    ws.mkdir()
+    fake = FakeProvider(turns=[[TextDelta("答")]])
+    harness = Harness(fake)
+    harness.send({"type": "init", "workspaceRoots": [str(ws)]})
+    session_id = harness.frames()[0]["sessionId"]
+    harness.send({"type": "user_message", "text": "重构登录模块"})
+    assert harness.wait_frames("message_complete")
+
+    # new_session 触发一次新的 sessions_list 广播，携带首会话的最新元信息
+    harness.send({"type": "control", "command": "new_session"})
+    listing = harness.frames_of_type("sessions_list")[-1]["sessions"]
+    entry = next(s for s in listing if s["sessionId"] == session_id)
+    assert entry["title"] == "重构登录模块"
+    assert entry["pinned"] is False
+    assert entry["messageCount"] == 1
+    assert entry["lastActivity"]
+    assert entry["rootPath"] == str(ws)
+
+
+def test_fork_control_round_trip(tmp_home):
+    fake = FakeProvider(turns=[[TextDelta("第一答")], [TextDelta("第二答")]])
+    harness = Harness(fake)
+    harness.send({"type": "init", "workspaceRoots": []})
+    session_id = harness.frames()[0]["sessionId"]
+    harness.send({"type": "user_message", "text": "问题一"})
+    assert harness.wait_frames("message_complete")
+    harness.send({"type": "user_message", "text": "问题二"})
+    assert harness.wait_frames("message_complete", count=2)
+
+    # 分叉点 = 转录里第二条用户消息的 messageId（入站帧落盘时已附上）
+    fork_point = _inbound_events(tmp_home, session_id)[-1]["messageId"]
+
+    harness.send(
+        {"type": "control", "command": "fork", "sessionId": session_id, "atMessageId": fork_point}
+    )
+    result = harness.frames_of_type("result")[-1]
+    assert result["command"] == "fork" and result["ok"] is True
+    new_id = result["detail"]
+    assert new_id != session_id
+    # 广播了新会话 session_started + 列表更新（含 parentSessionId）
+    assert new_id in [f["sessionId"] for f in harness.frames_of_type("session_started")]
+    listing = harness.frames_of_type("sessions_list")[-1]["sessions"]
+    assert any(
+        s["sessionId"] == new_id and s["parentSessionId"] == session_id for s in listing
+    )
+    # 新会话转录只含分叉点之前的轮次（问题一那轮）
+    assert [e["text"] for e in _inbound_events(tmp_home, new_id)] == ["问题一"]
+    # 新会话的 session_started 没被重复记进本会话转录（record=False 语义）
+    assert "问题二" not in (tmp_home / "sessions" / new_id / "transcript.jsonl").read_text()
+
+    # 未知分叉点 → not_found
+    harness.send({"type": "control", "command": "fork", "sessionId": session_id, "atMessageId": "ghost"})
+    assert harness.frames_of_type("error")[-1]["kind"] == "not_found"
+
+
+def test_pin_toggle_round_trip(tmp_home):
+    harness = Harness(FakeProvider())
+    harness.send({"type": "init", "workspaceRoots": []})
+    session_id = harness.frames()[0]["sessionId"]
+
+    harness.send({"type": "control", "command": "pin", "sessionId": session_id, "pinned": True})
+    result = harness.frames_of_type("result")[-1]
+    assert result["command"] == "pin" and result["ok"] is True and result["detail"] == "pinned"
+    meta = json.loads((tmp_home / "sessions" / session_id / "meta.json").read_text())
+    assert meta["pinned"] is True
+
+    # pinned 缺省 = 取反切换
+    harness.send({"type": "control", "command": "pin", "sessionId": session_id})
+    result = harness.frames_of_type("result")[-1]
+    assert result["detail"] == "unpinned"
+    meta = json.loads((tmp_home / "sessions" / session_id / "meta.json").read_text())
+    assert meta["pinned"] is False
+
+    harness.send({"type": "control", "command": "pin", "sessionId": "ghost"})
+    assert harness.frames_of_type("error")[-1]["kind"] == "not_found"
+
+
+def test_export_returns_markdown_via_result(tmp_home):
+    fake = FakeProvider(turns=[[TextDelta("答复全文")]])
+    harness = Harness(fake)
+    harness.send({"type": "init", "workspaceRoots": []})
+    session_id = harness.frames()[0]["sessionId"]
+    harness.send({"type": "user_message", "text": "导出我"})
+    assert harness.wait_frames("message_complete")
+
+    harness.send({"type": "control", "command": "export", "sessionId": session_id})
+    result = harness.frames_of_type("result")[-1]
+    assert result["command"] == "export" and result["ok"] is True
+    markdown = result["markdown"]
+    assert markdown.startswith("# ")
+    assert "## 用户" in markdown and "导出我" in markdown
+    assert "## 助手" in markdown and "答复全文" in markdown
+
+    harness.send({"type": "control", "command": "export", "sessionId": "ghost"})
+    assert harness.frames_of_type("error")[-1]["kind"] == "not_found"
+
+
+def test_set_root_switches_tool_cwd(tmp_home):
+    ws_a = tmp_home / "ws_a"
+    ws_b = tmp_home / "ws_b"
+    ws_a.mkdir()
+    ws_b.mkdir()
+    fake = FakeProvider(turns=[[TextDelta("ok")]])
+    harness = Harness(fake)
+    harness.send({"type": "init", "workspaceRoots": [str(ws_a), str(ws_b)]})
+    session_id = harness.frames()[0]["sessionId"]
+    assert harness.service._loop.tool_session.ctx.cwd == ws_a  # 默认第一个根
+
+    # 按 rootIndex 切根：工具 ctx cwd、会话 meta.rootPath 同步
+    harness.send({"type": "control", "command": "set_root", "rootIndex": 1})
+    result = harness.frames_of_type("result")[-1]
+    assert result["command"] == "set_root" and result["ok"] is True
+    assert result["detail"] == str(ws_b)
+    assert harness.service._loop.tool_session.ctx.cwd == ws_b
+    meta = json.loads((tmp_home / "sessions" / session_id / "meta.json").read_text())
+    assert meta["rootPath"] == str(ws_b)
+
+    # 按 rootPath 切回；不带参数回落第一个根
+    harness.send({"type": "control", "command": "set_root", "rootPath": str(ws_a)})
+    assert harness.service._loop.tool_session.ctx.cwd == ws_a
+    harness.send({"type": "control", "command": "set_root", "rootIndex": 1})
+    harness.send({"type": "control", "command": "set_root"})
+    assert harness.service._loop.tool_session.ctx.cwd == ws_a
+
+    # 越界 / 工作区之外的路径一律拒绝
+    harness.send({"type": "control", "command": "set_root", "rootIndex": 9})
+    errors = harness.frames_of_type("error")
+    assert errors[-1]["kind"] == "protocol" and "out of range" in errors[-1]["message"]
+    harness.send({"type": "control", "command": "set_root", "rootPath": "/not/a/root"})
+    errors = harness.frames_of_type("error")
+    assert errors[-1]["kind"] == "protocol" and "workspaceRoots" in errors[-1]["message"]
+
+
+def test_new_session_resets_root_and_resume_restores(tmp_home):
+    """set_root 的根只属于当前会话：新会话回落第一个根，resume 回到记录的根。"""
+    ws_a = tmp_home / "ws_a"
+    ws_b = tmp_home / "ws_b"
+    ws_a.mkdir()
+    ws_b.mkdir()
+    fake = FakeProvider(turns=[[TextDelta("ok")]])
+    harness = Harness(fake)
+    harness.send({"type": "init", "workspaceRoots": [str(ws_a), str(ws_b)]})
+    first = harness.frames()[0]["sessionId"]
+    harness.send({"type": "control", "command": "set_root", "rootIndex": 1})
+    assert harness.service._loop.tool_session.ctx.cwd == ws_b
+
+    harness.send({"type": "control", "command": "new_session"})
+    assert harness.service._loop.tool_session.ctx.cwd == ws_a  # 新会话默认第一个根
+
+    harness.send({"type": "control", "command": "resume", "sessionId": first})
+    result = harness.frames_of_type("result")[-1]
+    assert result["command"] == "resume" and result["ok"] is True
+    assert harness.service._loop.tool_session.ctx.cwd == ws_b  # 恢复记录的根

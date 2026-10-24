@@ -108,3 +108,177 @@ def test_replay_with_fresh_store_instance(tmp_home):
     assert [m["sessionId"] for m in revived.list_sessions()] == [session_id]
     messages = context_from_frames(revived.read_frames(session_id))
     assert [b.text for m in messages for b in m.blocks] == ["q1", "a1"]
+
+
+# ---------------------------------------------------------------------------
+# M4：列表元信息（title/messageCount/pinned/rootPath）、搜索、分叉、导出、输入历史
+# ---------------------------------------------------------------------------
+
+
+def test_record_user_input_title_history_count(tmp_home):
+    """title 由首条非空用户消息定（前 30 字符只定一次）；messageCount 每条 +1。"""
+    store = SessionStore()
+    sid = store.create()["sessionId"]
+    store.record_user_input(sid, "把登录模块重构成类形式并补齐测试")
+    first = store.get_meta(sid)
+    assert first["title"] == "把登录模块重构成类形式并补齐测试"  # <30 字符整条
+    assert first["messageCount"] == 1
+
+    long_text = "甲" * 35
+    other = store.create()["sessionId"]
+    store.record_user_input(other, long_text)
+    assert store.get_meta(other)["title"] == "甲" * 30  # 恰 30 字符截断
+
+    # 第二条消息不改 title，只累计轮次
+    store.record_user_input(sid, "再来一条")
+    again = store.get_meta(sid)
+    assert again["title"] == "把登录模块重构成类形式并补齐测试"
+    assert again["messageCount"] == 2
+
+
+def test_input_history_cap_and_consecutive_dedupe(tmp_home):
+    store = SessionStore()
+    sid = store.create()["sessionId"]
+    store.record_user_input(sid, "same")
+    store.record_user_input(sid, "same")  # 连续重复不占 ↑ 位
+    assert store.get_meta(sid)["inputHistory"] == ["same"]
+    for i in range(105):
+        store.record_user_input(sid, f"q{i:03d}")
+    history = store.get_meta(sid)["inputHistory"]
+    assert len(history) == 100  # R27 上限
+    assert history[0] == "q005"  # 最旧的被挤出
+    assert history[-1] == "q104"
+
+
+def test_create_defaults_and_pin_toggle(tmp_home):
+    store = SessionStore()
+    meta = store.create(root_path="/w/a")
+    sid = meta["sessionId"]
+    on_disk = store.get_meta(sid)
+    assert on_disk["pinned"] is False
+    assert on_disk["rootPath"] == "/w/a"
+    assert on_disk["messageCount"] == 0
+
+    store.set_pinned(sid, True)
+    assert store.get_meta(sid)["pinned"] is True
+    store.set_pinned(sid, False)
+    assert store.get_meta(sid)["pinned"] is False
+
+
+def test_search_by_title_and_transcript_text(tmp_home):
+    store = SessionStore()
+    s1 = store.create()["sessionId"]
+    store.record_user_input(s1, "重构登录模块")
+    store.append(s1, {"type": "message_complete", "stopReason": "end_turn", "text": "AuthClass 已就位"})
+    s2 = store.create()["sessionId"]
+    store.record_user_input(s2, "数据库连接排查")
+
+    assert [m["sessionId"] for m in store.search_sessions("登录")] == [s1]  # title 命中
+    assert [m["sessionId"] for m in store.search_sessions("authclass")] == [s1]  # 助手文本、大小写不敏感
+    assert [m["sessionId"] for m in store.search_sessions("数据库")] == [s2]  # 用户文本
+    assert store.search_sessions("不存在的关键词") == []
+    assert len(store.search_sessions("   ")) == 2  # 空关键词退化为全量
+    # 工具参数不是搜索语料：查工具路径命不中
+    store.append(s2, {"type": "tool_call", "callId": "t", "name": "read",
+                      "args": {"path": "zzz_secret.py"}, "state": "finished"})
+    assert store.search_sessions("zzz_secret") == []
+
+
+def _fill_two_turns(store: SessionStore, sid: str) -> None:
+    store.append(sid, {"type": "session_started", "sessionId": sid})
+    store.append(sid, {"type": "telegraph_state", "current": "max"})
+    store.append(sid, {"type": "user_message", "text": "q1", "messageId": "um_a"}, direction="in")
+    store.append(sid, {"type": "tool_call", "callId": "t1", "name": "read", "args": {"path": "a.py"},
+                       "state": "finished", "result": {"content": "x"}, "elapsedMs": 3})
+    store.append(sid, {"type": "message_complete", "stopReason": "end_turn", "text": "a1"})
+    store.append(sid, {"type": "user_message", "text": "q2", "messageId": "um_b"}, direction="in")
+    store.append(sid, {"type": "message_complete", "stopReason": "end_turn", "text": "a2"})
+
+
+def test_fork_copies_prefix_before_fork_point(tmp_home):
+    """分叉语义：新会话 = 分叉点用户消息**之前**的完整轮次；分叉点那轮不带走。"""
+    store = SessionStore()
+    meta = store.create(workspace_roots=["/w"], root_path="/w",
+                        provider_id="glm", model_id="glm-5.3", title="话题")
+    sid = meta["sessionId"]
+    _fill_two_turns(store, sid)
+
+    forked = store.fork(sid, "um_b")
+    new_id = forked["sessionId"]
+    assert new_id != sid
+    assert forked["parentSessionId"] == sid
+    assert forked["title"] == "话题"
+    assert forked["rootPath"] == "/w"
+    frames = store.read_frames(new_id)
+    assert [(f["dir"], f["event"]["type"]) for f in frames] == [
+        ("out", "session_started"),   # 新 id 首帧
+        ("out", "telegraph_state"),
+        ("in", "user_message"),       # q1 轮完整（含工具卡）
+        ("out", "tool_call"),
+        ("out", "message_complete"),
+    ]
+    assert frames[0]["event"]["sessionId"] == new_id  # 旧 session_started 已剔除
+    assert frames[2]["event"]["messageId"] == "um_a"
+    # 分叉点那轮不带走：q2/a2 不在新转录，上下文重建也只有 q1/a1
+    assert all(f["event"].get("text") != "q2" for f in frames)
+    assert forked["messageCount"] == 1
+    assert forked["inputHistory"] == ["q1"]
+    messages = context_from_frames(frames)
+    assert [b.text for m in messages for b in m.blocks] == ["q1", "a1"]
+
+    # 原会话不受影响
+    assert len(store.read_frames(sid)) == 7
+
+
+def test_fork_at_first_message_yields_empty_prefix(tmp_home):
+    store = SessionStore()
+    sid = store.create()["sessionId"]
+    _fill_two_turns(store, sid)
+    forked = store.fork(sid, "um_a")
+    frames = store.read_frames(forked["sessionId"])
+    # 前缀里没有轮次，只剩新 session_started + 首条消息前的状态帧（车钟等）
+    assert [(f["dir"], f["event"]["type"]) for f in frames] == [
+        ("out", "session_started"),
+        ("out", "telegraph_state"),
+    ]
+    assert frames[0]["event"]["sessionId"] == forked["sessionId"]
+    assert forked["messageCount"] == 0
+    assert forked["inputHistory"] == []
+
+
+def test_fork_unknown_point_raises(tmp_home):
+    store = SessionStore()
+    sid = store.create()["sessionId"]
+    _fill_two_turns(store, sid)
+    with pytest.raises(SessionError, match="fork point"):
+        store.fork(sid, "um_ghost")
+    with pytest.raises(SessionError):
+        store.fork("nope", "um_a")
+
+
+def test_export_markdown_structure(tmp_home):
+    store = SessionStore()
+    sid = store.create(provider_id="glm", model_id="glm-5.3", root_path="/w")["sessionId"]
+    store.record_user_input(sid, "看看这个报错")
+    store.append(sid, {"type": "user_message", "text": "看看这个报错", "messageId": "um_a"}, direction="in")
+    store.append(sid, {"type": "tool_call", "callId": "t1", "name": "bash",
+                       "args": {"command": "pytest -q"}, "state": "finished",
+                       "result": {"output": "..."}, "elapsedMs": 12})
+    store.append(sid, {"type": "tool_call", "callId": "t2", "name": "read",
+                       "args": {"path": "a.py"}, "state": "finished",
+                       "result": {"error": "not_found", "detail": "gone"}})
+    store.append(sid, {"type": "message_complete", "stopReason": "end_turn", "text": "修好了"})
+    store.append(sid, {"type": "user_message", "text": "再跑一次", "messageId": "um_b"}, direction="in")
+    store.append(sid, {"type": "message_complete", "stopReason": "cancelled", "text": None})
+
+    md = store.export_markdown(sid)
+    assert md.startswith("# 看看这个报错\n")
+    assert "session `" + sid + "`" in md
+    assert "glm/glm-5.3" in md
+    assert "root `/w`" in md
+    # 轮次结构：用户 → 本轮工具卡摘要 → 助手
+    assert md.index("## 用户") < md.index("`bash` pytest -q (ok, 12ms)")
+    assert md.index("`bash`") < md.index("`read` a.py (error)")
+    assert md.index("`read`") < md.index("## 助手")
+    assert "修好了" in md
+    assert "_（无文本输出）_" in md  # 取消轮显式标注，不静默丢轮

@@ -32,6 +32,13 @@ CONTROL_COMMANDS = (
     "telegraph",
     "switch_model",
     "ping",
+    # M4（R16/R28/R12/R11）：分叉 / 收藏固定 / 导出 Markdown / multi-root 切根
+    "fork",
+    "pin",
+    "export",
+    "set_root",
+    # M5（R7/R21）：环境面板「刷新」——重新探测并广播 env_info
+    "env_refresh",
 )
 PERMISSION_DECISIONS = ("allow", "deny", "always")
 TOOL_CALL_STATES = ("started", "update", "finished")
@@ -62,6 +69,8 @@ class MessageContext:
     fileRefs: list = field(default_factory=list)
     terminalSel: str | None = None
     problems: str | None = None
+    """图片附件路径（M5 视觉中继入口；主模型无视觉时经中继转述后退场）"""
+    images: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         out: dict = {}
@@ -73,6 +82,8 @@ class MessageContext:
             out["terminalSel"] = self.terminalSel
         if self.problems is not None:
             out["problems"] = self.problems
+        if self.images:
+            out["images"] = list(self.images)
         return out
 
     @classmethod
@@ -82,6 +93,7 @@ class MessageContext:
             fileRefs=list(payload.get("fileRefs") or []),
             terminalSel=payload.get("terminalSel"),
             problems=payload.get("problems"),
+            images=list(payload.get("images") or []),
         )
 
 
@@ -110,6 +122,11 @@ class Control:
     level: str | None = None
     providerId: str | None = None
     modelId: str | None = None
+    # M4 扩展参数：各命令只取自己所需，其余字段忽略（向后兼容靠这一约定）
+    atMessageId: str | None = None  # fork：分叉点（转录内入站 user_message 的 messageId）
+    pinned: bool | None = None  # pin：目标态；缺省 = 取反切换
+    rootIndex: int | None = None  # set_root：init.workspaceRoots 下标
+    rootPath: str | None = None  # set_root：按路径切根（与 rootIndex 二选一）
 
 
 @dataclass
@@ -230,6 +247,12 @@ class RollbackResult:
 
 @dataclass
 class SessionsList:
+    """会话列表：sessions 为摘要 dict 数据驱动直通（TS 侧开放接口）。
+
+    M4 起字段：sessionId / title / pinned / lastActivity / messageCount /
+    rootPath（另有 providerId / modelId / parentSessionId）。
+    """
+
     sessions: list = field(default_factory=list)
 
 
@@ -274,6 +297,8 @@ class Result:
     ok: bool
     command: str | None = None
     detail: str | None = None
+    # export：导出的 Markdown 全文（保存落盘由 UI 决定）；其余命令恒 None
+    markdown: str | None = None
 
 
 # ---------------------------------------------------------------------------

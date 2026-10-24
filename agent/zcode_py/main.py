@@ -11,12 +11,17 @@
 - ``rollback{checkpointId}`` → ``git checkout <sha> -- .``（M2；命令本身即
   用户的显式确认动作——UI「回滚到这」按钮）
 - ``control``：new_session / resume / cancel / telegraph / switch_model / ping
+  + M4 四件：fork（分叉点之前轮次复制成新会话并广播）/ pin（收藏切换）/
+  export（Markdown 经 result 帧返回）/ set_root（multi-root 切当前根）
   （compact 属 M8，明确回 unsupported）
 - git_commit 属后续里程碑，回 unsupported
 
 会话转录（transcript.jsonl + meta.json）由 sessions/ 落盘；resume 重放历史
-out 帧（不重复入账）。API Key 只从环境变量读（config.api_key_for），且不随
-bash 子进程环境泄漏（tools/bash.sanitize_child_env）。
+out 帧（不重复入账）。入站 user_message 落转录时附 messageId（fork 分叉点与
+checkpoint.atMessageId 对齐）。MEMORY.md 跨会话记忆（R24）在会话启动时注入
+system prompt 尾部，``memory`` 工具读写它（read 免批 / 写与 write 同档）。
+API Key 只从环境变量读（config.api_key_for），且不随 bash 子进程环境泄漏
+（tools/bash.sanitize_child_env）。
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ from pathlib import Path
 from typing import Callable, TextIO
 
 from . import telegraph
+from . import vision_relay
 from .checkpoints import CheckpointManager
 from .config import (
     DEFAULT_CONFIG,
@@ -39,16 +45,19 @@ from .config import (
     get_provider_entry,
     load_config,
 )
+from .envprobe import environment_facts, probe as probe_environment
 from .llm import Provider, ProviderError, default_provider_factory, ping as ping_provider
+from .llm.base import ImageBlock
 from .loop import AgentLoop, DEFAULT_SYSTEM_PROMPT, context_from_frames
+from .memory import MemoryPermissionEngine, memory_injection, register_memory_tool
 from .perf import PerfTracker
-from .permissions import PermissionEngine
 from .protocol import (
     Checkpoint,
     Control,
     CoreToShellMessage,
     DiffProposed,
     DiffReview,
+    EnvInfo,
     Error,
     GitCommit,
     Init,
@@ -196,12 +205,17 @@ class ZcodeService:
         self._settings: dict = {}
         self._workspace_roots: list = []
         self._usage_by_model: dict[str, dict[str, int]] = {}
-        # M2：工具/权限/检查点
+        # M2：工具/权限/检查点；M4：memory 工具（R24）挂进注册表
         self._router = ResponseRouter()
         self._registry = default_registry()
+        register_memory_tool(self._registry)
         self._checkpoints: CheckpointManager | None = None
         self._workspace_cwd = Path.cwd()
         self._permission_timeout_s = DEFAULT_PERMISSION_TIMEOUT_S
+        # M5：环境探测（R7/R21）后台线程状态与注入缓存
+        self._env_probe_lock = threading.Lock()
+        self._env_probe_thread: threading.Thread | None = None
+        self._env_facts: str | None = None
 
     # ------------------------------------------------------------------ 帧入口
 
@@ -264,6 +278,41 @@ class ZcodeService:
         model = get_model_entry(entry) if entry else None
         self._apply_model(entry, model, keep_level=None)
         self._start_session()
+        # M5（R7/R21）：init 后台线程探测硬件+工作区语言 → 广播 env_info；
+        # 不阻塞读线程与首条消息（环境注入规则见 _system_prompt_with_env）
+        self._spawn_env_probe()
+
+    # ------------------------------------------------------------------ M5 环境探测
+
+    def _spawn_env_probe(self) -> bool:
+        """启动一次环境探测（已在跑则返回 False）。"""
+        if not self._env_probe_lock.acquire(blocking=False):
+            return False
+        thread = threading.Thread(
+            target=self._run_env_probe, daemon=True, name="zcode-envprobe"
+        )
+        self._env_probe_thread = thread
+        thread.start()
+        return True
+
+    def _run_env_probe(self) -> None:
+        """探测 → 广播 env_info（含环境面板所需全部事实）→ 环境事实注入
+        system prompt。探测失败广播 error 但不影响会话。"""
+        try:
+            env = probe_environment(self._workspace_roots)
+            self._emit(
+                EnvInfo(hardware=env["hardware"], workspaceLangs=env["workspaceLangs"])
+            )
+            self._env_facts = environment_facts(env)
+            loop = self._loop
+            if loop is not None:
+                loop.system_prompt = self._system_prompt_with_env()
+        except Exception as exc:  # noqa: BLE001 —— 探测失败只降级，不拖垮会话
+            self._emit(
+                Error(kind="env", message=f"environment probe failed: {type(exc).__name__}: {exc}")
+            )
+        finally:
+            self._env_probe_lock.release()
 
     def _ensure_config(self) -> None:
         if self._config is not None:
@@ -277,10 +326,16 @@ class ZcodeService:
     # ------------------------------------------------------------------ 会话
 
     def _start_session(self) -> None:
+        # R11：新会话默认第一个根（会话内 set_root 过的根不带到新会话）；
+        # resume 的会话根恢复在 _control_resume 处理
+        if self._workspace_roots:
+            self._workspace_cwd = Path(self._workspace_roots[0]).expanduser()
+            self._checkpoints = CheckpointManager(self._workspace_cwd)
         meta = self._store.create(
             workspace_roots=self._workspace_roots,
             provider_id=(self._provider_entry or {}).get("id"),
             model_id=(self._model_entry or {}).get("id"),
+            root_path=str(self._workspace_cwd) if self._workspace_roots else None,
         )
         self._emitter.bind_session(meta["sessionId"])
         self._cancel.clear()
@@ -299,17 +354,23 @@ class ZcodeService:
                 )
             )
 
-    def _session_summaries(self) -> list:
-        return [
+    def _session_summaries(self, metas: list | None = None) -> list:
+        """sessions_list 载荷（M4 字段集，None 值剔除保持载荷紧凑）。"""
+        summaries = [
             {
                 "sessionId": m.get("sessionId"),
                 "title": m.get("title"),
-                "updatedAt": m.get("updatedAt"),
+                "pinned": bool(m.get("pinned")),
+                "lastActivity": m.get("updatedAt"),
+                "messageCount": int(m.get("messageCount") or 0),
+                "rootPath": m.get("rootPath"),
                 "providerId": m.get("providerId"),
                 "modelId": m.get("modelId"),
+                "parentSessionId": m.get("parentSessionId"),
             }
-            for m in self._store.list_sessions()
+            for m in (metas if metas is not None else self._store.list_sessions())
         ]
+        return [{k: v for k, v in s.items() if v is not None} for s in summaries]
 
     # ------------------------------------------------------------------ 模型
 
@@ -349,13 +410,30 @@ class ZcodeService:
     def model_id(self) -> str | None:
         return (self._model_entry or {}).get("id")
 
+    def _system_prompt_with_env(self) -> str:
+        """系统提示词组装：settings 覆盖 → 环境事实 → 跨会话记忆。
+
+        M5 环境注入规则（R21）：探测在后台线程进行，**不阻塞首条消息**——
+        探测完成前的轮次用裸提示词；探测完成后（``_run_env_probe`` 更新
+        ``loop.system_prompt``）注入生效于**后续轮次**（LLMRequest.system
+        每轮从 loop.system_prompt 现取）。
+        """
+        prompt = str(self._settings.get("systemPrompt") or DEFAULT_SYSTEM_PROMPT)
+        if self._env_facts:
+            prompt += "\n\n" + self._env_facts
+        # R24：会话启动注入跨会话记忆尾部（无 MEMORY.md / 空文件不占 token）
+        injection = memory_injection()
+        if injection:
+            prompt += injection
+        return prompt
+
     def _rebuild_loop(self) -> None:
         perf = PerfTracker()
-        system_prompt = str(self._settings.get("systemPrompt") or DEFAULT_SYSTEM_PROMPT)
+        system_prompt = self._system_prompt_with_env()
         allow_rules = [
             str(r) for r in (self._settings.get("permissionAllow") or []) if isinstance(r, str)
         ]
-        engine = PermissionEngine(allow_rules=allow_rules)
+        engine = MemoryPermissionEngine(allow_rules=allow_rules)
         session = ToolSession(
             registry=self._registry,
             permissions=engine,
@@ -409,14 +487,19 @@ class ZcodeService:
             )
             return
         session_id = self._emitter.session_id
-        self._store.append(session_id, encode_message(msg), direction="in")
+        # messageId 先于一切落盘动作生成：转录入站帧、checkpoint.atMessageId、
+        # fork 分叉点共用同一标识（R16/R30 对齐）
+        message_id = "um_" + uuid.uuid4().hex[:10]
+        inbound = encode_message(msg)
+        inbound["messageId"] = message_id
+        self._store.append(session_id, inbound, direction="in")
         try:
-            self._store.update_meta(session_id, title=(msg.text or "")[:40] or None)
+            # R16/R27：首条用户消息定 title（前 30 字符）+ 输入历史 + 轮次计数
+            self._store.record_user_input(session_id, msg.text or "")
         except SessionError:
             pass
         # 检查点：每条 user_message 处理前做 git 快照（R30；不动工作区）。
         # sha 与消息 id 随 checkpoint 事件入转录，rollback 凭转录找回 sha。
-        message_id = "um_" + uuid.uuid4().hex[:10]
         if self._checkpoints is not None:
             snap = self._checkpoints.snapshot(message_id)
             if snap.ok:
@@ -424,17 +507,29 @@ class ZcodeService:
                     Checkpoint(id=snap.checkpoint_id, sha=snap.sha, atMessageId=message_id)
                 )
         text = _decorate_user_message(msg)
+        images = [
+            str(p)
+            for p in ((msg.context.images if msg.context is not None else None) or [])
+            if str(p).strip()
+        ]
         self._cancel.clear()  # 上一回合的 cancel 不应泄漏到新回合
         thread = threading.Thread(
-            target=self._run_turn, args=(session_id, text), daemon=True, name="zcode-turn"
+            target=self._run_turn, args=(session_id, text, images), daemon=True, name="zcode-turn"
         )
         self._turn_thread = thread
         thread.start()
 
-    def _run_turn(self, session_id: str, text: str) -> None:
+    def _run_turn(self, session_id: str, text: str, images: list[str] | None = None) -> None:
         assert self._loop is not None
         try:
-            self._loop.run_user_text(text)
+            # M5 视觉入口（R9）：主模型支持视觉 → ImageBlock 直入请求；否则
+            # 中继转述段落并入用户文本（原图不进主请求）。中继在回合线程内
+            # 做——它本身是一次模型流式调用，可能秒级阻塞。
+            blocks, relay_paragraphs = self._prepare_images(images or [])
+            if relay_paragraphs:
+                suffix = "\n\n".join(relay_paragraphs)
+                text = f"{text}\n\n{suffix}" if text else suffix
+            self._loop.run_user_text(text, images=blocks or None)
         except ProviderError as exc:
             self._emit(Error(kind=exc.kind, message=exc.message))
         except Exception as exc:  # noqa: BLE001
@@ -449,6 +544,40 @@ class ZcodeService:
                 self._store.update_meta(session_id)
             except SessionError:
                 pass
+
+    def _prepare_images(self, images: list[str]) -> tuple[list, list[str]]:
+        """图片分流（R9）：返回 (主请求 ImageBlock 列表, 中继转述段落)。
+
+        - 主模型档案 ``capabilities.vision`` → 读文件 base64 成 ImageBlock；
+        - 无视觉 → 视觉中继（vision_relay.relay_images）：每图广播
+          ``vision_relay`` 帧（经 emitter 入转录，可审计）；未配置中继模型
+          广播 ``error{kind:"config"}``，图片按无视觉处理（跳过，不阻塞）。
+        """
+        if not images:
+            return [], []
+        if vision_relay.model_supports_vision(self._model_entry):
+            blocks: list = []
+            for path in images:
+                try:
+                    blocks.append(ImageBlock.from_file(path))
+                except OSError as exc:
+                    self._emit(Error(kind="vision", message=f"cannot read image {path}: {exc}"))
+            return blocks, []
+        result = vision_relay.relay_images(
+            images,
+            config=self._config or {},
+            provider_entry=self._provider_entry,
+            settings=self._settings,
+            provider_factory=self._factory,
+            api_key_env=self._api_key_env,
+            on_frame=self._emit,
+            cancel_event=self._cancel,
+        )
+        if result.error is not None:
+            self._emit(result.error)
+        for err in result.errors:
+            self._emit(err)
+        return [], result.paragraphs
 
     def _turn_alive(self) -> bool:
         thread = self._turn_thread
@@ -465,6 +594,10 @@ class ZcodeService:
             "switch_model": self._control_switch_model,
             "ping": self._control_ping,
             "compact": self._control_compact,
+            "fork": self._control_fork,
+            "pin": self._control_pin,
+            "export": self._control_export,
+            "set_root": self._control_set_root,
         }.get(msg.command)
         if handler is None:
             self._emit(Error(kind="protocol", message=f"unknown control command: {msg.command!r}"))
@@ -505,6 +638,9 @@ class ZcodeService:
             )
             return
         self._apply_model(entry, model, keep_level=self._level)
+        # R11：恢复会话回到它记录的根（meta.rootPath 须仍在当前 workspaceRoots
+        # 内——工作区已移除的根不能复活）；检查点管理器随根重建（sha 绑定仓库）
+        self._restore_session_root(meta)
         self._emitter.bind_session(session_id)
         self._cancel.clear()
         self._rebuild_loop()
@@ -621,6 +757,122 @@ class ZcodeService:
 
     def _control_compact(self, msg: Control) -> None:
         self._emit(Error(kind="unsupported", message="compaction lands in M8 (PLAN §3.4)"))
+
+    # ------------------------------------------------------------------ M4：fork / pin / export / set_root
+
+    def _control_fork(self, msg: Control) -> None:
+        """R16 分叉：分叉点之前的完整轮次复制成新会话（语义见 SessionStore.fork）。
+
+        新会话是并列的独立会话（各自进程），本进程只代为落盘 + 广播；新会话的
+        session_started / 更新的 sessions_list 用 record=False——它们描述的是
+        兄弟会话，不属于本会话的 UI 事件流（fork() 落盘时已在新转录写首帧）。
+        """
+        source_id = msg.sessionId or self._emitter.session_id
+        if not source_id:
+            self._emit(Error(kind="protocol", message="fork requires sessionId"))
+            return
+        if not msg.atMessageId:
+            self._emit(Error(kind="protocol", message="fork requires atMessageId"))
+            return
+        try:
+            new_meta = self._store.fork(source_id, msg.atMessageId)
+        except SessionError as exc:
+            self._emit(Error(kind="not_found", message=str(exc)))
+            return
+        new_id = new_meta["sessionId"]
+        self._emitter.emit(SessionStarted(sessionId=new_id), record=False)
+        self._emitter.emit(SessionsList(sessions=self._session_summaries()), record=False)
+        self._emit(Result(ok=True, command="fork", detail=new_id))
+
+    def _control_pin(self, msg: Control) -> None:
+        """R28：pinned 标志切换（pinned 缺省 = 取反）；置顶渲染由 UI 决定。"""
+        session_id = msg.sessionId or self._emitter.session_id
+        if not session_id:
+            self._emit(Error(kind="protocol", message="pin requires sessionId"))
+            return
+        try:
+            current = bool(self._store.get_meta(session_id).get("pinned"))
+            target = (not current) if msg.pinned is None else bool(msg.pinned)
+            self._store.set_pinned(session_id, target)
+        except SessionError as exc:
+            self._emit(Error(kind="not_found", message=str(exc)))
+            return
+        self._emit(Result(ok=True, command="pin", detail="pinned" if target else "unpinned"))
+
+    def _control_export(self, msg: Control) -> None:
+        """R12：transcript → Markdown，经 result.markdown 返回全文；
+        保存落盘由 UI 决定（核侧不替用户选路径）。"""
+        session_id = msg.sessionId or self._emitter.session_id
+        if not session_id:
+            self._emit(Error(kind="protocol", message="export requires sessionId"))
+            return
+        try:
+            markdown = self._store.export_markdown(session_id)
+        except SessionError as exc:
+            self._emit(Error(kind="not_found", message=str(exc)))
+            return
+        self._emit(Result(ok=True, command="export", markdown=markdown))
+
+    def _control_set_root(self, msg: Control) -> None:
+        """R11 multi-root：切换当前会话工具 ctx 的 cwd（不指定 = 默认第一个根）。
+
+        切根即切仓库：CheckpointManager 随根重建（检查点 sha 绑定原仓库，
+        留在旧管理器上无从回滚）；rootIndex / rootPath 都必须命中
+        init.workspaceRoots——不接受工作区之外的路径当根。
+        """
+        roots = list(self._workspace_roots or [])
+        if not roots:
+            self._emit(
+                Error(kind="protocol", message="set_root requires init.workspaceRoots")
+            )
+            return
+        candidates = {str(Path(r).expanduser()) for r in roots} | {str(r) for r in roots}
+        if msg.rootIndex is not None:
+            if not 0 <= msg.rootIndex < len(roots):
+                self._emit(
+                    Error(
+                        kind="protocol",
+                        message=f"rootIndex {msg.rootIndex} out of range "
+                        f"(0..{len(roots) - 1})",
+                    )
+                )
+                return
+            root = str(Path(roots[msg.rootIndex]).expanduser())
+        elif msg.rootPath:
+            if str(Path(msg.rootPath).expanduser()) not in candidates:
+                self._emit(
+                    Error(
+                        kind="protocol",
+                        message=f"rootPath {msg.rootPath!r} is not one of "
+                        "init.workspaceRoots",
+                    )
+                )
+                return
+            root = str(Path(msg.rootPath).expanduser())
+        else:
+            root = str(Path(roots[0]).expanduser())
+        self._workspace_cwd = Path(root)
+        if self._loop is not None and self._loop.tool_session is not None:
+            self._loop.tool_session.ctx.cwd = self._workspace_cwd
+        self._checkpoints = CheckpointManager(self._workspace_cwd)
+        session_id = self._emitter.session_id
+        if session_id is not None:
+            try:
+                self._store.update_meta(session_id, rootPath=root)
+            except SessionError:
+                pass
+        self._emit(Result(ok=True, command="set_root", detail=root))
+
+    def _restore_session_root(self, meta: dict) -> None:
+        """resume 时回到 meta.rootPath 记录的根（仍在当前 workspaceRoots 内才生效）。"""
+        recorded = meta.get("rootPath")
+        if not recorded:
+            return
+        roots = list(self._workspace_roots or [])
+        candidates = {str(Path(r).expanduser()) for r in roots} | {str(r) for r in roots}
+        if str(Path(recorded).expanduser()) in candidates:
+            self._workspace_cwd = Path(recorded).expanduser()
+            self._checkpoints = CheckpointManager(self._workspace_cwd)
 
     # ------------------------------------------------------------------ M2：权限 / diff 审阅 / 回滚
 
