@@ -175,6 +175,11 @@ export interface WebviewStore {
   /* ---- 输入态 ---- */
   inputDraft: string;
   setInputDraft(text: string): void;
+  /** M3：待发上下文（📎文件 / ⊞选中 / 终端选中 / Problems 的 chip 集合） */
+  pendingContext: UserMessageContext;
+  attachContext(patch: Partial<UserMessageContext>): void;
+  removeContextChip(kind: 'fileRef' | 'selection' | 'terminalSel' | 'problems', file?: string): void;
+  applyHostPrompt(text: string, context?: UserMessageContext): void;
 
   /* ---- 动作 ---- */
   boot(): Promise<void>;
@@ -275,6 +280,52 @@ export const useStore = create<WebviewStore>()((set, get) => ({
   setInputDraft: (text) => {
     set({ inputDraft: text });
     persistUi(get);
+  },
+
+  pendingContext: {},
+
+  attachContext: (patch) => {
+    set((s) => {
+      const cur = s.pendingContext;
+      const next: UserMessageContext = { ...cur };
+      if (patch.fileRefs !== undefined) {
+        const merged = [...(cur.fileRefs ?? []), ...patch.fileRefs];
+        next.fileRefs = [...new Set(merged)];
+      }
+      if (patch.selection !== undefined) next.selection = patch.selection;
+      if (patch.terminalSel !== undefined) next.terminalSel = patch.terminalSel;
+      if (patch.problems !== undefined) next.problems = patch.problems;
+      return { pendingContext: next };
+    });
+  },
+
+  removeContextChip: (kind, file) => {
+    set((s) => {
+      const cur = s.pendingContext;
+      const next: UserMessageContext = { ...cur };
+      if (kind === 'fileRef') {
+        next.fileRefs = (cur.fileRefs ?? []).filter((f) => f !== file);
+      } else if (kind === 'selection') {
+        delete next.selection;
+      } else if (kind === 'terminalSel') {
+        delete next.terminalSel;
+      } else {
+        delete next.problems;
+      }
+      return { pendingContext: next };
+    });
+  },
+
+  applyHostPrompt: (text, context) => {
+    // 宿主预填（编辑器右键/终端选中/Problems）：既有草稿在前、新文本换行接续，
+    // 上下文并入 pendingContext，并切到聊天视图（不代发——用户最终确认）
+    set((s) => ({
+      inputDraft: s.inputDraft ? `${s.inputDraft}\n${text}` : text,
+      view: 'chat',
+    }));
+    if (context !== undefined) {
+      useStore.getState().attachContext(context);
+    }
   },
 
   boot: async () => {
@@ -565,15 +616,17 @@ export const useStore = create<WebviewStore>()((set, get) => ({
   sendUserMessage: (text, context) => {
     const t = text.trim();
     if (!t) return;
+    const merged = { ...get().pendingContext, ...(context ?? {}) };
     set((s) => ({
       inputDraft: '',
+      pendingContext: {},
       chat: {
         ...s.chat,
-        items: [...s.chat.items, { kind: 'user', id: nid('u'), at: Date.now(), text: t, context }],
+        items: [...s.chat.items, { kind: 'user', id: nid('u'), at: Date.now(), text: t, context: merged }],
       },
     }));
     persistUi(get);
-    hostSendCore({ type: 'user_message', text: t, context: context ?? {} });
+    hostSendCore({ type: 'user_message', text: t, context: merged });
   },
 
   newSession: () => {

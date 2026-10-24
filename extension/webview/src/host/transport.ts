@@ -10,6 +10,7 @@
  *   {kind:'core', sessionKey, message}          核 → 壳事件转发
  *   {kind:'host_error', sessionKey?, errorKind, message}
  *   {kind:'process_state', sessionKey, state, detail?}
+ *   {kind:'host_prompt', text, context?}        M3 编辑器联动：待发提示预填
  *   {kind:'rpc_result', id, ok, result?, error?}
  *   {kind:'replay', messages[]}                 ready 后的全量重放（有界 2000 条）
  *
@@ -18,7 +19,7 @@
  *  - 侧边栏视图销毁重建后由宿主重放事件恢复状态（不开 retain，§1.4/§7.2）。
  */
 
-import type { CoreEvent, CoreSend, RpcErrorInfo } from '../protocol';
+import type { CoreEvent, CoreSend, RpcErrorInfo, UserMessageContext } from '../protocol';
 
 interface VsCodeApi {
   postMessage(message: unknown): void;
@@ -80,10 +81,17 @@ type HostErrorHandler = (e: { sessionKey?: string; errorKind: string; message: s
 type ProcessStateHandler = (e: { sessionKey: string; state: string; detail?: string }) => void;
 
 /* 宿主 → webview 信封（对齐 extension/src/protocol.ts HostToWebviewMessage） */
+export interface HostPromptEvent {
+  kind: 'host_prompt';
+  text: string;
+  context?: UserMessageContext;
+}
+
 type HostEnvelope =
   | { kind: 'core'; sessionKey: string; message: CoreEvent }
   | { kind: 'host_error'; sessionKey?: string; errorKind: string; message: string }
   | { kind: 'process_state'; sessionKey: string; state: string; detail?: string }
+  | HostPromptEvent
   | { kind: 'rpc_result'; id: string; ok: boolean; result?: unknown; error?: string }
   | { kind: 'replay'; messages: HostEnvelope[] };
 
@@ -92,6 +100,7 @@ const pending = new Map<string, PendingEntry>();
 const eventHandlers = new Set<EventHandler>();
 const hostErrorHandlers = new Set<HostErrorHandler>();
 const processStateHandlers = new Set<ProcessStateHandler>();
+const hostPromptHandlers = new Set<(e: HostPromptEvent) => void>();
 let installed = false;
 
 function dispatchHostMessage(data: HostEnvelope): void {
@@ -104,6 +113,9 @@ function dispatchHostMessage(data: HostEnvelope): void {
       break;
     case 'process_state':
       for (const h of processStateHandlers) h(data);
+      break;
+    case 'host_prompt':
+      for (const h of hostPromptHandlers) h(data);
       break;
     case 'rpc_result': {
       const entry = pending.get(data.id);
@@ -174,4 +186,10 @@ export function onProcessState(handler: ProcessStateHandler): () => void {
   installListener();
   processStateHandlers.add(handler);
   return () => processStateHandlers.delete(handler);
+}
+
+export function onHostPrompt(handler: (e: HostPromptEvent) => void): () => void {
+  installListener();
+  hostPromptHandlers.add(handler);
+  return () => hostPromptHandlers.delete(handler);
 }

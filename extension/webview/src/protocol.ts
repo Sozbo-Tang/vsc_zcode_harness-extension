@@ -168,8 +168,15 @@ export type CoreSend =
 
 /* ---------- webview ↔ 宿主 RPC ---------- */
 
-/** 宿主已注册（extension/src/extension.ts）：echo / getState / editor.openDiff */
-export type RegisteredRpcMethod = 'echo' | 'getState' | 'editor.openDiff';
+/** 宿主已注册（extension/src/extension.ts）：echo / getState / editor.* */
+export type RegisteredRpcMethod =
+  | 'echo'
+  | 'getState'
+  | 'editor.openDiff'
+  | 'editor.followToolCall'
+  | 'editor.getSelection'
+  | 'editor.listFiles'
+  | 'editor.pickFile';
 
 /** 编辑器桥 RPC 契约（镜像宿主 protocol.ts RPC_EDITOR_* 常量与注释） */
 export interface EditorOpenDiffParams {
@@ -188,13 +195,34 @@ export interface EditorFollowToolCallParams {
   name: string;
   /** 工具入参原样直通（宿主从中取 file_path/path/行号） */
   args: Record<string, unknown>;
+  /** 工具结果原样直通（grep 的行号在结果里） */
+  result?: unknown;
 }
 
-/**
- * 编辑跟随（R10，M3 TODO）：宿主暂未注册 → 收 unknown_method 应答，
- * 调用方须静默吞错（ToolCallCard 点击占位就是这么做的）。
- */
-export type EditorRpcMethod = 'editor.openDiff' | 'editor.followToolCall';
+/** M3 选区联动（editor.getSelection 结果；无编辑器/无选中时 null） */
+export interface EditorSelectionResult {
+  file: string;
+  startLine: number;
+  endLine: number;
+  text: string;
+}
+
+/** M3 @补全（editor.listFiles {query} → {files}，最多 20 条） */
+export interface EditorListFilesResult {
+  files: string[];
+}
+
+/** M3 文件挑选（editor.pickFile → {file}；用户取消 null） */
+export interface EditorPickFileResult {
+  file: string;
+}
+
+export type EditorRpcMethod =
+  | 'editor.openDiff'
+  | 'editor.followToolCall'
+  | 'editor.getSelection'
+  | 'editor.listFiles'
+  | 'editor.pickFile';
 
 export interface GetStateResult {
   activeSessionKey?: string;

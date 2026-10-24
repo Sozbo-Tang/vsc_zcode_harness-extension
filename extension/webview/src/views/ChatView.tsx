@@ -16,7 +16,8 @@
 import { useEffect, useRef, useState } from 'react';
 import Markdown from 'react-markdown';
 import { useStore, isSubagentTool, currentLevel, formatParam, type ChatItem } from '../store/store';
-import type { PermissionMode } from '../protocol';
+import type { EditorSelectionResult, PermissionMode } from '../protocol';
+import { useHostRpc } from '../host/useHostRpc';
 import { Telegraph } from '../components/Telegraph';
 import { PerfChip } from '../components/PerfChip';
 import { ContextMeter } from '../components/ContextMeter';
@@ -61,6 +62,16 @@ function ItemView({ item }: { item: ChatItem }): React.JSX.Element {
           {item.context?.selection && (
             <div className="attach">
               <span className="chip">📎 选中: {item.context.selection.slice(0, 40)}</span>
+            </div>
+          )}
+          {item.context?.terminalSel && (
+            <div className="attach">
+              <span className="chip">⌨ 终端选中: {item.context.terminalSel.slice(0, 40)}</span>
+            </div>
+          )}
+          {item.context?.problems && (
+            <div className="attach">
+              <span className="chip">⚠ Problems 诊断</span>
             </div>
           )}
         </div>
@@ -118,8 +129,15 @@ export function ChatView(): React.JSX.Element {
   const switchModel = useStore((s) => s.switchModel);
   const permissionMode = useStore((s) => s.permissionMode);
   const setPermissionMode = useStore((s) => s.setPermissionMode);
+  const pendingContext = useStore((s) => s.pendingContext);
+  const attachContext = useStore((s) => s.attachContext);
+  const removeContextChip = useStore((s) => s.removeContextChip);
+  const rpc = useHostRpc();
 
   const [teleOpen, setTeleOpen] = useState(false);
+  // M3 @补全：输入尾部的 @token 触发文件下拉（query 为 @ 后前缀）
+  const [atMenu, setAtMenu] = useState<{ query: string; items: string[]; active: number } | null>(null);
+  const atFetchRef = useRef<number | undefined>(undefined);
   const logRef = useRef<HTMLDivElement | null>(null);
   const stickRef = useRef(true);
 
@@ -153,6 +171,88 @@ export function ChatView(): React.JSX.Element {
       return;
     }
     sendUserMessage(draft);
+  };
+
+  const onDraftChange = (text: string): void => {
+    setInputDraft(text);
+    const m = /@([A-Za-z0-9_./-]*)$/.exec(text);
+    if (m === null) {
+      setAtMenu(null);
+      return;
+    }
+    const query = m[1];
+    setAtMenu((cur) => ({ query, items: cur?.items ?? [], active: 0 }));
+    window.clearTimeout(atFetchRef.current);
+    atFetchRef.current = window.setTimeout(() => {
+      void rpc
+        .request<{ files: string[] }>('editor.listFiles', { query })
+        .then((r) =>
+          setAtMenu((cur) =>
+            cur !== null && cur.query === query
+              ? { ...cur, items: r.files, active: Math.min(cur.active, Math.max(0, r.files.length - 1)) }
+              : cur,
+          ),
+        )
+        .catch(() => undefined); // 宿主未就绪/超时静默
+    }, 150);
+  };
+
+  const pickAtFile = (file: string): void => {
+    setInputDraft(draft.replace(/@([A-Za-z0-9_./-]*)$/, ''));
+    attachContext({ fileRefs: [file] });
+    setAtMenu(null);
+  };
+
+  const onInputKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>): void => {
+    if (atMenu !== null && atMenu.items.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setAtMenu({ ...atMenu, active: (atMenu.active + 1) % atMenu.items.length });
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setAtMenu({ ...atMenu, active: (atMenu.active - 1 + atMenu.items.length) % atMenu.items.length });
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        const f = atMenu.items[atMenu.active];
+        if (f !== undefined) pickAtFile(f);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setAtMenu(null);
+        return;
+      }
+    }
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      if (!running) sendUserMessage(draft);
+    }
+  };
+
+  const attachFile = (): void => {
+    void rpc
+      .request<{ file: string } | null>('editor.pickFile')
+      .then((r) => {
+        if (r !== null) attachContext({ fileRefs: [r.file] });
+      })
+      .catch(() => undefined);
+  };
+
+  const attachSelection = (): void => {
+    void rpc
+      .request<EditorSelectionResult | null>('editor.getSelection')
+      .then((sel) => {
+        if (sel === null) return; // 无编辑器/无选中：宿主不提示，这里也静默
+        attachContext({
+          fileRefs: [sel.file],
+          selection: `# ${sel.file} L${sel.startLine}-${sel.endLine}\n${sel.text}`,
+        });
+      })
+      .catch(() => undefined);
   };
 
   return (
@@ -232,19 +332,72 @@ export function ChatView(): React.JSX.Element {
         <PerfChip />
       </div>
 
+      {(atMenu !== null && atMenu.items.length > 0) ||
+      (pendingContext.fileRefs?.length ?? 0) > 0 ||
+      pendingContext.selection !== undefined ||
+      pendingContext.terminalSel !== undefined ||
+      pendingContext.problems !== undefined ? (
+        <div className="composer-attach">
+          {atMenu !== null && atMenu.items.length > 0 && (
+            <div className="atmenu" role="listbox">
+              {atMenu.items.map((f, i) => (
+                <div
+                  key={f}
+                  role="option"
+                  aria-selected={i === atMenu.active}
+                  className={i === atMenu.active ? 'atitem active' : 'atitem'}
+                  onClick={() => pickAtFile(f)}
+                  onMouseEnter={() => setAtMenu({ ...atMenu, active: i })}
+                >
+                  📎 {f}
+                </div>
+              ))}
+            </div>
+          )}
+          {(pendingContext.fileRefs?.length ?? 0) > 0 &&
+            pendingContext.fileRefs?.map((f) => (
+              <span key={f} className="chip">
+                📎 {f}
+                <button className="chip-x" onClick={() => removeContextChip('fileRef', f)} title="移除引用">
+                  ×
+                </button>
+              </span>
+            ))}
+          {pendingContext.selection !== undefined && (
+            <span className="chip">
+              ⊞ 选中代码
+              <button className="chip-x" onClick={() => removeContextChip('selection')} title="移除选区">
+                ×
+              </button>
+            </span>
+          )}
+          {pendingContext.terminalSel !== undefined && (
+            <span className="chip">
+              ⌨ 终端选中
+              <button className="chip-x" onClick={() => removeContextChip('terminalSel')} title="移除终端选中">
+                ×
+              </button>
+            </span>
+          )}
+          {pendingContext.problems !== undefined && (
+            <span className="chip">
+              ⚠ Problems
+              <button className="chip-x" onClick={() => removeContextChip('problems')} title="移除 Problems">
+                ×
+              </button>
+            </span>
+          )}
+        </div>
+      ) : null}
+
       <div className="inputrow">
         <textarea
           className="in inputbox"
           rows={2}
-          placeholder="问点什么… (@引用 / 技能)"
+          placeholder="问点什么… (@引用文件 / Shift+Enter 换行)"
           value={draft}
-          onChange={(e) => setInputDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
-              if (!running) sendUserMessage(draft);
-            }
-          }}
+          onChange={(e) => onDraftChange(e.target.value)}
+          onKeyDown={onInputKeyDown}
         />
         <button
           className={running ? 'btn stop' : 'btn send'}
@@ -256,13 +409,21 @@ export function ChatView(): React.JSX.Element {
       </div>
 
       <div className="quickrow">
-        <button className="btn sec" disabled title="文件引用 — M3 编辑器联动">
+        <button
+          className="btn sec"
+          onClick={attachFile}
+          title="引用工作区文件（也可在输入框输入 @ 触发补全）"
+        >
           📎 文件
         </button>
         <button className="btn sec" disabled title="图片输入 — M5 Vision 中继">
           🖼 图片
         </button>
-        <button className="btn sec" disabled title="选中代码作为上下文 — M3 编辑器联动">
+        <button
+          className="btn sec"
+          onClick={attachSelection}
+          title="把编辑器当前选中代码附为上下文"
+        >
           ⊞ 选中代码
         </button>
         <button className="btn sec" disabled title="一键 Commit & Push — R17（后续里程碑）">

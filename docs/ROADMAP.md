@@ -52,14 +52,17 @@
 
 ## M3 编辑器联动
 
-- [ ] 终端选中报错右键发送 Agent
-- [ ] Problems 面板诊断一键发送
-- [ ] 选区上下文 + @文件引用补全
-- [ ] diff 审阅页（对比视图）
-- [ ] 编辑跟随（点工具卡/diff 卡跳转对应文件行）
-- [ ] 编辑器右键菜单：解释/优化/写测试/修 Bug
+- [x] 终端选中报错右键发送 Agent（copySelection+剪贴板通道读取，剪贴板尽力恢复）
+- [x] Problems 面板诊断一键发送（命令面板/快捷键，错误+警告，上限 30 条）
+- [x] 选区上下文 + @文件引用补全（editor.getSelection/listFiles/pickFile RPC；
+      输入框 @ 触发下拉，chips 待发上下文随 user_message.context 发送）
+- [x] diff 审阅页（对比视图）（M2 落地，M3 复验）
+- [x] 编辑跟随（点工具卡跳转对应文件行；read/edit/write 用入参行号，grep 用首个命中行）
+- [x] 编辑器右键菜单：解释/优化/写测试/修 Bug（「发给 Zcode-Py」子菜单，预填草稿不代发）
+- [x] 快捷键：唤起侧边栏 ⌃⌘Z / 停止生成 ⌥⌘. / 新会话 ⌥⌘N
 
-**验收：Copilot 式 edit 体验**
+**验收：Copilot 式 edit 体验**（2026-10-24 完成；pytest 398 + compile/build 门禁全绿，
+context 四字段 e2e 冒烟通过；UI 交互需 F5 人工验收）
 
 ## M4 多会话 + 记忆
 

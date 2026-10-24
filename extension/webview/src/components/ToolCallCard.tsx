@@ -29,12 +29,14 @@ export function ToolCallCard({ item }: { item: Extract<ChatItem, { kind: 'tool' 
   const rpc = useHostRpc();
   const arg = mainArg(item.args);
 
-  // 编辑跟随（占位）：点击即上报宿主；M3 前宿主未注册该方法，吞掉应答错误
+  // 编辑跟随：点击即上报宿主（M3 已注册：按工具类型跳转文件行；
+  // grep 的行号在 result 里，一并直通）
   const onFollow = (): void => {
     const params: EditorFollowToolCallParams = {
       callId: item.callId,
       name: item.name,
       args: item.args,
+      result: item.result,
     };
     void rpc.request('editor.followToolCall', params).catch(() => undefined);
   };

@@ -23,6 +23,40 @@ def wait_for(predicate, timeout=5.0, interval=0.01):
     return False
 
 
+# ---------------------------------------------------------------------------
+# user_message.context 渲染（M3 编辑器联动的 Python 侧锁定）
+# ---------------------------------------------------------------------------
+
+
+def test_decorate_user_message_all_context_fields():
+    """selection/fileRefs/terminalSel/problems 四类附件按序拼装进提示词。"""
+    from zcode_py.main import _decorate_user_message
+    from zcode_py.protocol import MessageContext, UserMessage
+
+    msg = UserMessage(
+        text="请看上面的问题",
+        context=MessageContext(
+            selection="print('hi')",
+            fileRefs=["src/a.py"],
+            terminalSel="Traceback (most recent call last):",
+            problems="[error] src/a.py:12: boom",
+        ),
+    )
+    out = _decorate_user_message(msg)
+    assert out.index("Referenced files: src/a.py") < out.index("Selected code:")
+    assert "```\nprint('hi')\n```" in out
+    assert "Terminal selection:" in out and "Traceback" in out
+    assert "Problems:" in out and "[error] src/a.py:12" in out
+    assert out.endswith("请看上面的问题")
+
+
+def test_decorate_user_message_empty_context():
+    from zcode_py.main import _decorate_user_message
+    from zcode_py.protocol import UserMessage
+
+    assert _decorate_user_message(UserMessage(text="你好")) == "你好"
+
+
 class Harness:
     """直连 ZcodeService（stdout 为 StringIO），帧用 dict 断言。"""
 

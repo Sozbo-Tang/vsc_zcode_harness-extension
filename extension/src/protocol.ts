@@ -520,6 +520,36 @@ export interface EditorFollowToolCallParams {
   name: string;
   /** 工具入参原样直通（宿主从中取 file_path/path/行号） */
   args: Record<string, unknown>;
+  /** 工具结果原样直通（grep 等工具的行号在结果里而不是入参里） */
+  result?: unknown;
+}
+
+/* ──────────── M3 编辑器联动 RPC（选区 / @文件补全 / 文件挑选） ──────────── */
+
+export const RPC_EDITOR_GET_SELECTION = "editor.getSelection";
+/** 当前编辑器选区；无编辑器或无选中时 result 为 null */
+export interface EditorSelectionResult {
+  /** 工作区相对路径（multi-root 下相对所在根；盘外文件为绝对路径） */
+  file: string;
+  startLine: number;
+  endLine: number;
+  text: string;
+}
+
+export const RPC_EDITOR_LIST_FILES = "editor.listFiles";
+export interface EditorListFilesParams {
+  /** @ 后的补全前缀（空串 = 全部） */
+  query: string;
+}
+export interface EditorListFilesResult {
+  /** 按前缀过滤的相对路径，最多 20 条 */
+  files: string[];
+}
+
+export const RPC_EDITOR_PICK_FILE = "editor.pickFile";
+/** QuickPick 挑选结果；用户取消时 result 为 null */
+export interface EditorPickFileResult {
+  file: string;
 }
 
 export type WebviewToHostMessage = WebviewReadyMessage | WebviewCoreSendMessage | WebviewRpcRequest;
@@ -553,11 +583,25 @@ export interface WebviewRpcResponseMessage {
   error?: string;
 }
 
+/**
+ * 宿主主动投给 webview 的「待发提示」（编辑器右键四动作 / 终端选中诊断 /
+ * Problems 一键发送，PLAN §6.7）：webview 收到后填充输入框草稿并挂上下文
+ * chip，用户确认后发送（不代发——用户保持对输入的最终控制权）。
+ */
+export interface WebviewHostPromptMessage {
+  kind: "host_prompt";
+  /** 预填文本（与既有草稿拼接：草稿在前，新文本换行接续） */
+  text: string;
+  /** 随行上下文（合并进 pendingContext） */
+  context?: UserMessageContext;
+}
+
 /** 可进重放缓冲的消息（rpc_result 是即时应答、replay 自身不重放） */
 export type ReplayableWebviewMessage =
   | WebviewCoreForwardMessage
   | WebviewHostErrorMessage
-  | WebviewProcessStateMessage;
+  | WebviewProcessStateMessage
+  | WebviewHostPromptMessage;
 
 /** 视图重 resolve 后的全量重放（bounded，见 webviewHost） */
 export interface WebviewReplayMessage {
@@ -570,4 +614,5 @@ export type HostToWebviewMessage =
   | WebviewHostErrorMessage
   | WebviewProcessStateMessage
   | WebviewRpcResponseMessage
-  | WebviewReplayMessage;
+  | WebviewReplayMessage
+  | WebviewHostPromptMessage;

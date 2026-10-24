@@ -22,6 +22,7 @@ import {
   CoreToHostMessage,
   HostToWebviewMessage,
   ReplayableWebviewMessage,
+  UserMessageContext,
   WebviewCoreSendMessage,
   WebviewToHostMessage,
 } from "./protocol";
@@ -106,6 +107,13 @@ export class ZcodeWebviewViewProvider implements vscode.WebviewViewProvider {
   /** 子进程状态变迁广播给 UI（进重放缓冲） */
   public postProcessState(sessionKey: string, state: string, detail?: string): void {
     const envelope = { kind: "process_state" as const, sessionKey, state, detail };
+    this.appendReplay(envelope);
+    this.post(envelope);
+  }
+
+  /** 宿主 → webview 待发提示（编辑器右键/终端/Problems 联动，进重放缓冲） */
+  public postHostPrompt(text: string, context?: UserMessageContext): void {
+    const envelope = { kind: "host_prompt" as const, text, context };
     this.appendReplay(envelope);
     this.post(envelope);
   }

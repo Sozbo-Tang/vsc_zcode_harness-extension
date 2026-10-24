@@ -417,6 +417,65 @@ body {
   white-space: pre-wrap;
 }
 
+/* M3 输入区：待发上下文 chips + @补全下拉 */
+.composer-attach {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  position: relative;
+  margin: 0 0 2px;
+}
+
+.composer-attach .chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.chip-x {
+  border: none;
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.chip-x:hover {
+  color: var(--vscode-errorForeground);
+}
+
+.atmenu {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  max-height: 180px;
+  overflow-y: auto;
+  z-index: 10;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-panelBorder);
+  border-radius: 4px;
+  margin-bottom: 4px;
+  width: 100%;
+}
+
+.atitem {
+  padding: 3px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vscode-editorWidget-foreground);
+}
+
+.atitem.active {
+  background: var(--vscode-list-activeSelectionBackground);
+  color: var(--vscode-list-activeSelectionForeground);
+}
+
 /* 权限卡：命令行预览 + 参数折叠 + 规则内联编辑 */
 
 .permcard .cmdline {

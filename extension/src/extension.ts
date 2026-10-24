@@ -17,8 +17,27 @@ import {
 import { PythonProcessManager } from "./processManager";
 import { ZcodeWebviewViewProvider } from "./webviewHost";
 import { registerInlineCompletionIfEnabled } from "./inlineCompletion";
-import { EditorOpenDiffParams, RPC_EDITOR_OPEN_DIFF } from "./protocol";
-import { openDiffReview, registerEditorBridge } from "./editorBridge";
+import {
+  EditorFollowToolCallParams,
+  EditorListFilesParams,
+  EditorOpenDiffParams,
+  RPC_EDITOR_FOLLOW_TOOL_CALL,
+  RPC_EDITOR_GET_SELECTION,
+  RPC_EDITOR_LIST_FILES,
+  RPC_EDITOR_PICK_FILE,
+  UserMessageContext,
+} from "./protocol";
+import {
+  collectDiagnostics,
+  collectSelection,
+  followToolCall,
+  listWorkspaceFiles,
+  openDiffReview,
+  pickFile,
+  readTerminalSelection,
+  registerEditorBridge,
+  selectionToContext,
+} from "./editorBridge";
 
 interface Runtime {
   channel: vscode.OutputChannel;
@@ -62,6 +81,18 @@ function sendToActiveSession(rt: Runtime, message: HostToCoreMessage): boolean {
     rt.provider.postHostError(key, "send_failed", `消息发往会话 ${key} 失败（进程不在）`);
   }
   return delivered;
+}
+
+/** 编辑器右键四动作共用：选区 → 上下文 + 预填草稿 → 唤起侧边栏 */
+async function promptFromSelection(rt: Runtime, template: string): Promise<void> {
+  const sel = collectSelection();
+  if (sel === null) {
+    vscode.window.showInformationMessage("Zcode-Py: 请先在编辑器中选中代码");
+    return;
+  }
+  const context: UserMessageContext = selectionToContext(sel);
+  rt.provider.postHostPrompt(template, context);
+  await vscode.commands.executeCommand("zcode.sidebar.focus");
 }
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -132,7 +163,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // 编辑器桥：diff 审阅页（DiffReviewCard「打开对比页」；契约 protocol.ts
   // RPC_EDITOR_OPEN_DIFF，实现 editorBridge.openDiffReview）
   const diffProvider = registerEditorBridge(context);
-  provider.registerRpcHandler(RPC_EDITOR_OPEN_DIFF, (params) => {
+  provider.registerRpcHandler("editor.openDiff", (params) => {
     const p = params as Partial<EditorOpenDiffParams> | undefined;
     if (
       p === undefined ||
@@ -145,9 +176,29 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     return openDiffReview(diffProvider, p as EditorOpenDiffParams);
   });
-  // TODO(M3 编辑跟随)：registerRpcHandler("editor.followToolCall", ...) ——
-  // webview ToolCallCard 点击已按该约定发 RPC（占位，当前会收
-  // unknown_method 应答并被 webview 静默忽略），实现见 editorBridge.ts 注释
+
+  // 编辑器桥 M3：编辑跟随 / 选区 / @补全 / 文件挑选
+  provider.registerRpcHandler(RPC_EDITOR_FOLLOW_TOOL_CALL, (params) => {
+    const p = params as Partial<EditorFollowToolCallParams> | undefined;
+    if (p === undefined || typeof p.callId !== "string" || typeof p.name !== "string") {
+      throw new Error("editor.followToolCall: 参数需为 {callId, name, args}");
+    }
+    return followToolCall({
+      callId: p.callId,
+      name: p.name,
+      args: (p.args ?? {}) as Record<string, unknown>,
+      result: p.result,
+    });
+  });
+  provider.registerRpcHandler(RPC_EDITOR_GET_SELECTION, () => collectSelection());
+  provider.registerRpcHandler(RPC_EDITOR_LIST_FILES, (params) => {
+    const q = (params as Partial<EditorListFilesParams> | undefined)?.query;
+    return { files: listWorkspaceFiles(typeof q === "string" ? q : "") };
+  });
+  provider.registerRpcHandler(RPC_EDITOR_PICK_FILE, async () => {
+    const file = await pickFile();
+    return file !== null ? { file } : null;
+  });
 
   // —— 视图与命令 ——
   context.subscriptions.push(
@@ -183,6 +234,39 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand("zcode.openSettings", () => {
       void vscode.commands.executeCommand("workbench.action.openSettings", "@ext:zcode-py.zcode-py");
+    }),
+
+    // —— M3 编辑器联动（PLAN §6.7）：一律「预填草稿 + 挂上下文 chip」，
+    // 不代发——用户保持对输入的最终控制权；随后唤起侧边栏。
+    vscode.commands.registerCommand("zcode.explainSelection", () =>
+      promptFromSelection(rt, "请解释这段代码："),
+    ),
+    vscode.commands.registerCommand("zcode.optimizeSelection", () =>
+      promptFromSelection(rt, "请优化这段代码，说明改动理由："),
+    ),
+    vscode.commands.registerCommand("zcode.writeTests", () =>
+      promptFromSelection(rt, "请为这段代码编写测试："),
+    ),
+    vscode.commands.registerCommand("zcode.fixBug", () =>
+      promptFromSelection(rt, "请修复这段代码中的 Bug："),
+    ),
+    vscode.commands.registerCommand("zcode.sendTerminalSelection", async () => {
+      const text = await readTerminalSelection();
+      if (!text) {
+        vscode.window.showInformationMessage("Zcode-Py: 终端里没有选中内容（先在终端选中报错再右键）");
+        return;
+      }
+      rt.provider.postHostPrompt("请诊断这个终端报错：", { terminalSel: text });
+      await vscode.commands.executeCommand("zcode.sidebar.focus");
+    }),
+    vscode.commands.registerCommand("zcode.sendProblems", async () => {
+      const problems = collectDiagnostics();
+      if (!problems) {
+        vscode.window.showInformationMessage("Zcode-Py: Problems 面板为空，没有可诊断的问题");
+        return;
+      }
+      rt.provider.postHostPrompt("请诊断这些 Problems：", { problems });
+      await vscode.commands.executeCommand("zcode.sidebar.focus");
     }),
   );
 

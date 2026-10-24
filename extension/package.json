@@ -67,6 +67,36 @@
       {
         "command": "zcode.openSettings",
         "title": "Zcode-Py: Open Settings"
+      },
+      {
+        "command": "zcode.explainSelection",
+        "title": "解释这段代码",
+        "category": "Zcode-Py"
+      },
+      {
+        "command": "zcode.optimizeSelection",
+        "title": "优化这段代码",
+        "category": "Zcode-Py"
+      },
+      {
+        "command": "zcode.writeTests",
+        "title": "为这段代码写测试",
+        "category": "Zcode-Py"
+      },
+      {
+        "command": "zcode.fixBug",
+        "title": "修复这段代码的 Bug",
+        "category": "Zcode-Py"
+      },
+      {
+        "command": "zcode.sendTerminalSelection",
+        "title": "诊断终端选中报错",
+        "category": "Zcode-Py"
+      },
+      {
+        "command": "zcode.sendProblems",
+        "title": "诊断 Problems 面板",
+        "category": "Zcode-Py"
       }
     ],
     "menus": {
@@ -81,8 +111,65 @@
           "group": "navigation",
           "when": "view == zcode.sidebar"
         }
+      ],
+      "editor/context": [
+        {
+          "submenu": "zcode.editorSend",
+          "group": "9_cutcopypaste"
+        }
+      ],
+      "zcode.editorSend": [
+        {
+          "command": "zcode.explainSelection",
+          "when": "editorHasSelection",
+          "group": "1_actions@1"
+        },
+        {
+          "command": "zcode.optimizeSelection",
+          "when": "editorHasSelection",
+          "group": "1_actions@2"
+        },
+        {
+          "command": "zcode.writeTests",
+          "when": "editorHasSelection",
+          "group": "1_actions@3"
+        },
+        {
+          "command": "zcode.fixBug",
+          "when": "editorHasSelection",
+          "group": "1_actions@4"
+        }
+      ],
+      "terminal/context": [
+        {
+          "command": "zcode.sendTerminalSelection",
+          "group": "2_zcode"
+        }
       ]
     },
+    "submenus": [
+      {
+        "id": "zcode.editorSend",
+        "label": "发给 Zcode-Py"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "zcode.openSidebar",
+        "key": "Ctrl+Cmd+Z",
+        "mac": "Ctrl+Cmd+Z"
+      },
+      {
+        "command": "zcode.stopGeneration",
+        "key": "Alt+Cmd+.",
+        "mac": "Alt+Cmd+."
+      },
+      {
+        "command": "zcode.newSession",
+        "key": "Alt+Cmd+N",
+        "mac": "Alt+Cmd+N"
+      }
+    ],
     "configuration": {
       "title": "Zcode-Py",
       "properties": {

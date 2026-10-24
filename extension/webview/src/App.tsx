@@ -45,11 +45,16 @@ export function App(): React.JSX.Element {
       useStore.setState({ hostConnected: true });
       useStore.getState().applyProcessState(e);
     });
+    const offPrompt = rpc.onHostPrompt((e) => {
+      useStore.setState({ hostConnected: true });
+      useStore.getState().applyHostPrompt(e.text, e.context);
+    });
     void store.boot();
     return () => {
       offEvents();
       offErr();
       offProc();
+      offPrompt();
     };
   }, [rpc]);
 
