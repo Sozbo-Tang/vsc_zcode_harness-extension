@@ -1,0 +1,893 @@
+/*
+ * 全局样式 —— 零自定颜色（PLAN §4 前端约定）：
+ * 一切颜色取自 --vscode-* CSS 变量，深浅色主题自动跟随。
+ * 代码等宽字体用通用关键字 monospace（非自定颜色）。
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size, 13px);
+  color: var(--vscode-foreground);
+  background-color: transparent;
+}
+
+.root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+/* ---------- 顶部视图导航 ---------- */
+
+.topnav {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-sideBar-background, transparent);
+  flex: none;
+}
+
+.navbtn {
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+  border: none;
+  border-radius: 4px;
+  padding: 3px 9px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: var(--vscode-font-family);
+}
+
+.navbtn:hover {
+  background: var(--vscode-toolbar-hoverBackground);
+  color: var(--vscode-foreground);
+}
+
+.navbtn.active {
+  background: var(--vscode-list-activeSelectionBackground);
+  color: var(--vscode-list-activeSelectionForeground);
+}
+
+.conn {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--vscode-disabledForeground);
+}
+
+.conn.on {
+  color: var(--vscode-charts-green);
+}
+
+.viewhost {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- 通用视图 ---------- */
+
+.view {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 10px;
+}
+
+.view-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 600;
+  padding: 2px 0 8px;
+}
+
+.empty-note {
+  padding: 18px 6px;
+  text-align: center;
+  font-size: 12px;
+}
+
+.muted {
+  color: var(--vscode-descriptionForeground);
+}
+
+.small {
+  font-size: 11px;
+}
+
+.ok {
+  color: var(--vscode-charts-green);
+}
+
+.bad {
+  color: var(--vscode-errorForeground);
+}
+
+.warn {
+  color: var(--vscode-editorWarning-foreground, var(--vscode-charts-yellow));
+}
+
+.add {
+  color: var(--vscode-charts-green);
+}
+
+.del {
+  color: var(--vscode-charts-red);
+}
+
+/* ---------- 控件 ---------- */
+
+.btn {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  border: none;
+  border-radius: 3px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: var(--vscode-font-family);
+  white-space: nowrap;
+}
+
+.btn:hover {
+  background: var(--vscode-button-hoverBackground);
+}
+
+.btn.sec {
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+}
+
+.btn.sec:hover {
+  background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-secondaryBackground));
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.btn.danger:hover {
+  color: var(--vscode-errorForeground);
+}
+
+.in,
+.sel {
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 3px;
+  padding: 3px 6px;
+  font-size: 12px;
+  font-family: var(--vscode-font-family);
+}
+
+.sel {
+  background: var(--vscode-dropdown-background);
+  color: var(--vscode-dropdown-foreground);
+  border-color: var(--vscode-dropdown-border, transparent);
+}
+
+.in:focus,
+.sel:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+}
+
+.in::placeholder {
+  color: var(--vscode-input-placeholderForeground);
+}
+
+.grow {
+  flex: 1;
+  min-width: 60px;
+}
+
+/* ---------- 聊天视图 ---------- */
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.chat-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 10px;
+  flex: none;
+}
+
+.brand {
+  font-size: var(--vscode-font-size, 13px);
+  font-weight: 700;
+}
+
+.chat-log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 10px;
+}
+
+.who {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  margin-bottom: 2px;
+}
+
+.msg-user {
+  margin: 8px 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.msg-user .bubble {
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 6px;
+  padding: 6px 9px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.attach {
+  margin-top: 3px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.chip {
+  font-size: 11px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 3px;
+  padding: 0 5px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.msg-ai {
+  margin: 10px 0;
+}
+
+.msg-ai .body {
+  overflow-wrap: anywhere;
+}
+
+.msg-ai .body pre {
+  background: var(--vscode-textCodeBlock-background);
+  border-radius: 4px;
+  padding: 6px 8px;
+  overflow-x: auto;
+  font-family: monospace;
+  font-size: 12px;
+}
+
+.msg-ai .body code {
+  font-family: monospace;
+  font-size: 12px;
+}
+
+.msg-ai .body p {
+  margin: 6px 0;
+}
+
+.cursor {
+  color: var(--vscode-foreground);
+  animation: zc-blink 1s step-start infinite;
+}
+
+@keyframes zc-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* 思考块（默认折叠） */
+
+.think {
+  margin: 6px 0;
+}
+
+.think summary {
+  cursor: pointer;
+  list-style: none;
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+  user-select: none;
+}
+
+.think summary::-webkit-details-marker {
+  display: none;
+}
+
+.think .chev {
+  display: inline-block;
+  transition: transform 0.15s ease;
+}
+
+.think[open] .chev {
+  transform: rotate(90deg);
+}
+
+.think-body {
+  white-space: pre-wrap;
+  font-size: 11.5px;
+  color: var(--vscode-descriptionForeground);
+  background: var(--vscode-textCodeBlock-background);
+  border-radius: 4px;
+  padding: 6px 8px;
+  max-height: 280px;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  margin: 4px 0;
+}
+
+.syserr {
+  border: 1px solid var(--vscode-errorForeground);
+  color: var(--vscode-errorForeground);
+  border-radius: 4px;
+  padding: 5px 8px;
+  margin: 6px 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- 卡片 ---------- */
+
+.card {
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  margin: 4px 0;
+  font-size: 12px;
+  background: transparent;
+}
+
+.card summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  align-items: baseline;
+  user-select: none;
+}
+
+.card summary::-webkit-details-marker {
+  display: none;
+}
+
+.card-title {
+  overflow-wrap: anywhere;
+}
+
+.card-side {
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.card-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.card-body {
+  font-family: monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--vscode-textCodeBlock-background);
+  border-radius: 4px;
+  padding: 5px 7px;
+  margin: 5px 0 2px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.permcard .card-body {
+  max-height: 160px;
+}
+
+/* 隐私护栏警告（R15）：read/grep/webfetch 命中敏感模式时醒目展示 */
+.privacy-warning {
+  color: var(--vscode-editorWarning-foreground);
+  border-left: 2px solid var(--vscode-editorWarning-foreground);
+  padding: 2px 6px;
+  margin: 5px 0 2px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+/* 权限卡：命令行预览 + 参数折叠 + 规则内联编辑 */
+
+.permcard .cmdline {
+  margin: 4px 0 2px;
+  max-height: 100px;
+}
+
+.permargs summary {
+  cursor: pointer;
+  user-select: none;
+  margin-top: 2px;
+}
+
+.permargs summary::-webkit-details-marker {
+  display: none;
+}
+
+.ruleedit {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 5px;
+}
+
+.ruleedit .in {
+  width: 100%;
+}
+
+/* 工具卡标题行可点击（编辑跟随占位 + 展开/收起） */
+
+.toolcard summary {
+  cursor: pointer;
+}
+
+.btnrow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 5px;
+}
+
+/* ---------- 任务清单条 ---------- */
+
+.taskbar {
+  flex: none;
+  border-top: 1px solid var(--vscode-panel-border);
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.taskbar summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  user-select: none;
+}
+
+.taskbar summary::-webkit-details-marker {
+  display: none;
+}
+
+.taskbar-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.meter {
+  display: inline-block;
+  width: 90px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--vscode-input-background);
+  overflow: hidden;
+}
+
+.meter i {
+  display: block;
+  height: 100%;
+  background: var(--vscode-progressBar-background);
+}
+
+.tasklist {
+  list-style: none;
+  margin: 4px 0 2px;
+  padding: 0;
+}
+
+.tasklist li {
+  padding: 1px 0;
+}
+
+.tasklist li.done {
+  color: var(--vscode-disabledForeground);
+  text-decoration: line-through;
+}
+
+.task-ico {
+  display: inline-block;
+  width: 14px;
+}
+
+/* ---------- 车钟 ---------- */
+
+.telegraph-panel {
+  flex: none;
+  display: flex;
+  justify-content: center;
+  padding: 6px;
+  border-top: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-sideBar-background, transparent);
+}
+
+.telegraph {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  user-select: none;
+}
+
+.telegraph-svg {
+  touch-action: none;
+}
+
+.telegraph-off .telegraph-svg {
+  opacity: 0.45;
+}
+
+.tg-brass {
+  stroke: var(--vscode-charts-yellow);
+}
+
+.tg-brass-thin {
+  stroke: var(--vscode-charts-yellow);
+  opacity: 0.55;
+}
+
+.tg-face {
+  fill: var(--vscode-editorWidget-background);
+  stroke: var(--vscode-editorWidget-border, var(--vscode-panel-border));
+}
+
+.tg-tick {
+  stroke: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+}
+
+.tg-tick-cur {
+  stroke: var(--vscode-charts-yellow);
+}
+
+.tg-label {
+  fill: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+  font-size: 10px;
+  font-family: var(--vscode-font-family);
+}
+
+.tg-label-cur {
+  font-weight: 700;
+}
+
+.tg-disabled text,
+.tg-disabled line {
+  opacity: 0.4;
+}
+
+.tg-disabled .tg-label {
+  fill: var(--vscode-disabledForeground);
+}
+
+.tg-needle {
+  stroke: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+  stroke-width: 3;
+  stroke-linecap: round;
+}
+
+.tg-ack-line {
+  stroke: var(--vscode-descriptionForeground);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+
+.tg-knob {
+  fill: var(--vscode-button-secondaryBackground);
+  stroke: var(--vscode-editorWidget-border, var(--vscode-panel-border));
+  stroke-width: 1.5;
+}
+
+.tg-grip {
+  stroke: var(--vscode-button-secondaryForeground);
+  stroke-width: 1;
+  stroke-linecap: round;
+}
+
+.tg-caption {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.tg-caption b {
+  color: var(--vscode-foreground);
+}
+
+.tg-mode {
+  font-size: 10px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+/* ---------- 底部控制条 / 输入区 ---------- */
+
+.ctlbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-top: 1px solid var(--vscode-panel-border);
+  font-size: 12px;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+.chipbtn {
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  border: none;
+  border-radius: 10px;
+  padding: 2px 9px;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: var(--vscode-font-family);
+}
+
+.chipbtn:hover {
+  background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-secondaryBackground));
+}
+
+.ctl-sel {
+  max-width: 40%;
+  min-width: 80px;
+}
+
+.ctxmeter,
+.perf {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.inputrow {
+  flex: none;
+  display: flex;
+  gap: 6px;
+  padding: 6px 8px 2px;
+  align-items: flex-end;
+}
+
+.inputbox {
+  flex: 1;
+  resize: none;
+  font-size: 12px;
+  line-height: 1.5;
+  max-height: 140px;
+}
+
+.send,
+.stop {
+  min-width: 34px;
+}
+
+.quickrow {
+  flex: none;
+  display: flex;
+  gap: 6px;
+  padding: 4px 8px 8px;
+  flex-wrap: wrap;
+}
+
+/* ---------- 欢迎页 ---------- */
+
+.welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  text-align: center;
+  padding: 28px 8px;
+  font-size: 12px;
+}
+
+.welcome-title {
+  font-size: var(--vscode-font-size-h3, 16px);
+  font-weight: 700;
+}
+
+.chips {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.chip-sug {
+  min-width: 200px;
+}
+
+/* ---------- API 视图 ---------- */
+
+.apiview {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.provlist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.prov {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.prov:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.prov.sel {
+  background: var(--vscode-list-activeSelectionBackground);
+  color: var(--vscode-list-activeSelectionForeground);
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 1px solid var(--vscode-descriptionForeground);
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  flex: none;
+}
+
+.dot.on {
+  background: var(--vscode-charts-green);
+  border-color: var(--vscode-charts-green);
+  cursor: default;
+}
+
+.prov-name {
+  overflow-wrap: anywhere;
+}
+
+.prov-proto {
+  margin-left: auto;
+  font-size: 11px;
+}
+
+.form {
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.form-title {
+  font-weight: 600;
+}
+
+.form-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.form-row label {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  white-space: nowrap;
+}
+
+.form-row.end {
+  justify-content: flex-end;
+}
+
+/* ---------- 会话/任务列表 ---------- */
+
+.sessionlist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+}
+
+.session {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.session:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.session.sel {
+  background: var(--vscode-list-activeSelectionBackground);
+  color: var(--vscode-list-activeSelectionForeground);
+}
+
+.session-title {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- 环境/设置 ---------- */
+
+.envinfo {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.setting-group {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+/* ---------- 工具视图 tab ---------- */
+
+.tabrow {
+  display: flex;
+  gap: 2px;
+  padding-bottom: 8px;
+}
+
+.tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-family: var(--vscode-font-family);
+}
+
+.tab.active {
+  color: var(--vscode-foreground);
+  border-bottom-color: var(--vscode-focusBorder);
+}

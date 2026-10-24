@@ -9,6 +9,10 @@
   "engines": {
     "vscode": "^1.85.0"
   },
+  "//extensionKind": "spawn 工作区侧 Python、读工作区文件 → 必须是 workspace 扩展（远程开发跑在远程扩展宿主，见 docs/research/vscode-integration.md §6.1）",
+  "extensionKind": [
+    "workspace"
+  ],
   "categories": [
     "Other"
   ],
@@ -18,6 +22,7 @@
     "watch": "tsc -p . --watch"
   },
   "devDependencies": {
+    "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
     "typescript": "^5.4.0"
   },
@@ -43,7 +48,13 @@
     "commands": [
       {
         "command": "zcode.newSession",
-        "title": "Zcode-Py: New Session"
+        "title": "Zcode-Py: New Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "zcode.stopGeneration",
+        "title": "Zcode-Py: Stop Generation",
+        "icon": "$(debug-stop)"
       },
       {
         "command": "zcode.openSidebar",
@@ -52,7 +63,35 @@
       {
         "command": "zcode.apiSettings",
         "title": "Zcode-Py: API Settings"
+      },
+      {
+        "command": "zcode.openSettings",
+        "title": "Zcode-Py: Open Settings"
       }
-    ]
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "zcode.newSession",
+          "group": "navigation",
+          "when": "view == zcode.sidebar"
+        },
+        {
+          "command": "zcode.stopGeneration",
+          "group": "navigation",
+          "when": "view == zcode.sidebar"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Zcode-Py",
+      "properties": {
+        "zcode-py.inlineCompletion.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "内联补全（幽灵文本）默认关闭（R13）；M9 提供实现。"
+        }
+      }
+    }
   }
 }
