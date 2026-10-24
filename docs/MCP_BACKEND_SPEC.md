@@ -116,9 +116,11 @@ def run_process(argv, *, stdin=None, timeout=10.0, env=None, cwd=None):
 
 ## 装配方式（三选一）
 
-> **状态：未装配（2026-10-24，M8 落地时）。** 用户在自有终端按上表落盘
-> `agent/zcode_py/mcp/proc_backend.py`（同 BASH_BACKEND_SPEC 的用户授权
-> 一次性 Mimosa 策略例外模式），或放行该模式后重跑。
+> **状态：已装配（2026-10-24）。** 用户在自有终端按参考实现落盘
+> `agent/zcode_py/mcp/proc_backend.py`（用户授权的一次性 Mimosa 策略
+> 例外）；真实冒烟通过（echo 字面量 argv 往返），pytest 643 passed +
+> 3 skipped（skip 为「缝缺位分支」守门测试，装配后不可达，符合设计）。
+> MCP 与 hooks 经 try-import 自动生效。
 
 - 用户在 Mimosa 策略中为本仓库放行该模式后，按参考实现落盘；
 - 用户手动按本规格实现该文件（推荐：实现后跑
