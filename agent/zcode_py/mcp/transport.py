@@ -99,8 +99,15 @@ class StdioTransport:
 
     def start(self) -> "StdioTransport":
         """spawn + 握手 + tools/list；失败抛 McpTransportError（并 close）。"""
+        # 独立评审中危 #4：MCP server 是用户配置的本地命令——env 以脱敏
+        # 基线（剔除 API Key/SECRET/TOKEN 等）起步，再叠加显式配置项，
+        # 不把含 Provider Key 的完整 os.environ 交给任意本地进程
+        # （与 tools/bash、background 的 sanitize_child_env 同一口径）。
+        from ..tools.bash import sanitize_child_env
+
+        merged_env = {**sanitize_child_env(), **(self.env or {})}
         try:
-            self._proc = spawn_server(self.argv, self.env or None, self.cwd)
+            self._proc = spawn_server(self.argv, merged_env or None, self.cwd)
         except McpTransportError:
             raise
         except Exception as exc:  # noqa: BLE001 —— 启动失败统一分类

@@ -95,9 +95,15 @@ class ImageBlock:
     media_type: str = "image/png"
     path: str | None = None
 
+    # 图片大小上限（独立评审低危 #12：无上限时超大图整读 + base64 三重放大
+    # ——内存/请求体/token；抛 OSError 使 vision_relay 的读取异常路径统一接住）
+    MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
     @classmethod
     def from_file(cls, path: str | Path) -> "ImageBlock":
         p = Path(path).expanduser()
+        if p.stat().st_size > cls.MAX_IMAGE_BYTES:
+            raise OSError(f"image too large (>8MB): {p}")
         raw = p.read_bytes()
         return cls(
             source_type="base64",

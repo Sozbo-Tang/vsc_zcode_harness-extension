@@ -393,12 +393,53 @@ def test_cron_task_action_starts_background(tmp_home, monkeypatch):
     monkeypatch.setattr("zcode_py.tools.bash_backend.run_command", stub)
     harness = Harness(FakeProvider())
     harness.send({"type": "init", "workspaceRoots": []})
+    # 命令型 cron 动作过权限门（独立评审高危 #2）：yolo 下放行非危险命令
+    harness.send({"type": "control", "command": "permission_mode", "mode": "yolo"})
 
     harness.service._cron_start_task("nightly-build", "构建")
     assert wait_for(lambda: any(f["type"] == "task_finished" for f in harness.frames()))
     started = [f for f in harness.frames() if f["type"] == "task_started"]
     assert started[0]["command"] == "nightly-build" and started[0]["name"] == "构建"
     assert calls == ["nightly-build"]
+
+
+def test_cron_task_fire_rejected_when_not_permitted(tmp_home, monkeypatch):
+    """fire 复检（高危 #2）：build 模式下白名单外命令到点不放行。"""
+    calls: list[str] = []
+
+    def stub(command, *, cwd=None, timeout=120.0, env=None):
+        calls.append(command)
+        return BashResult(0, "done", "", False, 1)
+
+    monkeypatch.setattr("zcode_py.tools.bash_backend.run_command", stub)
+    harness = Harness(FakeProvider())
+    harness.send({"type": "init", "workspaceRoots": []})
+
+    harness.service._cron_start_task("curl example.com", "拉取")
+    assert wait_for(lambda: any(
+        f["type"] == "error" and "不再被允许" in str(f.get("message", ""))
+        for f in harness.frames()
+    ))
+    assert calls == []  # 从未执行
+
+
+def test_cron_add_task_action_gated(tmp_home):
+    """add 时门禁（高危 #2）：build 下白名单外 task 动作直接拒绝；危险命令
+    任何模式都拒绝。"""
+    harness = Harness(FakeProvider())
+    harness.send({"type": "init", "workspaceRoots": []})
+
+    harness.send({"type": "control", "command": "cron_add", "schedule": "*/5 * * * *",
+                  "action": {"type": "task", "command": "make build"}, "name": "b"})
+    assert wait_for(lambda: any(
+        f["type"] == "error" and f.get("kind") == "permission" for f in harness.frames()
+    ))
+
+    harness.send({"type": "control", "command": "permission_mode", "mode": "yolo"})
+    harness.send({"type": "control", "command": "cron_add", "schedule": "*/5 * * * *",
+                  "action": {"type": "task", "command": "rm -rf /"}, "name": "d"})
+    errs = [f for f in harness.frames() if f["type"] == "error"]
+    assert any("危险命令" in str(e.get("message", "")) for e in errs)
 
 
 def test_shutdown_stops_cron_thread(tmp_home):

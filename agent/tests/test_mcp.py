@@ -171,9 +171,15 @@ def fake_spawn(monkeypatch):
 def test_handshake_sends_initialize_notification_and_tools_list(fake_spawn):
     transport = StdioTransport("srv", ["mcp-server-fake", "--flag"], env={"K": "V"}, cwd="/w").start()
     proc = fake_spawn["created"][0]
-    assert fake_spawn["calls"][0] == {
-        "argv": ["mcp-server-fake", "--flag"], "env": {"K": "V"}, "cwd": "/w",
-    }
+    # env 语义（独立评审中危 #4）：脱敏基线 + 显式配置项叠加——配置键必须在，
+    # 凭据意味的变量绝不出现（基线可能带 PATH 等，只做包含性断言）
+    call = fake_spawn["calls"][0]
+    assert call["argv"] == ["mcp-server-fake", "--flag"] and call["cwd"] == "/w"
+    assert call["env"].get("K") == "V"
+    assert not any(
+        key.upper().startswith(("ZCODE_PY_API_KEY", "API_KEY", "SECRET", "TOKEN", "PASSWORD"))
+        for key in call["env"]
+    )
     methods = [r.get("method") for r in proc.requests]
     assert methods[:3] == ["initialize", "notifications/initialized", "tools/list"]
     init = proc.requests[0]

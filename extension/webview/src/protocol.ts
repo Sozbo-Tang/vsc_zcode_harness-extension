@@ -199,7 +199,7 @@ export type CoreEvent =
    * task_output 为增量追加，UI 侧滚动窗口截尾（≤4KB，store TASK_TAIL_LIMIT）。
    */
   | { type: 'task_started'; taskId: string; name?: string; command?: string; atMs?: number }
-  | { type: 'task_output'; taskId: string; text: string; stream?: string }
+  | { type: 'task_output'; taskId: string; tail: string; stream?: string }
   | { type: 'task_finished'; taskId: string; status?: string; exitCode?: number; detail?: string }
   | { type: 'error'; kind: string; message: string }
   /**
@@ -313,12 +313,16 @@ export type CoreSend =
       /** M8 提案字段（mcp_add）：子进程环境变量键值 */
       env?: Record<string, string>;
       /** M9 提案字段：task_stop 的目标任务 id；cron_remove/cron_toggle 的
-       *  定时任务名；workflow_run 的工作流名（与 name 通道二选一，双发） */
+       *  定时任务 id（与 name 双发，核心侧 cronId 优先） */
       taskId?: string;
-      /** M9 提案字段（cron_add）：cron 调度表达式（7 段或描述文本） */
+      /** M9：cron_remove / cron_toggle 的定时任务条目 id（core 契约字段） */
+      cronId?: string;
+      /** M9 提案字段（cron_add）：cron 调度表达式（标准 5 段） */
       schedule?: string;
-      /** M9 提案字段（cron_add）：prompt 型动作文本（command 型用 args） */
+      /** M9 提案字段（cron_add）：prompt 型动作文本（command 型用 action.command） */
       prompt?: string;
+      /** M9（cron_add 契约字段）：到点动作 {type:'prompt',text} | {type:'task',command} */
+      action?: { type: 'prompt' | 'task'; text?: string; command?: string };
       /** M9 提案字段（cron_toggle）：目标启停态 */
       enabled?: boolean;
     };

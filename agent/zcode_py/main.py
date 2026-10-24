@@ -68,7 +68,7 @@ from .loop import DEFAULT_SYSTEM_PROMPT, AgentLoop, context_from_frames
 from .mcp import McpManager
 from .memory import MemoryPermissionEngine, memory_injection, register_memory_tool
 from .perf import PerfTracker
-from .permissions import PERMISSION_MODES, mode_aware_engine
+from .permissions import ALLOW, DENY, PERMISSION_MODES, mode_aware_engine
 from .protocol import (
     Checkpoint,
     Control,
@@ -850,54 +850,59 @@ class ZcodeService:
         handler(msg)
 
     def _control_new_session(self, msg: Control) -> None:
-        if self._turn_alive() or self._workflow_alive():
-            self._emit(Error(kind="busy", message="cannot start a new session while a turn or workflow is running"))
-            return
-        self._ensure_config()
-        self._start_session()
-        self._emit(Result(ok=True, command="new_session"))
+        # 闸门与变更原子化（独立评审中危 #6：锁外检查与 cron 注入/工作流
+        # 启动存在 TOCTOU，可致两会话线程并发共用 _cancel 与转录）
+        with self._intake_lock:
+            if self._turn_alive() or self._workflow_alive():
+                self._emit(Error(kind="busy", message="cannot start a new session while a turn or workflow is running"))
+                return
+            self._ensure_config()
+            self._start_session()
+            self._emit(Result(ok=True, command="new_session"))
 
     def _control_resume(self, msg: Control) -> None:
-        if self._turn_alive() or self._workflow_alive():
-            self._emit(Error(kind="busy", message="cannot resume while a turn or workflow is running"))
-            return
-        session_id = msg.sessionId
-        if not session_id:
-            self._emit(Error(kind="protocol", message="resume requires sessionId"))
-            return
-        try:
-            meta = self._store.get_meta(session_id)
-            frames = self._store.read_frames(session_id)
-        except SessionError as exc:
-            self._emit(Error(kind="not_found", message=str(exc)))
-            return
-        self._ensure_config()
-        entry = get_provider_entry(self._config or {}, meta.get("providerId"))
-        model = get_model_entry(entry, meta.get("modelId")) if entry else None
-        if entry is None or model is None:
-            self._emit(
-                Error(
-                    kind="config",
-                    message=f"provider {meta.get('providerId')!r} no longer configured; cannot resume",
+        # 闸门与会话换绑原子化（同 new_session：防 cron/工作流并发 TOCTOU）
+        with self._intake_lock:
+            if self._turn_alive() or self._workflow_alive():
+                self._emit(Error(kind="busy", message="cannot resume while a turn or workflow is running"))
+                return
+            session_id = msg.sessionId
+            if not session_id:
+                self._emit(Error(kind="protocol", message="resume requires sessionId"))
+                return
+            try:
+                meta = self._store.get_meta(session_id)
+                frames = self._store.read_frames(session_id)
+            except SessionError as exc:
+                self._emit(Error(kind="not_found", message=str(exc)))
+                return
+            self._ensure_config()
+            entry = get_provider_entry(self._config or {}, meta.get("providerId"))
+            model = get_model_entry(entry, meta.get("modelId")) if entry else None
+            if entry is None or model is None:
+                self._emit(
+                    Error(
+                        kind="config",
+                        message=f"provider {meta.get('providerId')!r} no longer configured; cannot resume",
+                    )
                 )
-            )
-            return
-        self._apply_model(entry, model, keep_level=self._level)
-        # R11：恢复会话回到它记录的根（meta.rootPath 须仍在当前 workspaceRoots
-        # 内——工作区已移除的根不能复活）；检查点管理器随根重建（sha 绑定仓库）
-        self._restore_session_root(meta)
-        self._emitter.bind_session(session_id)
-        self._cancel.clear()
-        self._rebuild_loop()
-        self._loop.load_context(context_from_frames(frames))
-        # 重放：session_started + 历史 out 帧（不重复入账），再广播当前状态
-        self._emitter.emit_raw({"type": "session_started", "sessionId": session_id})
-        for envelope in frames:
-            if envelope.get("dir") == "out":
-                self._emitter.emit_raw(envelope.get("event") or {})
-        self._emitter.emit(self._telegraph_message(), record=False)
-        self._emitter.emit(SessionsList(sessions=self._session_summaries()), record=False)
-        self._emit(Result(ok=True, command="resume", detail=f"{len(frames)} frames replayed"))
+                return
+            self._apply_model(entry, model, keep_level=self._level)
+            # R11：恢复会话回到它记录的根（meta.rootPath 须仍在当前 workspaceRoots
+            # 内——工作区已移除的根不能复活）；检查点管理器随根重建（sha 绑定仓库）
+            self._restore_session_root(meta)
+            self._emitter.bind_session(session_id)
+            self._cancel.clear()
+            self._rebuild_loop()
+            self._loop.load_context(context_from_frames(frames))
+            # 重放：session_started + 历史 out 帧（不重复入账），再广播当前状态
+            self._emitter.emit_raw({"type": "session_started", "sessionId": session_id})
+            for envelope in frames:
+                if envelope.get("dir") == "out":
+                    self._emitter.emit_raw(envelope.get("event") or {})
+            self._emitter.emit(self._telegraph_message(), record=False)
+            self._emitter.emit(SessionsList(sessions=self._session_summaries()), record=False)
+            self._emit(Result(ok=True, command="resume", detail=f"{len(frames)} frames replayed"))
 
     def _control_cancel(self, msg: Control) -> None:
         self._cancel.set()
@@ -1311,8 +1316,14 @@ class ZcodeService:
         return thread is not None and thread.is_alive()
 
     def _control_background_start(self, msg: Control) -> None:
-        """M9（R3）后台任务启动：daemon 线程跑 bash_backend.run_command
-        （timeout 透传默认 3600s；停止只能标记取消，见 background.py）。"""
+        """M9（R3）后台任务启动——**必须先过权限引擎**（独立评审高危 #1 修复：
+        该入口曾完全绕过 DANGER 黑名单与 plan 模式，§9.3/§9.5 双违反）。
+
+        策略：danger 命中 → 一律拒绝（后台是长驻无监督执行面，黑名单命令
+        请经 bash 工具交互确认）；plan → 引擎 DENY；yolo / 白名单 / 会话
+        always → 直接启动；build 其余 → 异步弹权限卡（读线程不能阻塞等
+        应答——应答 allow 才真正启动，deny/超时回执 ok=False）。
+        """
         command = msg.taskCommand
         if not isinstance(command, str) or not command.strip():
             self._emit(
@@ -1331,8 +1342,72 @@ class ZcodeService:
                 )
                 return
             timeout = float(msg.timeoutSec)
+        check = self._background_command_check(command)
+        if check.outcome == DENY:
+            self._emit(Error(kind="permission", message=check.reason))
+            return
+        if check.danger:
+            self._emit(
+                Error(
+                    kind="permission",
+                    message=f"危险命令拒绝后台执行（{check.reason}）；"
+                    "如确需运行请通过 bash 工具交互确认",
+                )
+            )
+            return
+        if check.outcome == ALLOW:
+            self._start_background_now(command, msg.name, timeout)
+            return
+        # build 默认询问：异步权限卡（独立线程等应答，不阻塞读线程）
+        request_id = "perm_" + uuid.uuid4().hex[:10]
+        waiter = self._router.create(request_id)
+        self._emit(
+            PermissionRequest(id=request_id, tool="background", args={"command": command})
+        )
+
+        def wait_reply() -> None:
+            reply = self._router.wait(
+                waiter, request_id, timeout=self._permission_timeout_s
+            )
+            decision = reply.get("decision") if reply else None
+            if decision not in ("allow", "always"):
+                reason = "denied" if decision == "deny" else "permission timeout"
+                self._emit(Result(ok=False, command="background_start", detail=reason))
+                return
+            # 应答后复检（模式/规则可能已变；danger 永不因应答放行）
+            recheck = self._background_command_check(command)
+            if recheck.danger or recheck.outcome == DENY:
+                self._emit(
+                    Result(ok=False, command="background_start", detail="denied by re-check")
+                )
+                return
+            if decision == "always" and self._permissions_engine is not None:
+                try:
+                    self._permissions_engine.remember_always("background", {"command": command})
+                except Exception:  # noqa: BLE001 —— 记忆失败不影响启动
+                    pass
+            self._start_background_now(command, msg.name, timeout)
+
+        threading.Thread(target=wait_reply, daemon=True, name="zcode-bg-perm").start()
+
+    def _background_command_check(self, command: str):
+        """后台/定时命令的权限判定：走服务级 ModeAware 引擎（伪工具
+        ``background``，DANGER_SCANNED_TOOLS 覆盖黑名单；plan 档经 tier
+        兜底 DENY）。引擎未建（理论仅 init 前）时按无白名单 build 语义判。"""
+        engine = self._permissions_engine
+        if engine is None:
+            from .permissions import PermissionEngine
+
+            allow_rules = [
+                str(r) for r in (self._settings.get("permissionAllow") or [])
+                if isinstance(r, str)
+            ]
+            engine = PermissionEngine(allow_rules=allow_rules)
+        return engine.check("background", {"command": command})
+
+    def _start_background_now(self, command: str, name: str | None, timeout: float) -> None:
         record = self._background.start(
-            command, name=msg.name, timeout=timeout, cwd=self._workspace_cwd
+            command, name=name, timeout=timeout, cwd=self._workspace_cwd
         )
         self._emit(Result(ok=True, command="background_start", detail=record["taskId"]))
 
@@ -1380,6 +1455,34 @@ class ZcodeService:
                 )
             )
             return
+        # 命令型动作在「新增时」就要过权限门（独立评审高危 #2 修复：到点
+        # 无人值守，不能等到 fire 才弹卡）：danger 一律拒绝；plan 拒绝；
+        # 非白名单/yolo 拒绝并指引——fire 时还会复检（规则/模式可能已变）。
+        if msg.action.get("type") == "task":
+            command = str(msg.action.get("command") or "")
+            check = self._background_command_check(command)
+            if check.outcome == DENY:
+                self._emit(
+                    Error(kind="permission", message=f"cron task 动作被拒绝：{check.reason}")
+                )
+                return
+            if check.danger:
+                self._emit(
+                    Error(
+                        kind="permission",
+                        message="危险命令不能作为定时任务动作（黑名单优先级高于一切，PLAN §9.3）",
+                    )
+                )
+                return
+            if check.outcome != ALLOW:
+                self._emit(
+                    Error(
+                        kind="permission",
+                        message="命令型定时任务需先在权限设置加白名单（或 yolo 模式）——"
+                        "定时触发无人值守，不接受到点弹卡",
+                    )
+                )
+                return
         job, error = self._cron.add(
             schedule=msg.schedule,
             action=msg.action,
@@ -1392,18 +1495,20 @@ class ZcodeService:
         self._emit(Result(ok=True, command="cron_add", detail=job["id"]))
 
     def _control_cron_remove(self, msg: Control) -> None:
-        if not msg.cronId:
+        cron_id = msg.cronId or msg.name  # 宽容：早期 UI 提案用 name 通道
+        if not cron_id:
             self._emit(Error(kind="protocol", message="cron_remove requires cronId"))
             return
-        ok, message = self._cron.remove(msg.cronId)
+        ok, message = self._cron.remove(cron_id)
         self._emit(Result(ok=ok, command="cron_remove", detail=message))
 
     def _control_cron_toggle(self, msg: Control) -> None:
         """启停切换：enabled 缺省 = 取反。"""
-        if not msg.cronId:
+        cron_id = msg.cronId or msg.name  # 宽容：早期 UI 提案用 name 通道
+        if not cron_id:
             self._emit(Error(kind="protocol", message="cron_toggle requires cronId"))
             return
-        job, error = self._cron.toggle(msg.cronId, msg.enabled)
+        job, error = self._cron.toggle(cron_id, msg.enabled)
         if error is not None:
             self._emit(Result(ok=False, command="cron_toggle", detail=error))
             return
@@ -1449,13 +1554,21 @@ class ZcodeService:
                 Result(ok=False, command="inline_complete", detail="missing prefix")
             )
             return
+        # 回合/工作流进行中不起补全调用（独立评审低危 #13：与回合帧交错入账
+        # 污染转录 + 与主回合抢 provider）；补全 Result 一律不入转录
+        if self._turn_alive() or self._workflow_alive():
+            self._emit(Result(ok=False, command="inline_complete", detail="busy"))
+            return
+        # 快照并发引用（switch_model 可能并发改写字段；线程内不再裸读）
+        entry = dict(self._provider_entry or {})
+        key_env = dict(self._api_key_env or {})
+        model_id = self.model_id
 
         def run() -> None:
             try:
-                entry = self._provider_entry or {}
-                provider = self._factory(entry, api_key_for(entry.get("id") or "", self._api_key_env))
+                provider = self._factory(entry, api_key_for(entry.get("id") or "", key_env))
                 request = LLMRequest(
-                    model=self.model_id,
+                    model=model_id,
                     messages=[
                         LLMUserMessage(
                             [
@@ -1483,45 +1596,52 @@ class ZcodeService:
                 for event in provider.stream(request):
                     if isinstance(event, TextDelta) and event.text:
                         chunks.append(event.text)
-                self._emit(Result(ok=True, command="inline_complete", detail="".join(chunks)))
+                self._emitter.emit(
+                    Result(ok=True, command="inline_complete", detail="".join(chunks)),
+                    record=False,
+                )
             except Exception as exc:  # noqa: BLE001 —— 补全失败静默降级
-                self._emit(
-                    Result(ok=False, command="inline_complete", detail=f"{type(exc).__name__}: {exc}")
+                self._emitter.emit(
+                    Result(ok=False, command="inline_complete",
+                           detail=f"{type(exc).__name__}: {exc}"),
+                    record=False,
                 )
 
         threading.Thread(target=run, daemon=True, name="zcode-inline").start()
 
     def _control_workflow_run(self, msg: Control) -> None:
         """执行工作流：校验 + 起工作流线程（报告经 result 帧异步返回——逐步
-        是真实 LLM 子回合，不能占读线程，否则权限卡应答会被饿死）。"""
-        if self._turn_alive() or self._workflow_alive():
-            self._emit(
-                Error(kind="busy", message="cannot start a workflow while a turn or workflow is running")
-            )
-            return
-        name = (msg.name or "").strip()
-        if not name:
-            self._emit(Error(kind="protocol", message="workflow_run requires a non-empty 'name'"))
-            return
-        try:
-            self._workflows.load(name)  # 仅校验可加载（报告由工作流线程产出）
-        except WorkflowError as exc:
-            self._emit(Error(kind="not_found", message=str(exc)))
-            return
-        if self._provider is None:
-            self._emit(
-                Error(
-                    kind="config",
-                    message=self._provider_error or "no provider configured",
+        是真实 LLM 子回合，不能占读线程，否则权限卡应答会被饿死）。
+        校验与线程启动整体在 _intake_lock 内（闸门原子化，防 cron 注入并发）。"""
+        with self._intake_lock:
+            if self._turn_alive() or self._workflow_alive():
+                self._emit(
+                    Error(kind="busy", message="cannot start a workflow while a turn or workflow is running")
                 )
+                return
+            name = (msg.name or "").strip()
+            if not name:
+                self._emit(Error(kind="protocol", message="workflow_run requires a non-empty 'name'"))
+                return
+            try:
+                self._workflows.load(name)  # 仅校验可加载（报告由工作流线程产出）
+            except WorkflowError as exc:
+                self._emit(Error(kind="not_found", message=str(exc)))
+                return
+            if self._provider is None:
+                self._emit(
+                    Error(
+                        kind="config",
+                        message=self._provider_error or "no provider configured",
+                    )
+                )
+                return
+            self._cancel.clear()  # 陈旧 cancel 不应秒杀工作流（与 user_message 同口径）
+            thread = threading.Thread(
+                target=self._run_workflow, args=(name,), daemon=True, name="zcode-workflow"
             )
-            return
-        self._cancel.clear()  # 陈旧 cancel 不应秒杀工作流（与 user_message 同口径）
-        thread = threading.Thread(
-            target=self._run_workflow, args=(name,), daemon=True, name="zcode-workflow"
-        )
-        self._workflow_thread = thread
-        thread.start()
+            self._workflow_thread = thread
+            thread.start()
 
     def _run_workflow(self, name: str) -> None:
         """工作流线程：逐步受限子代理（前步结果作下步上下文前缀），完成广播
@@ -1575,7 +1695,17 @@ class ZcodeService:
         self._on_user_message(UserMessage(text=text))
 
     def _cron_start_task(self, command: str, name: str | None):
-        """cron task 动作：经后台任务执行（bash_backend 唯一执行点）。"""
+        """cron task 动作：经后台任务执行（bash_backend 唯一执行点）。
+        fire 时复检权限（新增时已过门；模式/规则此后可能已变，宁缺勿滥）。"""
+        check = self._background_command_check(command)
+        if check.outcome != ALLOW or check.danger:
+            self._emit(
+                Error(
+                    kind="permission",
+                    message=f"cron task skipped: {command[:80]!r} 不再被允许（{check.reason}）",
+                )
+            )
+            return None
         return self._background.start(command, name=name, cwd=self._workspace_cwd)
 
     # ------------------------------------------------------------------ M2：权限 / diff 审阅 / 回滚

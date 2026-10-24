@@ -286,10 +286,18 @@ def test_service_background_controls_round_trip(stub_backend, tmp_home):
     stub_backend.add("train.py", lambda: (time.sleep(0.05), BashResult(0, "epoch done", "", False, 5))[1])
     harness = Harness()
     harness.send({"type": "init", "workspaceRoots": [str(tmp_home)]})
+    # 权限门（独立评审高危 #1 修复）：build 档先弹权限卡，allow 后才真正启动
     harness.send(
         {"type": "control", "command": "background_start", "taskCommand": "train.py", "name": "训练"}
     )
-
+    assert wait_for(
+        lambda: any(f["type"] == "permission_request" and f["tool"] == "background"
+                    for f in harness.frames())
+    )
+    req = [f for f in harness.frames() if f["type"] == "permission_request"][-1]
+    assert req["args"]["command"] == "train.py"
+    harness.send({"type": "permission_response", "id": req["id"], "decision": "allow"})
+    assert wait_for(lambda: harness.results("background_start"))
     ack = harness.results("background_start")
     assert ack and ack[0]["ok"] is True
     task_id = ack[0]["detail"]
@@ -337,3 +345,49 @@ def test_shutdown_stops_monitor_thread(stub_backend, tmp_path):
     monitor.join(timeout=2.0)
     assert not monitor.is_alive()
     hold.set()
+
+
+# ---------------------------------------------------------------------------
+# 权限门（独立评审高危 #1 修复的锁定测试）
+# ---------------------------------------------------------------------------
+
+
+def test_background_danger_command_rejected_without_card(tmp_home):
+    harness = Harness()
+    harness.send({"type": "init", "workspaceRoots": []})
+    harness.send({"type": "control", "command": "background_start",
+                  "taskCommand": "rm -rf /"})
+    assert wait_for(lambda: any(
+        f["type"] == "error" and f.get("kind") == "permission" for f in harness.frames()
+    ))
+    assert not any(f["type"] == "permission_request" for f in harness.frames())
+    assert harness.results("background_start") == []
+
+
+def test_background_plan_mode_denied_yolo_allows(tmp_home, stub_backend):
+    stub_backend.add("echo ok", lambda: BashResult(0, "ok", "", False, 1))
+    harness = Harness()
+    harness.send({"type": "init", "workspaceRoots": []})
+    harness.send({"type": "control", "command": "permission_mode", "mode": "plan"})
+    harness.send({"type": "control", "command": "background_start", "taskCommand": "echo ok"})
+    assert wait_for(lambda: any(
+        f["type"] == "error" and f.get("kind") == "permission" for f in harness.frames()
+    ))
+    assert harness.results("background_start") == []
+
+    harness.send({"type": "control", "command": "permission_mode", "mode": "yolo"})
+    harness.send({"type": "control", "command": "background_start", "taskCommand": "echo ok"})
+    assert wait_for(lambda: harness.results("background_start"))
+    assert harness.results("background_start")[-1]["ok"] is True
+
+
+def test_background_deny_answer_does_not_start(tmp_home):
+    harness = Harness()
+    harness.send({"type": "init", "workspaceRoots": []})
+    harness.send({"type": "control", "command": "background_start", "taskCommand": "echo x"})
+    assert wait_for(lambda: any(f["type"] == "permission_request" for f in harness.frames()))
+    req = [f for f in harness.frames() if f["type"] == "permission_request"][-1]
+    harness.send({"type": "permission_response", "id": req["id"], "decision": "deny"})
+    assert wait_for(lambda: harness.results("background_start"))
+    assert harness.results("background_start")[-1]["ok"] is False
+    assert not any(f["type"] == "task_started" for f in harness.frames())

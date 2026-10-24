@@ -42,6 +42,12 @@ READONLY_TOOLS = frozenset(
     {"read", "glob", "grep", "todo", "webfetch", "websearch", "search_history", "notebook_read"}
 )
 
+# DANGER 黑名单扫描的工具面（PLAN §9.3 黑名单优先级高于一切）：bash 工具之外，
+# background（M9 后台任务）与 cron_task（M9 定时任务命令动作）都以
+# {"command": str} 载荷执行 shell 命令串——同受黑名单管辖（独立评审高危 #1/#2：
+# 这两个入口曾完全绕过引擎）。
+DANGER_SCANNED_TOOLS = frozenset({"bash", "background", "cron_task"})
+
 # 各工具规则匹配的入参字段（zcode 语义：匹配主体按工具取具体入参）
 _SUBJECT_FIELD: dict[str, str] = {
     "bash": "command",
@@ -405,7 +411,7 @@ class PermissionEngine:
     def check(self, tool: str, args: dict[str, Any]) -> PermissionCheck:
         subject = subject_for(tool, args)
         # 1. 黑名单最高优先级（PLAN §9.3）：压过白名单与总是允许
-        if tool == "bash":
+        if tool in DANGER_SCANNED_TOOLS:
             command = args.get("command")
             if isinstance(command, str):
                 hit = match_danger(command)
@@ -534,6 +540,15 @@ class ModeAwarePermissionEngine(PermissionEngine):
             return inner_check
         if inner_check.outcome == ALLOW:
             return inner_check
+        if tool == "notebook_run":
+            # R29 精神（独立评审中危 #3）：notebook_run 执行任意 Python，危险面
+            # 等价 shell——yolo 也保留逐次确认，堵住黑名单只扫 shell 模式的盲区
+            return PermissionCheck(
+                outcome=ASK,
+                ruleId="notebook_guard",
+                reason="notebook_run executes arbitrary Python; confirm each run",
+                subject=inner_check.subject,
+            )
         if is_write:
             return PermissionCheck(
                 outcome=ALLOW,

@@ -1302,7 +1302,7 @@ export const useStore = create<WebviewStore>()((set, get) => ({
           if (exists) {
             return {
               tasks: s.tasks.map((t) =>
-                t.id === e.taskId ? { ...t, tail: clampTail(`${t.tail ?? ''}${e.text}`) } : t,
+                t.id === e.taskId ? { ...t, tail: clampTail(`${t.tail ?? ''}${e.tail ?? ''}`) } : t,
               ),
             };
           }
@@ -1713,21 +1713,20 @@ export const useStore = create<WebviewStore>()((set, get) => ({
     if (get().cronPendingAction !== undefined) return;
     const kind: 'prompt' | 'command' =
       command !== undefined && command !== '' ? 'command' : 'prompt';
-    // control cron_add —— 双通道载荷：schedule/prompt/args 专用字段 +
-    // query JSON 镜像（{schedule, kind, prompt?, command?}）；成功自动回拉
+    // control cron_add —— 契约载荷（core _control_cron_add）：schedule（标准
+    // 5 段）+ action {type:'prompt',text} | {type:'task',command}；query JSON
+    // 镜像兜底；命令型动作在核心侧过权限门（新增时即校验，无人值守不弹卡）
+    const action =
+      kind === 'prompt'
+        ? { type: 'prompt' as const, text: prompt ?? '' }
+        : { type: 'task' as const, command: command ?? '' };
     set({ cronPendingAction: 'add', cronNotice: undefined });
     hostSendCore({
       type: 'control',
       command: 'cron_add',
       schedule,
-      prompt: kind === 'prompt' ? prompt : undefined,
-      args: kind === 'command' ? command : undefined,
-      query: JSON.stringify({
-        schedule,
-        kind,
-        prompt: kind === 'prompt' ? prompt : undefined,
-        command: kind === 'command' ? command : undefined,
-      }),
+      action,
+      query: JSON.stringify({ schedule, kind, prompt, command }),
     });
     window.setTimeout(() => {
       if (useStore.getState().cronPendingAction === 'add') {
@@ -1738,12 +1737,14 @@ export const useStore = create<WebviewStore>()((set, get) => ({
 
   removeCron: (name) => {
     if (get().cronPendingAction !== undefined) return;
+    const entry = get().crons.find((c) => c.name === name);
     set({ cronPendingAction: 'remove', cronNotice: undefined });
     hostSendCore({
       type: 'control',
       command: 'cron_remove',
+      cronId: entry?.id ?? name,
       name,
-      query: JSON.stringify({ name }),
+      query: JSON.stringify({ cronId: entry?.id, name }),
     });
     window.setTimeout(() => {
       if (useStore.getState().cronPendingAction === 'remove') {
@@ -1763,6 +1764,7 @@ export const useStore = create<WebviewStore>()((set, get) => ({
     hostSendCore({
       type: 'control',
       command: 'cron_toggle',
+      cronId: get().crons.find((c) => c.name === name)?.id ?? name,
       name,
       enabled,
       query: JSON.stringify({ name, enabled }),

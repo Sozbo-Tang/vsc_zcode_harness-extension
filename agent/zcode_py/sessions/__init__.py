@@ -16,6 +16,7 @@ M4 起 meta.json 额外承载列表元信息（R16/R27/R28/R11）：
 from __future__ import annotations
 
 import json
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -56,6 +57,11 @@ def _new_session_id() -> str:
 class SessionStore:
     def __init__(self, base_dir: Path | None = None):
         self.base_dir = Path(base_dir) if base_dir else home_dir() / "sessions"
+        # 转录追加互斥锁（独立评审中危 #5）：入站帧与出站帧走不同上游锁
+        # （_intake_lock / emitter 锁），后台任务/cron/inline 线程的 emit 与
+        # 读线程入账可并发到达——检测断尾+两次 write 必须原子，否则大帧可
+        # 撕裂成坏行被 read_frames 静默跳过（丢帧）。
+        self._append_lock = threading.Lock()
 
     # -- 生命周期 ------------------------------------------------------------
 
@@ -114,15 +120,16 @@ class SessionStore:
         丢失，故先检测并补齐换行，保证坏行只影响它自己（read_frames 跳过）。
         """
         path = self._session_dir(session_id) / "transcript.jsonl"
-        needs_newline = False
-        if path.exists() and path.stat().st_size > 0:
-            with path.open("rb") as fh:
-                fh.seek(-1, 2)
-                needs_newline = fh.read(1) != b"\n"
-        with path.open("a", encoding="utf-8") as fh:
-            if needs_newline:
-                fh.write("\n")
-            fh.write(json.dumps(envelope, ensure_ascii=False) + "\n")
+        with self._append_lock:
+            needs_newline = False
+            if path.exists() and path.stat().st_size > 0:
+                with path.open("rb") as fh:
+                    fh.seek(-1, 2)
+                    needs_newline = fh.read(1) != b"\n"
+            with path.open("a", encoding="utf-8") as fh:
+                if needs_newline:
+                    fh.write("\n")
+                fh.write(json.dumps(envelope, ensure_ascii=False) + "\n")
 
     def append(self, session_id: str, frame: dict, direction: str = "out") -> None:
         """追加一帧（新时间戳信封）到 transcript.jsonl。"""

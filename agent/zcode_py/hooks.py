@@ -202,13 +202,21 @@ class HooksRunner:
         matched = [r for r in self.rules if r.matches(event, tool)]
         if not matched:
             return []
-        backend = self._runner
-        if backend is None:
-            backend = _proc_backend()
-            if backend is None:
+        if self._runner is not None:
+            backend = self._runner  # 注入桩（测试）：契约 (argv, *, stdin, timeout)
+        else:
+            module = _proc_backend()
+            if module is None:
                 self._notify_disabled()
                 return []
-            backend = backend.run_process
+            # 独立评审中危 #4：hooks 同为用户配置的本地命令——env 脱敏后再给
+            # （真实 proc_backend 支持 env 形参；包装保持注入桩契约不变）
+            from .tools.bash import sanitize_child_env
+
+            def backend(argv, *, stdin=None, timeout=10.0):
+                return module.run_process(
+                    argv, stdin=stdin, timeout=timeout, env=sanitize_child_env()
+                )
         payload = json.dumps({"event": event, "tool": tool, "args": args}, ensure_ascii=False)
         out = []
         for rule in matched:

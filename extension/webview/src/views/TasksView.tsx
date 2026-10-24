@@ -189,7 +189,7 @@ function CronTab(): React.JSX.Element {
   const submitAdd = (): void => {
     const sch = schedule.trim();
     if (sch === '') {
-      setFormError('调度表达式必填（如 "0 30 9 * * * *" = 每天 9:30）');
+      setFormError('调度表达式必填（如 "30 9 * * *" = 每天 9:30，标准 5 段）');
       return;
     }
     if (kind === 'prompt' && prompt.trim() === '') {
@@ -296,8 +296,8 @@ function CronTab(): React.JSX.Element {
                 id="cron-schedule"
                 className="in grow mono"
                 value={schedule}
-                placeholder="0 30 9 * * * *（7 段 cron：秒 分 时 日 月 星期 年）"
-                title="7 段 cron 表达式（CloudBase/Quartz 风格）；描述文本由核心宽容解析"
+                placeholder="30 9 * * *（5 段：分 时 日 月 星期）"
+                title="标准 5 段 cron 表达式（*/5 * * * *、30 9 * * 1-5 等）"
                 onChange={(e) => setSchedule(e.target.value)}
               />
             </div>
@@ -360,7 +360,8 @@ function CronTab(): React.JSX.Element {
       </div>
 
       <div className="muted small skillhint">
-        到点动作：prompt 型在活跃会话发用户消息；command 型由核心执行（危险命令仍走权限黑名单）。
+        到点动作：prompt 型在活跃会话发用户消息；command 型经核心权限门——
+        新增时校验（危险命令一律拒绝；普通命令需白名单或 yolo 模式），到点不再弹卡。
       </div>
     </div>
   );
