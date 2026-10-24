@@ -66,67 +66,68 @@ context 四字段 e2e 冒烟通过；UI 交互需 F5 人工验收）
 
 ## M4 多会话 + 记忆
 
-- [ ] 会话 JSONL 持久化（transcript 即 UI 事件流）
-- [ ] 会话列表/搜索/恢复
-- [ ] 会话分叉（从某消息分支）
-- [ ] 并行多开（每会话一个独立 Python 子进程）
-- [ ] multi-root 多根工作区（会话选用根目录作为 Agent cwd）
-- [ ] 会话导出 Markdown
-- [ ] MEMORY.md 跨会话记忆（自动加载/自动更新）
-- [ ] 输入框 ↑ 历史输入 + 草稿自动保留
-- [ ] 收藏/固定重要回复
-- [ ] 空状态欢迎页 + 建议提示词卡片
+- [x] 会话 JSONL 持久化（transcript 即 UI 事件流）
+- [x] 会话列表/搜索/恢复（列表+全文搜索 control；UI 端当前会话全文过滤）
+- [x] 会话分叉（从某消息分支；支持 __last_user_message__ 哨兵）
+- [x] 并行多开（每会话一个独立 Python 子进程；UI 活跃切换，跨会话独立投影留待后续）
+- [x] multi-root 多根工作区（set_root 命令 + 会话 meta 记根）
+- [x] 会话导出 Markdown（result 帧返回 + 宿主 saveExport 落盘）
+- [x] MEMORY.md 跨会话记忆（system prompt 注入 + memory 工具 read/append/replace）
+- [x] 输入框 ↑ 历史输入 + 草稿自动保留
+- [x] 收藏/固定重要回复（pin 置顶分组）
+- [x] 空状态欢迎页 + 建议提示词卡片（M1 已有，M4 无回归）
 
-**验收：重启续聊**
+**验收：重启续聊**（2026-10-24 完成；pytest+compile+build 门禁全绿；重启恢复链路需 F5 人工验收）
 
 ## M5 环境 + Vision
 
-- [ ] 硬件探测（CPU/GPU/RAM/OS，三平台）
-- [ ] 工作区特征文件 → 语言检测（只显示命中的语言）
-- [ ] 工具链版本探测 + 缺失黄牌与安装指引
-- [ ] 环境事实注入 Agent 上下文
-- [ ] Vision 中继：不支持视觉时路由多模态模型转述
-- [ ] 中继卡 UI（模型名+转述全文可审计）+ 三档预设 + 自定义
-- [ ] 转述后原图退场；未配置视觉模型时一键跳转
+- [x] 硬件探测（CPU/GPU/RAM/OS，macOS/Linux/Windows 尽力实现）
+- [x] 工作区特征文件 → 语言检测（只显示命中的语言）
+- [x] 工具链版本探测 + 缺失黄牌与安装指引（并行探测 5s/项）
+- [x] 环境事实注入 Agent 上下文（≤1.5k 字符）
+- [x] Vision 中继：不支持视觉时路由多模态模型转述（visionRelayModel 三种写法）
+- [x] 中继卡 UI（模型名+转述全文可审计）+ 三档预设 + 自定义
+- [x] 转述后原图退场；未配置视觉模型时报 config 错误+指引
 
-**验收：贴图给纯文本模型能答**
+**验收：贴图给纯文本模型能答**（2026-10-24 完成；FakeProvider 双通道离线验证；真实多模态模型联测待 F5+API Key）
 
 ## M6 浏览器
 
-- [ ] browser-use 可选依赖组（未安装不注册工具）
-- [ ] 截图 artifact 回聊天流展示
-- [ ] 有头/无头配置 + 操作时间线
+- [x] browser-use 可选依赖组（[browser] 组；未安装不注册 + 幻觉调用返回安装指引）
+- [x] 截图 artifact 回聊天流展示（image_artifact 帧 + 宿主 imageUri 白名单转 URI）
+- [x] 有头/无头配置 + 操作时间线（≤30 条；SSRF 前置校验，重定向限制如实记录）
 
-**验收：「打开网站并总结」**
+**验收：「打开网站并总结」**（2026-10-24 完成代码与打桩测试；browser-use 真实 API 联测待安装 [browser] 组首跑）
 
 ## M7 子代理 + Skills
 
-- [ ] run_child 子代理（嵌套受限 loop，上下文防火墙）
-- [ ] 子代理可指定不同模型
-- [ ] Task 工具 + 子代理卡 UI
-- [ ] SKILL.md（zcode 兼容）+ 斜杠命令
+- [x] run_child 子代理（嵌套受限 loop，上下文防火墙；深度=1）
+- [x] 子代理可指定不同模型（providerId/modelId 覆盖走 factory 重建）
+- [x] Task 工具 + 子代理卡 UI（SubagentCard：prompt/状态/@model 徽标/结果折叠）
+- [x] SKILL.md（zcode 兼容）+ 斜杠命令（用户级/项目级搜索、/ 展开与输入提示）
 
-**验收：并行调研 + 自定义 skill**
+**验收：并行调研 + 自定义 skill**（2026-10-24 完成；FakeProvider 嵌套验证）
 
 ## M8 harness 对标
 
-- [ ] MCP client + 管理页（添加/状态灯/工具浏览）
-- [ ] hooks 系统
-- [ ] 计划模式
-- [ ] 压缩 L2 机械淘汰（>50% 旧工具结果换占位符，保 tool_use/tool_result 配对）
-- [ ] 压缩 L3 自动摘要（85% 阈值，七要素结构化，可指定便宜模型）+ /compact
-- [ ] 压缩 L4 冷存 + search_history 工具 + 压缩报告
-- [ ] Notebook 工具（读写 .ipynb 单元格并执行回传）
+- [x] MCP client + 管理页（stdio JSON-RPC；添加/状态灯/工具浏览；spawn 装配缝见 docs/MCP_BACKEND_SPEC.md——**需用户授权落盘后 MCP 才真连**）
+- [x] hooks 系统（pre_tool 阻断/post_tool 附加；执行走同一装配缝）
+- [x] 计划模式（build/plan/yolo 三档；plan 只读拒绝、yolo 黑名单仍强制）
+- [x] 压缩 L2 机械淘汰（>50% 旧工具结果换占位符，保 tool_use/tool_result 配对——专测）
+- [x] 压缩 L3 自动摘要（85% 阈值，七要素结构化，可指定便宜模型）+ /compact
+- [x] 压缩 L4 冷存 + search_history 工具 + 压缩报告（CompactionCard + ContextMeter 校正）
+- [x] Notebook 工具（read/write + run；nbformat 主依赖、nbclient [notebook] 可选组）
 
-**验收：接真实 MCP；跑 .ipynb**
+**验收：接真实 MCP；跑 .ipynb**（2026-10-24 完成代码与打桩测试；真实验收依赖 MCP 装配缝落盘 + [notebook] 组安装）
 
 ## M9 工作流 + 后台 + 补全
 
-- [ ] Python 工作流编排
-- [ ] 后台任务面板（运行中/定时任务）
-- [ ] cron 定时任务
-- [ ] 内联补全（幽灵文本，默认关闭；FIM 或 chat 模型模拟）
-- [ ] 多语言界面（中/英）
-- [ ] 远程开发实测（SSH / WSL / Dev Container / Codespaces）
+- [x] Python 工作流编排（~/.zcode-py/workflows/*.py STEPS 声明式；受限子循环逐步执行）
+- [x] 后台任务面板（运行中/定时任务/工作流三页签；task_output 2s 节流）
+- [x] cron 定时任务（标准 5 段表达式表驱动 50 测；prompt 动作走用户消息全路径）
+- [x] 内联补全（幽灵文本，默认关闭；chat 模型模拟 FIM，inline_complete 命令）
+- [x] 远程开发设计期审查（无硬编码绝对路径，路径均动态推导；R32）
+- [ ] 多语言界面（中/英）（R20，未实施）
+- [ ] 远程开发实测（SSH / WSL / Dev Container / Codespaces）（需真实远程环境）
 
-**验收：工作流脚本 + 远程跑通**
+**验收：工作流脚本 + 远程跑通**（工作流脚本 2026-10-24 完成；远程实测待真实环境；task_stop 为标记式停止——bash_backend 可取消接口留待后续）
