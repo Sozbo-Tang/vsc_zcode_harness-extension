@@ -631,3 +631,21 @@ def test_control_env_refresh(monkeypatch, tmp_home):
     assert harness.wait_frames("result")
     result = [r for r in harness.frames_of_type("result") if r.get("command") == "env_refresh"][-1]
     assert result["ok"] is True and result["detail"] == "probing"
+
+
+def test_control_inline_complete(tmp_home):
+    """R13：内联补全走 daemon 线程的 provider 调用，detail = 插入文本。"""
+    provider = FakeProvider(turns=[[TextDelta("print('hi')")]])
+    harness = Harness(provider)
+    harness.send({"type": "init", "workspaceRoots": ["/w"]})
+
+    harness.send({"type": "control", "command": "inline_complete",
+                  "prefix": "def greet():\n    ", "suffix": "\n    return", "path": "a.py"})
+    assert wait_for(
+        lambda: any(r.get("command") == "inline_complete" for r in harness.frames_of_type("result"))
+    )
+    result = [r for r in harness.frames_of_type("result") if r.get("command") == "inline_complete"][-1]
+    assert result["ok"] is True
+    assert result["detail"] == "print('hi')"
+    # 请求确实不带工具（纯补全提示词）
+    assert provider.requests and provider.requests[0].tools is None
